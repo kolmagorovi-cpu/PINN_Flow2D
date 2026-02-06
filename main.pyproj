@@ -5,7 +5,7 @@
     <ProjectGuid>7409aeca-110b-4439-8b97-9551c91d37ba</ProjectGuid>
     <ProjectHome>.</ProjectHome>
     <StartupFile>main.py</StartupFile>
-    <SearchPath>..\PINN_Flow2D;..\PINN_Flow2D;Geometry</SearchPath>
+    <SearchPath>..\PINN_Flow2D;..\PINN_Flow2D;Geometry;Samplers</SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
     <Name>main</Name>
