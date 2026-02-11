@@ -32,10 +32,11 @@ while wanted == True:
     print(r"""
 ⠀⠀⠀⠀⠀Выберите модуль: ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-    G2 - модуль геометрии (2D);
+    G2D - модуль геометрии (2D);
+    S2DR - модуль дискретизации (регулярный) (2D);
     -------------------------------
                 В РАЗРАБОТКЕ
-    M2R - модуль дискретизации (регулярный) (2D);
+    
     S2 - модуль граничных условий (2D);
     SLVS2 - модуль настроек решателя (2D);
     RES2 - модуль настроек вывода результатов (2D);
@@ -43,8 +44,8 @@ while wanted == True:
     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
     """)
     Start_Module = input("Выбрать модуль: ")
-    if Start_Module == "G2": import geometry_2d; geometry_2d.g2d()
-    if Start_Module == "M2R": import Sampler2DRegular; Sampler2DRegular.Sampler()
+    if Start_Module == "G2D": import geometry_2d; geometry_2d.g2d()
+    if Start_Module == "S2DR": import Sampler2DRegular; Sampler2DRegular.S2DR()
     if Start_Module == "S2": geometry_2d.g2d()
     if Start_Module == "SLVS2": geometry_2d.g2d()
     if Start_Module == "RES2": geometry_2d.g2d()

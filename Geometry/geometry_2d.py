@@ -1,8 +1,4 @@
-﻿#Функция загрузки контура из файла
-import math
-
-
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import math
 #Функция загрузки контура из файла
 def FoilLoader(path):
@@ -11,10 +7,11 @@ def FoilLoader(path):
         with open(path, 'r') as foil_file:
             for line_number, line in enumerate(foil_file, start=0):
                 line = line.strip()
+                #print(line)
                 if not line:
                     continue
                 try:
-                    x_str, y_str, z_str = line.split('\t')
+                    x_str, y_str = line.split('\t')
                     x = float(x_str)
                     y = float(y_str)
                     foil_coord.append((x,y))
@@ -112,15 +109,17 @@ def g2d():
     try:
         path = input("Путь файла: ")
         Foil = FoilLoader(path) #Загрузка профиля
+        print ("Геометрия профиля загружена")
     except ValueError:
         print("Неверный путь файла")
     Closure = Foil[0] == Foil[-1] #Проверка замкнутости контура
+    print ("Выполнена проверка замкнутости контура")
     if Closure == False: Domen = UnclosedDomen(Foil)
     else: Domen = ClosedDomen(Foil)
     Plot(Foil, Domen)
     Saving(Foil, "C:/Users/Ivan/source/repos/PINN_Flow2D/Geometry/Data/foil.txt")
     Saving(Domen, "C:/Users/Ivan/source/repos/PINN_Flow2D/Geometry/Data/domen.txt")
-
+    print ("Расчётная область сохранена")
 
 
             
