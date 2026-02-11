@@ -1,7 +1,10 @@
 ﻿# -*- coding: utf-8 -*-
+from ftplib import all_errors
+from shlex import join
 import numpy as np
 from shapely.geometry import Polygon, Point, LineString
 import matplotlib.pyplot as plt
+from multiprocessing import Process, Queue, set_start_method
 import os
 def Loader():
     try:
@@ -30,11 +33,14 @@ def SamplerFoil(contour, step):
         points.append((point.x, point.y))
         
     return points
-def Sampler(foil, domain, step):
+def Sampler(foil, domain, step, num_proc, i_proc, result_queue):
     poly_foil = Polygon(foil)
     poly_domain = Polygon(domain)
     area = poly_domain.difference(poly_foil)
     minx, miny, maxx, maxy = area.bounds
+    k_x = (maxx-minx)/num_proc; k_y = (maxy-miny)/num_proc
+    minx = minx + k_x*i_proc
+    maxx = minx + k_x
     points = []
     Number_of_points = (maxx-minx)*(maxy-miny)/step**2
 
@@ -45,7 +51,7 @@ def Sampler(foil, domain, step):
             print("Точек осталось: ", Number_of_points)
             if area.contains(point):
                 points.append((x, y))
-    return points
+    result_queue.put(points)
 
 def Plotter(outer_contour, inner_contour, points):
     plt.figure(figsize=(8, 8))
@@ -63,6 +69,7 @@ def Plotter(outer_contour, inner_contour, points):
     plt.grid(True)
     plt.title("Генерация точек между контурами")
     plt.show()
+
 
 def Saving(coordinates, filename):
     # Проверяем формат входных данных
@@ -82,18 +89,47 @@ def Saving(coordinates, filename):
             file.write(f"{x}\t{y}\n")
 #distance_to_inner = point.distance(inner_poly)
 def S2DR():
-    step = input("Шаг сетки расчётной области, м = ")
+    #set_start_method('spawn')
+    num_proc = int(input("Количество ядер (1...8): "))
+    if not (1 <= num_proc <= 8):
+            raise ValueError("Количество ядер должно быть от 1 до 8")
+    step = float(input("Шаг сетки расчётной области, м = "))
+    if step <= 0:
+            raise ValueError("Шаг должен быть положительным числом")
     print ("Загрузка расчётной области...")
     foil, domain, lines = Loader()
     print ("Расчётная область загружена")
     print ("Построение точек...")
     print ("Построение точек на профиле...")
-    points_foil = SamplerFoil(foil, float(step))
+    points_foil = SamplerFoil(foil, step)
     print ("Построение точек на границе расчётной области...")
-    points_boundary = SamplerFoil(domain, float(step))
+    points_boundary = SamplerFoil(domain, step)
     print ("Построение точек внутри расчётной области...")
-    points_domain = Sampler(foil, domain, float(step))
+    result_queue = Queue()
+    #shared_list = manager.list()
+    processes = []
+    for i_proc in range(num_proc):
+        print ("Создание процесса №", i_proc+1)
+        p = Process(target=Sampler, 
+                    args=(foil, 
+                          domain, 
+                          step, 
+                          num_proc, 
+                          i_proc, 
+                          result_queue))
+        processes.append(p)
+        p.start()
+    all_points = []
+    for _ in range(num_proc):
+        all_points.extend(result_queue.get())
+    for p in processes:
+        p.join()
+        #points_domain = Sampler(foil, domain, float(step), num_proc, i_proc)
     print("Создание массива точек")
+    #all_points = []
+    #for points_chunk in shared_list:
+        #all_points.extend(points_chunk)
+    points_domain = all_points
     points = (
             points_foil + 
             points_domain + 
