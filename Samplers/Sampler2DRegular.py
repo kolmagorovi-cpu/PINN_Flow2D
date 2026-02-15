@@ -6,6 +6,7 @@ from shapely.geometry import Polygon, Point, LineString
 import matplotlib.pyplot as plt
 from multiprocessing import Process, Queue, set_start_method
 import os
+import time
 def Loader():
     try:
         with open("C:/Users/Ivan/source/repos/PINN_Flow2D/Config/paths.txt", 'r') as paths_file:
@@ -42,15 +43,25 @@ def Sampler(foil, domain, step, num_proc, i_proc, result_queue):
     minx = minx + k_x*i_proc
     maxx = minx + k_x
     points = []
-    Number_of_points = (maxx-minx)*(maxy-miny)/step**2
-
+    Number_of_points = int((maxx-minx)*(maxy-miny)/step**2)
+    Number_of_points0 = Number_of_points
+    time.sleep(1.0)
+    print('\033c')
+    start_time = time.time()
     for x in np.arange(minx, maxx, step):
         for y in np.arange(miny, maxy, step):
-            point = Point(x, y)
-            Number_of_points = Number_of_points - 1.0
-            print("Точек осталось: ", Number_of_points)
+            point = Point(x,y)
+            if i_proc == 0:
+                print('\033c')
+                Number_of_points = Number_of_points - 1
+                execution = 100-int(Number_of_points/Number_of_points0*100)
+                print("Выполнение: ", execution, "%; ")
+                timer = Number_of_points * (time.time()-start_time)/execution
+                print(round(timer/60), " минут")
             if area.contains(point):
                 points.append((x, y))
+                
+    print("Время построения сетки: ", round(time.time()-start_time, 3), " секунд")
     result_queue.put(points)
 
 def Plotter(outer_contour, inner_contour, points):
@@ -89,6 +100,8 @@ def Saving(coordinates, filename):
             file.write(f"{x}\t{y}\n")
 #distance_to_inner = point.distance(inner_poly)
 def S2DR():
+    print('\033c')
+    print("Модуль S2DR")
     #set_start_method('spawn')
     num_proc = int(input("Количество ядер (1...8): "))
     if not (1 <= num_proc <= 8):
@@ -125,6 +138,7 @@ def S2DR():
     for p in processes:
         p.join()
         #points_domain = Sampler(foil, domain, float(step), num_proc, i_proc)
+    time.sleep(1.0)
     print("Создание массива точек")
     #all_points = []
     #for points_chunk in shared_list:
@@ -137,7 +151,11 @@ def S2DR():
         )
     print ("Точки построены")
     print ("Количество точек: ", len(points))
+    print ("Создание изображения")
+    time.sleep(1.0)
     Plotter(domain, foil, points)
+    time.sleep(1.0)
     print ("Сохранение...")
     Saving (points, lines[2].strip())
+    time.sleep(1.0)
     print ("Точки сохранены")

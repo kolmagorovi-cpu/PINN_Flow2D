@@ -1,4 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
+import os
 if __name__ == '__main__':
     def print_cat():
         print(r"""
@@ -34,6 +35,7 @@ if __name__ == '__main__':
     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
         G2D - модуль геометрии (2D);
         S2DR - модуль дискретизации (регулярный) (2D);
+
         -------------------------------
                     В РАЗРАБОТКЕ
     
@@ -46,10 +48,10 @@ if __name__ == '__main__':
         Start_Module = input("Выбрать модуль: ")
         if Start_Module == "G2D": import geometry_2d; geometry_2d.g2d()
         if Start_Module == "S2DR": import Sampler2DRegular; Sampler2DRegular.S2DR()
-        if Start_Module == "S2": geometry_2d.g2d()
+        if Start_Module == "S2": import Setup; Setup.setup_2d_mesh()
         if Start_Module == "SLVS2": geometry_2d.g2d()
         if Start_Module == "RES2": geometry_2d.g2d()
-    
+       
         print ("Завершить работу?")
         wanted = input("Y/N?: ")
         if wanted == "Y": wanted = False

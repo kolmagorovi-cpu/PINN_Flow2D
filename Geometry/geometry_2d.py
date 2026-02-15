@@ -105,6 +105,8 @@ def Saving(coordinates, filename):
         for x, y in zip(x_coords, y_coords):
             file.write(f"{x}\t{y}\n")
 def g2d():
+    print('\033c')
+    print("Модуль G2D")
     print ("Укажите путь к файлу контура (path.../name.txt):")
     try:
         path = input("Путь файла: ")
