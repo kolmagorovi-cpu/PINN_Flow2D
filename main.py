@@ -39,7 +39,7 @@ if __name__ == '__main__':
         -------------------------------
                     В РАЗРАБОТКЕ
     
-        S2 - модуль граничных условий (2D);
+        S2D - модуль граничных условий (2D);
         SLVS2 - модуль настроек решателя (2D);
         RES2 - модуль настроек вывода результатов (2D);
     
@@ -48,7 +48,7 @@ if __name__ == '__main__':
         Start_Module = input("Выбрать модуль: ")
         if Start_Module == "G2D": import geometry_2d; geometry_2d.g2d()
         if Start_Module == "S2DR": import Sampler2DRegular; Sampler2DRegular.S2DR()
-        if Start_Module == "S2": import Setup; Setup.main()
+        if Start_Module == "S2D": import Setup2D; Setup2D.main()
         if Start_Module == "SLVS2": geometry_2d.g2d()
         if Start_Module == "RES2": geometry_2d.g2d()
        

@@ -4,6 +4,7 @@ import os
 import json
 from scipy.spatial import distance, KDTree
 import matplotlib.pyplot as plt
+import time
 
 
 class FluidProperties:
@@ -1601,7 +1602,7 @@ def main():
     print("=" * 50)
     
     mesh.save_to_file('cfd_mesh')
-    
+    time.sleep(590)
     print("\n" + "=" * 70)
     print("🎉 РАБОТА ПРОГРАММЫ УСПЕШНО ЗАВЕРШЕНА")
     print("=" * 70)
