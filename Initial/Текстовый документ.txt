@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Модуль инициализации расчётной области (Initializer).
+Загружает геометрию, точки коллокации, параметры жидкости и граничные условия.
+Вычисляет начальные поля (давление, скорость, плотность, вязкость, SDF) для всех точек.
+SDF вычисляется как минимальное расстояние до точек с граничным условием WALL.
+Сохраняет полный набор данных и визуализирует поля.
+"""
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from shapely.geometry import Point, LineString
+import logging
+from typing import Optional, Dict, List, Tuple
+import glob
+
+# Попытка импорта KDTree для ускорения
+try:
+    from scipy.spatial import cKDTree
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    logging.warning("scipy.spatial не доступен, SDF будет вычисляться медленно (перебором).")
+
+# Импортируем наши модули
+from Fluids import FluidLibrary
+from Conditions import ConditionsManager, BoundaryConditions
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Структура данных для точки с полными атрибутами
+point_dtype = np.dtype([
+    ('id', 'i4'),
+    ('x', 'f8'),
+    ('y', 'f8'),
+    ('boundary_type', 'U20'),
+    ('on_boundary', 'bool'),
+    ('pressure', 'f8'),
+    ('temperature', 'f8'),
+    ('u', 'f8'),
+    ('v', 'f8'),
+    ('density', 'f8'),
+    ('kin_visc', 'f8'),
+    ('dyn_visc', 'f8'),
+    ('sdf', 'f8')
+])
+
+
+class Initializer:
+    """Класс для инициализации расчётной области."""
+
+    def __init__(self):
+        self.geometry_dir = "Geometry/Data"
+        self.sampler_dir = "Sampler/Data"
+        self.fluids_dir = "Fluids"
+        self.conditions_dir = "Conditions"
+        self.output_dir = "Initial/Data"
+        self.plots_dir = "Initial/Plots"
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.plots_dir, exist_ok=True)
+
+        self.fluid_lib = FluidLibrary(self.fluids_dir)
+        self.cond_manager = ConditionsManager(self.conditions_dir)
+
+        self.points = None          # исходные точки из Sampler
+        self.points_with_fields = None  # структурированный массив с полями
+        self.wall_points = None      # координаты точек с типом WALL
+        self.fluid = None
+        self.conditions = None
+        self.domain = None           # контур области (для справки)
+
+        # Параметры инициализации
+        self.pressure_mode = None
+        self.velocity_mode = None
+        self.temperature = None
+
+    def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
+        """Загружает точки из Sampler/Data. Если filename не указан, ищет .npy файлы."""
+        if filename is None:
+            files = glob.glob(os.path.join(self.sampler_dir, "*.npy"))
+            if not files:
+                raise FileNotFoundError(f"Нет .npy файлов в {self.sampler_dir}")
+            # Ищем основной файл точек (не _interior, не _boundary)
+            main_files = [f for f in files if not f.endswith('_interior.npy') and not f.endswith('_boundary.npy')]
+            if main_files:
+                filename = main_files[0]
+            else:
+                filename = files[0]  # берём первый
+            print(f"Использую файл точек: {os.path.basename(filename)}")
+        data = np.load(filename, allow_pickle=True)
+
+        # Проверяем, структурированный ли массив или простой
+        if data.dtype.names is not None:
+            self.points = data
+            logger.info("Загружен структурированный массив точек.")
+        else:
+            # простые координаты, создаём базовую структуру
+            if data.ndim == 2 and data.shape[1] == 2:
+                arr = np.zeros(len(data), dtype=[('id', 'i4'), ('x', 'f8'), ('y', 'f8')])
+                arr['id'] = np.arange(len(data))
+                arr['x'] = data[:, 0]
+                arr['y'] = data[:, 1]
+                self.points = arr
+                logger.info("Загружены координаты точек, id присвоены.")
+            else:
+                raise ValueError("Неизвестный формат файла точек")
+
+        logger.info(f"Загружено {len(self.points)} точек из Sampler.")
+        return self.points
+
+    def extract_wall_points(self):
+        """Извлекает координаты точек с boundary_type = 'wall' для построения SDF."""
+        if self.points is None:
+            raise RuntimeError("Сначала загрузите точки.")
+        if 'boundary_type' not in self.points.dtype.names:
+            logger.warning("В точках нет информации о boundary_type. SDF будет вычислен по всем точкам? (некорректно)")
+            # Если нет информации, используем все точки (но это неправильно)
+            self.wall_points = np.column_stack((self.points['x'], self.points['y']))
+            return
+
+        # Находим индексы точек с boundary_type == 'wall'
+        wall_mask = self.points['boundary_type'] == 'wall'
+        if not np.any(wall_mask):
+            logger.error("Не найдено ни одной точки с типом WALL. SDF не может быть вычислен.")
+            self.wall_points = np.empty((0, 2))
+        else:
+            self.wall_points = np.column_stack((self.points['x'][wall_mask], self.points['y'][wall_mask]))
+            logger.info(f"Найдено {len(self.wall_points)} точек WALL для построения SDF.")
+
+    def compute_sdf_kdtree(self, x, y) -> float:
+        """Вычисляет расстояние до ближайшей точки WALL с использованием KDTree."""
+        if self.wall_points is None or len(self.wall_points) == 0:
+            return 0.0
+        # Если KDTree ещё не построен, строим его
+        if not hasattr(self, '_wall_tree'):
+            if SCIPY_AVAILABLE:
+                self._wall_tree = cKDTree(self.wall_points)
+            else:
+                # медленный метод, но для совместимости
+                self._wall_tree = None
+
+        if SCIPY_AVAILABLE and self._wall_tree is not None:
+            dist, _ = self._wall_tree.query(np.array([x, y]), k=1)
+            return float(dist)
+        else:
+            # fallback: перебор всех точек (очень медленно для больших массивов)
+            min_dist = np.inf
+            for wx, wy in self.wall_points:
+                d = (x - wx) ** 2 + (y - wy) ** 2
+                if d < min_dist:
+                    min_dist = d
+            return np.sqrt(min_dist) if min_dist != np.inf else 0.0
+
+    def select_fluid(self) -> str:
+        """Интерактивный выбор жидкости из библиотеки."""
+        fluids = self.fluid_lib.list_fluids()
+        if not fluids:
+            raise RuntimeError("Библиотека жидкостей пуста. Создайте жидкость в модуле Fluids.")
+        print("\nДоступные жидкости:")
+        for i, name in enumerate(fluids, 1):
+            fluid = self.fluid_lib.get(name)
+            print(f"{i}. {fluid.display()}")
+        while True:
+            try:
+                choice = input("Выберите номер жидкости: ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(fluids):
+                    self.fluid = self.fluid_lib.get(fluids[idx])
+                    return fluids[idx]
+                else:
+                    print("Неверный номер.")
+            except ValueError:
+                print("Введите число.")
+
+    def select_conditions(self) -> str:
+        """Интерактивный выбор граничных условий."""
+        names = self.cond_manager.list_names()
+        if not names:
+            raise RuntimeError("Библиотека условий пуста. Создайте условия в модуле Conditions.")
+        print("\nДоступные наборы условий:")
+        for i, name in enumerate(names, 1):
+            cond = self.cond_manager.get(name)
+            print(f"{i}. {name}")
+            print(f"   {cond.display(self.fluid_lib)}")
+        while True:
+            try:
+                choice = input("Выберите номер условий: ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(names):
+                    self.conditions = self.cond_manager.get(names[idx])
+                    return names[idx]
+                else:
+                    print("Неверный номер.")
+            except ValueError:
+                print("Введите число.")
+
+    def initialize_fields(self,
+                          pressure_mode: str = 'constant',
+                          velocity_mode: str = 'constant',
+                          temperature: float = 293.15):
+        """
+        Вычисляет поля для всех точек.
+        pressure_mode: 'constant' или 'linear_x' (линейное изменение от inlet к outlet по x)
+        velocity_mode: пока только 'constant' (постоянная, равная входной)
+        """
+        if self.points is None:
+            raise RuntimeError("Сначала загрузите точки.")
+        if self.fluid is None:
+            raise RuntimeError("Сначала выберите жидкость.")
+        if self.conditions is None:
+            raise RuntimeError("Сначала выберите граничные условия.")
+        if self.wall_points is None:
+            self.extract_wall_points()
+
+        # Сохраняем параметры
+        self.pressure_mode = pressure_mode
+        self.velocity_mode = velocity_mode
+        self.temperature = temperature
+
+        N = len(self.points)
+        # Создаём структурированный массив
+        arr = np.zeros(N, dtype=point_dtype)
+
+        # Копируем основные атрибуты из исходных точек
+        for name in point_dtype.names:
+            if name in ['id', 'x', 'y', 'boundary_type', 'on_boundary'] and name in self.points.dtype.names:
+                arr[name] = self.points[name]
+
+        # Если каких-то полей нет, заполняем значениями по умолчанию
+        if 'id' not in self.points.dtype.names:
+            arr['id'] = np.arange(N)
+        if 'x' not in self.points.dtype.names:
+            raise ValueError("В точках отсутствуют координаты x")
+        if 'y' not in self.points.dtype.names:
+            raise ValueError("В точках отсутствуют координаты y")
+        # Для остальных – останутся нули
+
+        # Поля жидкости (константы)
+        arr['density'] = self.fluid.density
+        arr['kin_visc'] = self.fluid.kinematic_viscosity
+        arr['dyn_visc'] = self.fluid.dynamic_viscosity
+        arr['temperature'] = temperature
+
+        # Скорость (постоянная, равна входной)
+        arr['u'] = self.conditions.u
+        arr['v'] = self.conditions.v
+
+        # Давление
+        if pressure_mode == 'constant':
+            arr['pressure'] = self.conditions.inlet_pressure
+        elif pressure_mode == 'linear_x':
+            x_min = np.min(arr['x'])
+            x_max = np.max(arr['x'])
+            if x_max > x_min:
+                slope = (self.conditions.outlet_pressure - self.conditions.inlet_pressure) / (x_max - x_min)
+                arr['pressure'] = self.conditions.inlet_pressure + slope * (arr['x'] - x_min)
+            else:
+                arr['pressure'] = self.conditions.inlet_pressure
+        else:
+            raise ValueError(f"Неизвестный режим давления: {pressure_mode}")
+
+        # SDF (расстояние до ближайшей точки WALL)
+        logger.info("Вычисление SDF для всех точек...")
+        for i in range(N):
+            arr['sdf'][i] = self.compute_sdf_kdtree(arr['x'][i], arr['y'][i])
+            if i % 10000 == 0:
+                logger.info(f"  ... {i}/{N}")
+
+        logger.info(f"SDF stats: min={np.min(arr['sdf']):.6f}, max={np.max(arr['sdf']):.6f}, mean={np.mean(arr['sdf']):.6f}")
+
+        self.points_with_fields = arr
+        logger.info("Поля инициализированы.")
+        return arr
+
+    def save(self, description: str = "initial"):
+        """Сохраняет массив точек с полями в NPY и метаданные."""
+        if self.points_with_fields is None:
+            raise RuntimeError("Нет данных для сохранения.")
+        base = os.path.join(self.output_dir, f"{description}.npy")
+        np.save(base, self.points_with_fields)
+        logger.info(f"Сохранено: {base}")
+
+        # Сохраняем также метаданные (использованные параметры)
+        meta = {
+            'description': description,
+            'fluid': self.fluid.to_dict() if self.fluid else None,
+            'conditions': self.conditions.to_dict() if self.conditions else None,
+            'temperature': self.temperature,
+            'pressure_mode': self.pressure_mode,
+            'velocity_mode': self.velocity_mode,
+            'num_points': len(self.points_with_fields)
+        }
+        meta_path = os.path.join(self.output_dir, f"{description}_metadata.npy")
+        np.save(meta_path, meta)
+        logger.info(f"Метаданные сохранены: {meta_path}")
+
+    def plot_field(self, field_name: str, title: str = None, save: bool = True, show: bool = False):
+        """Строит scatter plot поля."""
+        if self.points_with_fields is None:
+            raise RuntimeError("Нет данных для визуализации.")
+        plt.figure(figsize=(12, 8))
+        x = self.points_with_fields['x']
+        y = self.points_with_fields['y']
+        values = self.points_with_fields[field_name]
+
+        scatter = plt.scatter(x, y, c=values, s=1, cmap='jet', alpha=0.6)
+        plt.colorbar(scatter, label=field_name)
+        plt.title(title or f"Поле {field_name}")
+        plt.xlabel('x, м')
+        plt.ylabel('y, м')
+        plt.axis('equal')
+        plt.grid(alpha=0.3)
+
+        if save:
+            filename = os.path.join(self.plots_dir, f"{field_name}.png")
+            plt.savefig(filename, dpi=150, bbox_inches='tight')
+            logger.info(f"График сохранён: {filename}")
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+    def plot_all_fields(self):
+        """Строит графики для основных полей."""
+        fields = [
+            ('pressure', 'Давление, Па'),
+            ('u', 'Скорость U, м/с'),
+            ('v', 'Скорость V, м/с'),
+            ('sdf', 'SDF (расстояние до стенки), м'),
+            ('density', 'Плотность, кг/м³'),
+            ('kin_visc', 'Кинематическая вязкость, м²/с')
+        ]
+        for fname, label in fields:
+            self.plot_field(fname, title=label)
+
+
+def initialize_menu():
+    """Интерактивное меню инициализации."""
+    init = Initializer()
+
+    print("\n" + "="*60)
+    print("ИНИЦИАЛИЗАЦИЯ РАСЧЁТНОЙ ОБЛАСТИ".center(60))
+    print("="*60)
+
+    # Шаг 1: загрузка точек из Sampler
+    try:
+        init.load_sampler_points()
+    except Exception as e:
+        print(f"❌ Ошибка загрузки точек: {e}")
+        input("Нажмите Enter для возврата...")
+        return
+
+    # Шаг 2: извлечение точек WALL для SDF
+    try:
+        init.extract_wall_points()
+        if len(init.wall_points) == 0:
+            print("⚠️ Не найдено точек WALL. SDF будет нулевым.")
+    except Exception as e:
+        print(f"❌ Ошибка при извлечении точек WALL: {e}")
+        input("Нажмите Enter для возврата...")
+        return
+
+    # Шаг 3: выбор жидкости
+    try:
+        fluid_name = init.select_fluid()
+        print(f"Выбрана жидкость: {fluid_name}")
+    except Exception as e:
+        print(f"❌ {e}")
+        input("Нажмите Enter для возврата...")
+        return
+
+    # Шаг 4: выбор граничных условий
+    try:
+        cond_name = init.select_conditions()
+        print(f"Выбраны условия: {cond_name}")
+    except Exception as e:
+        print(f"❌ {e}")
+        input("Нажмите Enter для возврата...")
+        return
+
+    # Шаг 5: параметры инициализации
+    print("\nПараметры инициализации:")
+    print("Режим давления:")
+    print("   1 - постоянное (равное давлению на входе)")
+    print("   2 - линейное по X (от inlet до outlet)")
+    press_mode_choice = input("Выберите (1/2): ").strip()
+    pressure_mode = 'constant' if press_mode_choice == '1' else 'linear_x'
+
+    # Скорость пока только постоянная
+    velocity_mode = 'constant'
+
+    try:
+        temp = float(input("Температура [K] (по умолчанию 293.15): ").strip() or "293.15")
+    except ValueError:
+        temp = 293.15
+
+    # Шаг 6: вычисление полей
+    print("\n🔧 Вычисление полей...")
+    try:
+        init.initialize_fields(pressure_mode=pressure_mode, velocity_mode=velocity_mode, temperature=temp)
+    except Exception as e:
+        print(f"❌ Ошибка при вычислении полей: {e}")
+        input("Нажмите Enter для возврата...")
+        return
+
+    # Шаг 7: сохранение
+    desc = input("Введите описание для сохранения (по умолчанию 'initial'): ").strip() or "initial"
+    init.save(description=desc)
+
+    # Шаг 8: построение графиков
+    plot_choice = input("Построить графики полей? (Y/n): ").strip().lower()
+    if plot_choice == '' or plot_choice == 'y' or plot_choice == 'yes':
+        init.plot_all_fields()
+        print(f"Графики сохранены в {init.plots_dir}")
+
+    print("\n✅ Инициализация завершена.")
+
+
+if __name__ == "__main__":
+    initialize_menu()
