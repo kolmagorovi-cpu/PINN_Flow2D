@@ -1,0 +1,29 @@
+   """
+    for x in np.arange(minx, maxx, step):
+        for y in np.arange(miny, maxy, step):
+            point = Point(x, y)
+            distance_to_foil = point.distance(poly_foil)
+            distance_to_boundary = point.distance(poly_domain)
+            step = (distance_to_boundary*step_foil+
+                    distance_to_foil*step_boundary)
+            Number_of_points = Number_of_points - 1.0
+            print("Точек осталось: ", Number_of_points)
+            if area.contains(point):
+                points.append((x, y))
+    """       
+
+    x = minx; y = miny
+    Number_of_points = (maxx-minx)/step*(maxy-miny)/step
+    while x <= maxx:
+        while y <= maxy:
+            point = Point(x,y)
+            distance_to_foil = point.distance(poly_foil)
+            distance_to_boundary = point.distance(poly_domain)
+            step = (distance_to_boundary*step_foil+
+                    distance_to_foil*step_boundary)/(distance_to_boundary+distance_to_foil)
+            y = y + step
+            Number_of_points = Number_of_points - 1.0
+            print("Точек осталось: ", Number_of_points)
+            if area.contains(point):
+                points.append((x, y))
+        x = x + step

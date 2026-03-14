@@ -1,0 +1,3 @@
+C:/Users/Ivan/source/repos/PINN_Flow2D/Geometry/Data/domen.txt
+C:/Users/Ivan/source/repos/PINN_Flow2D/Geometry/Data/foil.txt
+C:/Users/Ivan/source/repos/PINN_Flow2D/Samplers/Data/points.txt
