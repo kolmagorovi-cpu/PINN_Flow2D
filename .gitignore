@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Виртуальные окружения
+.env/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Конфигурация с чувствительными данными
+config.yaml
+*.local.yaml
+*.secret.yaml
+
+# Чекпоинты и результаты обучения
+Checkpoints/
+*.pt
+*.pth
+
+# Временные файлы
+*.tmp
+*.log
+
+# Данные
+*.npy
+*.csv
+!requirements.txt
+
+# Графики и визуализация
+*.png
+*.jpg
+*.svg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
