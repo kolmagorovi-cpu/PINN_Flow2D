@@ -1,6 +1,6 @@
 # План расширения модуля Collocation.py для поддержки геометрии тройника
 
-**Версия документа:** 1.0  
+**Версия документа:** 1.1  
 **Дата:** 2026-03-18  
 **Автор:** BelchikovDA  
 **Статус:** На утверждении
@@ -20,7 +20,24 @@
 - Несколько границ одного типа (1 inlet + 2 outlet или наоборот)
 - Прямолинейные границы (упрощает классификацию точек)
 
-### 1.2. Анализ альтернатив
+### 1.2. Существующая конфигурация
+
+В проекте уже имеется файл конфигурации геометрии:
+
+**Файл:** `Airfoil PINN/geom_config.yaml`
+
+```yaml
+geom_type: 'junction'
+geom_name: 'VMFL010'
+```
+
+Параметр `geom_type` уже используется для выбора типа геометрии:
+- `'junction'` — геометрия тройника
+- `'airfoil'` — геометрия профиля крыла (по умолчанию)
+
+Параметр `geom_name` ссылается на конкретную конфигурацию в файле `junction_geoms.yaml`.
+
+### 1.3. Анализ альтернатив
 
 | Критерий | Расширение Collocation.py | Новый модуль junction_collocation.py |
 |----------|---------------------------|--------------------------------------|
@@ -30,7 +47,7 @@
 | Масштабируемость | Ограничена сложностью | Полная независимость |
 | **Рекомендация** | ✅ **Предпочтительно** | ⚠️ При планах на 3D |
 
-**Решение:** Расширить `Collocation.py` с разделением логики через параметр `geometry_type`.
+**Решение:** Расширить `Collocation.py` с разделением логики через параметр `geom_type` из `geom_config.yaml`.
 
 ---
 
@@ -63,13 +80,15 @@ class BoundaryType(Enum):
 class SamplerConfig:
     # ... существующие поля ...
     
-    # Новый параметр: тип геометрии
-    geometry_type: str = "airfoil"  # "airfoil" или "junction"
+    # Параметр загружается из geom_config.yaml
+    geom_type: str = "airfoil"    # "airfoil" или "junction"
+    geom_name: str = None         # Имя конфигурации (например, 'VMFL010')
     
     # Для тройника: именованные границы
-    junction_config: Dict = None    # Путь к YAML или dict с параметрами
+    junction_config_path: str = None      # Путь к junction_geoms.yaml
+    junction_params: Dict = None          # Загруженные параметры тройника
     
-    # Назначение границ для тройника
+    # Назначение границ для тройника (автоматически определяется)
     junction_inlet_boundary: str = "bottom"   # "bottom", "left", "right", "top"
     junction_outlet_boundaries: List[str] = None  # ["top", "right"]
     
@@ -89,26 +108,99 @@ dtype = [('id', 'i4'), ('x', 'f8'), ('y', 'f8'),
          ('channel_id', 'U20')]       # NEW: идентификатор канала
 ```
 
-### 2.2. Изменение класса `CollocationPoints`
+### 2.2. Загрузка конфигурации из geom_config.yaml
 
-#### 2.2.1. Новые атрибуты
+#### 2.2.1. Новый метод загрузки конфигурации
 
 ```python
-class CollocationPoints:
-    def __init__(self, config: SamplerConfig):
-        # ... существующие атрибуты ...
+def load_geometry_config(self, config_path: str = None) -> None:
+    """
+    Загрузка конфигурации геометрии из YAML-файла.
+    
+    Args:
+        config_path: Путь к geom_config.yaml (по умолчанию: 
+                     'Airfoil PINN/geom_config.yaml')
+    """
+    if config_path is None:
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "Airfoil PINN", "geom_config.yaml"
+        )
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            geom_config = yaml.safe_load(f)
         
-        # Для тройника
-        self.junction_params = None      # Параметры из YAML
-        self.channel_width = None        # Ширина канала
-        self.inlet_points = []           # Точки на inlet
-        self.outlet_points = []          # Точки на outlet
-        self.wall_points = []            # Точки на стенах
+        self.config.geom_type = geom_config.get('geom_type', 'airfoil')
+        self.config.geom_name = geom_config.get('geom_name')
+        
+        logger.info(f"✅ Конфигурация геометрии загружена: {config_path}")
+        logger.info(f"   geom_type: {self.config.geom_type}")
+        logger.info(f"   geom_name: {self.config.geom_name}")
+        
+        # Для тройника — загрузка дополнительных параметров
+        if self.config.geom_type == 'junction':
+            self._load_junction_params()
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось загрузить geom_config.yaml: {e}")
+        logger.info("   Используется конфигурация по умолчанию (airfoil)")
+
+def _load_junction_params(self) -> None:
+    """Загрузка параметров тройника из junction_geoms.yaml"""
+    junctions_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "Airfoil PINN", "Geometry", "junction_geoms.yaml"
+    )
+    
+    try:
+        with open(junctions_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        
+        # Поиск конфигурации по имени
+        junctions = {j['name']: j for j in data.get('junctions', [])}
+        
+        if self.config.geom_name in junctions:
+            self.config.junction_params = junctions[self.config.geom_name]
+            self.channel_width = self.config.junction_params.get('chanel_width')
+            logger.info(f"✅ Параметры тройника загружены: {self.config.geom_name}")
+        else:
+            logger.error(f"❌ Конфигурация '{self.config.geom_name}' не найдена")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки junction_geoms.yaml: {e}")
 ```
 
 ---
 
 ## 3. План модификации методов
+
+### 3.0. Загрузка конфигурации в __init__()
+
+**Новый метод:**
+
+```python
+def __init__(self, config: SamplerConfig):
+    self.config = config
+    self.points: List[CollocationPoint] = []
+    self.points_interior: List[CollocationPoint] = []
+    self.points_boundary: List[CollocationPoint] = []
+    self.metadata = {}
+    self.foil_metadata = {}
+    self.next_id = 0
+    self.foil_coords = None
+    self.domain_coords = None
+    self.foil_is_closed = False
+    
+    # Для тройника
+    self.junction_params = None
+    self.channel_width = None
+    
+    # Загрузка конфигурации геометрии
+    self.load_geometry_config()
+    
+    os.makedirs(config.output_dir, exist_ok=True)
+```
 
 ### 3.1. Метод `load_geometries()`
 
@@ -121,7 +213,7 @@ class CollocationPoints:
 ```python
 def load_geometries(self) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Загрузка геометрии в зависимости от типа"""
-    if self.config.geometry_type == "junction":
+    if self.config.geom_type == "junction":
         return self._load_junction_geometry()
     else:
         return self._load_airfoil_geometry()
@@ -164,7 +256,7 @@ def _load_airfoil_geometry(self) -> Tuple[np.ndarray, Optional[np.ndarray]]:
 def sample_boundary_external(self, contour: np.ndarray, step: float,
                               bounds: Dict) -> List[CollocationPoint]:
     """Генерация точек на внешнем контуре"""
-    if self.config.geometry_type == "junction":
+    if self.config.geom_type == "junction":
         return self._sample_boundary_junction(contour, step)
     else:
         return self._sample_boundary_airfoil(contour, step, bounds)
@@ -249,7 +341,7 @@ def _sample_boundary_airfoil(self, contour: np.ndarray, step: float,
 ```python
 def sample_boundary_foil(self, foil: np.ndarray, step: float) -> List[CollocationPoint]:
     """Генерация точек на профиле"""
-    if self.config.geometry_type == "junction":
+    if self.config.geom_type == "junction":
         # Для тройника профиль отсутствует
         logger.info("ℹ️ Профиль отсутствует (геометрия тройника)")
         return []
@@ -271,7 +363,7 @@ def _sample_boundary_foil_airfoil(self, foil: np.ndarray,
 def sample_bottom_edge(self, x_min_dom: float, x_min_foil: float,
                        y_min_dom: float, step: float) -> List[CollocationPoint]:
     """Генерация точек на нижней границе слева от профиля"""
-    if self.config.geometry_type == "junction":
+    if self.config.geom_type == "junction":
         # Для тройника не применяется
         return []
     else:
@@ -303,7 +395,7 @@ def generate(self, method: str = None, **kwargs) -> Dict[str, np.ndarray]:
     method = method or self.config.sampling_method
     
     # Проверка совместимости метода с геометрией
-    if self.config.geometry_type == "junction" and method == "adaptive_foil":
+    if self.config.geom_type == "junction" and method == "adaptive_foil":
         logger.warning("⚠️ Метод 'adaptive_foil' недоступен для тройника. "
                       "Используется 'adaptive_all'.")
         method = "adaptive_all"
@@ -352,7 +444,7 @@ def generate(self, method: str = None, **kwargs) -> Dict[str, np.ndarray]:
     print("\n" + "="*60)
     print("ГЕНЕРАЦИЯ ТОЧЕК КОЛЛОКАЦИИ".center(60))
     print("="*60)
-    print(f"Тип геометрии: {self.config.geometry_type}")
+    print(f"Тип геометрии: {self.config.geom_type}")
     
     # Загрузка геометрии
     domain, foil = self.load_geometries()
@@ -362,7 +454,7 @@ def generate(self, method: str = None, **kwargs) -> Dict[str, np.ndarray]:
     bounds = self._compute_bounds(domain)
     
     # Генерация граничных точек
-    if self.config.geometry_type == "junction":
+    if self.config.geom_type == "junction":
         boundary_points = self.sample_boundary_junction(domain, step)
         foil_points = []
         bottom_points = []
@@ -392,7 +484,7 @@ def _save_all_points(self, boundary_points, foil_points,
     
     # Сохранение метаданных
     metadata = {
-        'geometry_type': self.config.geometry_type,
+        'geom_type': self.config.geom_type,
         'sampling_method': self.config.sampling_method,
         'total_points': total_count,
         'boundary_points': len(boundary_points),
@@ -419,7 +511,7 @@ def _save_all_points(self, boundary_points, foil_points,
 
 ## 4. Изменение главной функции `s2dr()`
 
-### 4.1. Добавление выбора геометрии
+### 4.1. Автоматическая загрузка из geom_config.yaml
 
 ```python
 def s2dr() -> None:
@@ -429,29 +521,27 @@ def s2dr() -> None:
     print("МОДУЛЬ ДИСКРЕТИЗАЦИИ S2DR".center(60))
     print("="*60)
     
-    # Выбор типа геометрии
-    print("\n📐 Выберите тип геометрии:")
-    print("   1. Профиль крыла (airfoil)")
-    print("   2. Т-образный тройник (junction)")
-    
-    choice = input("\nВаш выбор (1 или 2): ").strip()
-    geometry_type = "airfoil" if choice == "1" else "junction"
-    
     # Конфигурация
     config = SamplerConfig(
-        geometry_type=geometry_type,
         sampling_method="regular",
         use_multiprocessing=True,
         num_processes=4,
         # ... остальные параметры ...
     )
     
-    # Для тройника — загрузка параметров
-    if geometry_type == "junction":
-        print("\n📂 Загрузка конфигурации тройника...")
-        config.junction_config = input("Путь к junction_config.yaml: ").strip()
-    
     sampler = CollocationPoints(config)
+    
+    # Конфигурация загружается автоматически из geom_config.yaml
+    # в __init__() через load_geometry_config()
+    
+    print(f"\n📐 Тип геометрии: {sampler.config.geom_type}")
+    print(f"   Конфигурация: {sampler.config.geom_name or 'default'}")
+    
+    # Для тройника — отображение параметров
+    if sampler.config.geom_type == "junction":
+        print(f"\n📐 Параметры тройника:")
+        print(f"   Ширина канала: {sampler.channel_width} м")
+        # ... другие параметры ...
     
     # Генерация
     results = sampler.generate()
@@ -464,6 +554,24 @@ def s2dr() -> None:
     input("Нажмите Enter для выхода...")
 ```
 
+### 4.2. Опциональный интерактивный выбор
+
+```python
+# Если требуется переопределить геометрию из конфига:
+print("\n📐 Использовать геометрию из geom_config.yaml?")
+print("   1. Да (по умолчанию)")
+print("   2. Нет, выбрать вручную")
+
+choice = input("\nВаш выбор: ").strip()
+if choice != "1":
+    print("\nВыберите тип геометрии:")
+    print("   1. Профиль крыла (airfoil)")
+    print("   2. Т-образный тройник (junction)")
+    
+    geom_choice = input("\nВаш выбор: ").strip()
+    config.geom_type = "airfoil" if geom_choice == "1" else "junction"
+```
+
 ---
 
 ## 5. Визуализация
@@ -473,15 +581,15 @@ def s2dr() -> None:
 ```python
 def plot_results(self, results: Dict[str, np.ndarray]) -> None:
     """Визуализация точек коллокации"""
-    
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
+
     # ... существующая логика ...
-    
+
     # Подписи границ для тройника
-    if self.config.geometry_type == "junction":
+    if self.config.geom_type == "junction":
         self._annotate_junction_boundaries(axes[0, 0])
-    
+
     plt.tight_layout()
     plt.show()
 
@@ -501,6 +609,8 @@ def _annotate_junction_boundaries(self, ax) -> None:
 
 | Тест | Описание |
 |------|----------|
+| `test_load_geometry_config()` | Загрузка конфигурации из geom_config.yaml |
+| `test_load_junction_params()` | Загрузка параметров тройника |
 | `test_load_junction_geometry()` | Загрузка геометрии тройника |
 | `test_classify_junction_boundary()` | Классификация границ тройника |
 | `test_sample_boundary_junction()` | Генерация граничных точек |
@@ -523,9 +633,14 @@ def _annotate_junction_boundaries(self, ax) -> None:
 ### 6.3. Тестовые конфигурации
 
 ```yaml
+# geom_config.yaml
+geom_type: 'junction'
+geom_name: 'VMFL010'
+
 # test_junction_config.yaml
 project_name: "T_junction_test"
-geometry_type: "junction"
+geom_type: "junction"
+geom_name: "VMFL010"
 sampling:
   method: "regular"
   step_size: 0.01
@@ -542,13 +657,16 @@ sampling:
 - [ ] Создать копию `Collocation.py` для резервирования
 - [ ] Изучить текущую структуру кода
 - [ ] Подготовить тестовые данные (геометрия тройника)
+- [ ] Проверить наличие `geom_config.yaml` и `junction_geoms.yaml`
 
 ### Этап 2: Рефакторинг (1 день)
 
 - [ ] Выделить `_load_airfoil_geometry()` из `load_geometries()`
 - [ ] Выделить `_sample_boundary_airfoil()` из `sample_boundary_external()`
 - [ ] Вынести `_sample_boundary_foil_airfoil()` из `sample_boundary_foil()`
-- [ ] Добавить параметр `geometry_type` в `SamplerConfig`
+- [ ] Добавить параметры `geom_type`, `geom_name` в `SamplerConfig`
+- [ ] Реализовать метод `load_geometry_config()`
+- [ ] Реализовать метод `_load_junction_params()`
 
 ### Этап 3: Реализация для тройника (1 день)
 
@@ -561,7 +679,7 @@ sampling:
 
 ### Этап 4: Интеграция и тестирование (0.5 дня)
 
-- [ ] Обновить `s2dr()` для выбора геометрии
+- [ ] Обновить `s2dr()` для автоматической загрузки конфигурации
 - [ ] Обновить визуализацию
 - [ ] Провести юнит-тесты
 - [ ] Провести интеграционный тест
@@ -612,28 +730,41 @@ sampling:
 
 ## 10. Приложения
 
-### Приложение A. Пример YAML-конфигурации тройника
+### Приложение A. Существующие конфигурационные файлы
+
+**geom_config.yaml** (основной файл конфигурации геометрии):
 
 ```yaml
-# junction_config.yaml
-geom_name: "T_junction_01"
+geom_type: 'junction'
+geom_name: 'VMFL010'
+```
 
+**junction_geoms.yaml** (библиотека конфигураций тройников):
+
+```yaml
 junctions:
-  - name: "T_junction_01"
+  - name: "VMFL010"
     chanel_width: 0.1        # м
     down_length: 0.5         # м (inlet)
     side_length: 0.3         # м (outlet)
     top_length: 0.4          # м (outlet)
     down2side_angl: 90       # град
     side2top_angl: 90        # град
+    
+  - name: "T_junction_01"
+    chanel_width: 0.05
+    down_length: 0.3
+    side_length: 0.2
+    top_length: 0.25
+    down2side_angl: 90
+    side2top_angl: 90
 ```
 
 ### Приложение B. Пример вызова
 
 ```python
-# Для тройника
+# Автоматическая загрузка из geom_config.yaml
 config = SamplerConfig(
-    geometry_type="junction",
     sampling_method="regular",
     step_size=0.005,
     boundary_point_density=1.5,
@@ -641,6 +772,8 @@ config = SamplerConfig(
 )
 
 sampler = CollocationPoints(config)
+# Конфигурация загружается автоматически в __init__()
+
 results = sampler.generate()
 
 # Выходные файлы:
@@ -657,10 +790,15 @@ results = sampler.generate()
 │                  CollocationPoints                      │
 ├─────────────────────────────────────────────────────────┤
 │ - config: SamplerConfig                                 │
-│ - geometry_type: str                                    │
-│ - junction_params: Dict                                 │
+│ - geom_type: str (из geom_config.yaml)                  │
+│ - geom_name: str (из geom_config.yaml)                  │
+│ - junction_params: Dict (из junction_geoms.yaml)        │
 │ - points: List[CollocationPoint]                        │
 ├─────────────────────────────────────────────────────────┤
+│ + __init__()                                            │
+│   └─ load_geometry_config()                             │
+│       ├─ Загрузка geom_config.yaml                      │
+│       └─ _load_junction_params()                        │
 │ + load_geometries()                                     │
 │   ├─ _load_airfoil_geometry()                           │
 │   └─ _load_junction_geometry()                          │
@@ -680,5 +818,12 @@ results = sampler.generate()
 | Версия | Дата | Автор | Изменения |
 |--------|------|-------|-----------|
 | 1.0 | 2026-03-18 | BelchikovDA | Первоначальная версия |
+| 1.1 | 2026-03-18 | BelchikovDA | Интеграция с существующим geom_config.yaml |
 
 ---
+
+**Документ утверждён:**
+
+_____________________ / _________________ / 2026
+
+(подпись) (ФИО)
