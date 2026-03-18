@@ -1,0 +1,16 @@
+junctions:
+  - name: 'VMFL010'
+    chanel_width: 1
+    down_length: 2
+    side_length: 3
+    top_length: 3
+    top2side_angl: 90
+    side2down_angl: 90
+
+  - name: 'Y-60'
+    chanel_width: 1
+    down_length: 2
+    side_length: 2
+    top_length: 2
+    top2side_angl: 120
+    side2down_angl: 120

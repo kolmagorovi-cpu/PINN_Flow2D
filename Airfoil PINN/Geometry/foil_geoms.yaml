@@ -1,0 +1,8 @@
+foils :
+  - name : 'VMFL063'
+    x_contour_points : [0,  0, 1500]
+    y_contour_points : [0, 45,   45]
+    x_contour_coef : 1
+    y_contour_coef : 1
+    x_domain_coef : 1
+    y_domain_coef : 20
