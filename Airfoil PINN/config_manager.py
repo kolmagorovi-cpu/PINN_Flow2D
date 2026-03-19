@@ -196,10 +196,6 @@ class ConfigManager:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 loaded = yaml.safe_load(f)
-        except yaml.constructor.ConstructorError as e:
-            logger.warning(f"Ошибка safe_load для {filepath}: {e}. Пробуем FullLoader (может быть небезопасно)")
-            with open(filepath, 'r', encoding='utf-8') as f:
-                loaded = yaml.load(f, Loader=yaml.FullLoader)
         except Exception as e:
             logger.error(f"Не удалось загрузить YAML из {filepath}: {e}")
             raise

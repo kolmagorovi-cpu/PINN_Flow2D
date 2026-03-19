@@ -134,7 +134,7 @@ class PINNSolver:
 
         # Исправление FutureWarning для GradScaler
         if self.use_amp and self.device.type == 'cuda':
-            self.scaler = torch.amp.GradScaler('cuda')
+            self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
 

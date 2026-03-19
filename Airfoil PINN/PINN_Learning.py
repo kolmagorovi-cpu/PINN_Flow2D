@@ -56,11 +56,6 @@ PICTURES_DIR = "Pictures"
 CONFIG_DIR = ConfigManager.CONFIG_DIR
 
 
-def clear_screen() -> None:
-    """Очищает экран с помощью ANSI escape-последовательности."""
-    print('\033c', end='')
-
-
 def print_submenu_header(title: str) -> None:
     """Выводит заголовок подменю."""
     print(f"\n{title} {{")
