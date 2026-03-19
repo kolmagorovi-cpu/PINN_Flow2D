@@ -1,42 +1,52 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Модуль дискретизации S2DR (Sampler 2D)
-Генерация точек коллокации для PINNs с классификацией граничных условий
+Модуль дискретизации S2DR (Sampler 2D).
+
+Генерация точек коллокации для PINNs с классификацией граничных условий.
 
 Область задаётся внешним прямоугольником (domain) и профилем (foil).
 Точки на внешних границах, на профиле и внутри области генерируются раздельно.
 
 Поддерживаются методы:
-- regular      : равномерная сетка
-- irregular    : равномерное случайное распределение
-- adaptive_foil: сгущение у профиля (на основе расстояния до профиля)
-- adaptive_all : сгущение ко всем границам (на основе расстояния до ближайшей границы)
+    - regular: равномерная сетка
+    - irregular: равномерное случайное распределение
+    - adaptive_foil: сгущение у профиля (на основе расстояния до профиля)
+    - adaptive_all: сгущение ко всем границам (на основе расстояния до ближайшей границы)
 
 Все методы поддерживают многопроцессорность (с корректной работой на Windows).
 Пользователь может задать параметры alpha (степень сгущения) и epsilon_factor (масштаб сгущения),
 а также выбрать тип верхней границы (INLET или OUTLET).
 
-Исправленная версия: улучшена производительность регулярной сетки (векторизованная проверка),
-исправлены обработчики исключений (замена голых except на конкретные).
+Example:
+    >>> config = SamplerConfig(step_size=0.01, num_processes=4)
+    >>> sampler = CollocationPoints(config)
+    >>> domain, foil = sampler.load_geometries()
+    >>> sampler.generate_all_points(domain, foil)
+    >>> sampler.save_points()
+
+Автор: Колмагоров И.Д.
+Версия: 3.260226 (исправленная)
 """
 
 import numpy as np
 from shapely.geometry import Polygon, Point, LineString
 import matplotlib.pyplot as plt
-from matplotlib.path import Path  # для векторизованной проверки внутри области
+from matplotlib.path import Path
 from multiprocessing import Process, Queue, freeze_support
 import os
 import time
 import logging
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union, Any
 from dataclasses import dataclass
 from enum import Enum
 import threading
 from collections import defaultdict
 import sys
-import queue  # для queue.Empty
+import queue
 from scipy.spatial import cKDTree
+
+from type_hints import CollocationPointDict, SamplerConfigDict
 
 # Попытка импорта tqdm для прогресс-бара
 try:
@@ -49,6 +59,15 @@ except ImportError:
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEOMETRY_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Data")
 DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Sampler", "Data")
+
+# Импортируем константы после определения локальных констант
+from constants import (
+    CLASSIFICATION_TOLERANCE_FACTOR,
+    MAX_ATTEMPTS_MULTIPLIER,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_PROCESSES,
+    QUEUE_TIMEOUT,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -65,6 +84,18 @@ class BoundaryType(Enum):
 
 @dataclass
 class CollocationPoint:
+    """
+    Точка коллокации с классификацией граничных условий.
+
+    Attributes:
+        id: Уникальный идентификатор точки
+        x: X-координата [м]
+        y: Y-координата [м]
+        boundary_type: Тип границы
+        on_airfoil: Находится ли точка на профиле
+        on_boundary: Находится ли точка на границе
+        segment_id: ID сегмента границы
+    """
     id: int
     x: float
     y: float
@@ -73,64 +104,142 @@ class CollocationPoint:
     on_boundary: bool = False
     segment_id: int = -1
 
-    def to_dict(self) -> dict:
-        return {
-            'id': self.id,
-            'x': self.x,
-            'y': self.y,
-            'boundary_type': self.boundary_type.value,
-            'on_airfoil': self.on_airfoil,
-            'on_boundary': self.on_boundary,
-            'segment_id': self.segment_id
-        }
+    def to_dict(self) -> CollocationPointDict:
+        """
+        Преобразует точку в словарь.
+
+        Returns:
+            Словарь с данными точки
+        """
+        return CollocationPointDict(
+            id=self.id,
+            x=self.x,
+            y=self.y,
+            boundary_type=self.boundary_type.value,
+            on_airfoil=self.on_airfoil,
+            on_boundary=self.on_boundary,
+            segment_id=self.segment_id
+        )
 
     def to_tuple(self) -> Tuple[float, float]:
+        """
+        Возвращает координаты точки в виде кортежа.
+
+        Returns:
+            Кортеж (x, y)
+        """
         return (self.x, self.y)
 
 
 @dataclass
 class SamplerConfig:
+    """
+    Конфигурация для дискретизации расчётной области.
+
+    Attributes:
+        num_processes: Количество процессов для параллельных вычислений
+        step_size: Шаг дискретизации
+        step_units: Единицы шага ('m' или 'mm')
+        use_multiprocessing: Использовать ли многопроцессорность
+        show_progress: Показывать ли прогресс-бар
+        save_format: Формат сохранения ('npy', 'csv')
+        plot_results: Построить ли результаты
+        plot_dpi: DPI для графиков
+        geometry_dir: Директория с геометрией
+        output_dir: Директория для выходных файлов
+        boundary_point_density: Плотность точек на границах
+        interior_point_density: Плотность внутренних точек
+        symmetry_type: Тип симметрии нижней границы
+        top_boundary_type: Тип верхней границы ('inlet' или 'outlet')
+        sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all')
+        adaptive_alpha: Степень сгущения (для адаптивных методов)
+        adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
+    """
     num_processes: int = 4
     step_size: float = 0.01
-    step_units: str = 'm'           # 'm' или 'mm'
+    step_units: str = 'm'
     use_multiprocessing: bool = True
     show_progress: bool = True
-    save_format: str = 'npy'         # 'npy', 'csv'
+    save_format: str = 'npy'
     plot_results: bool = True
     plot_dpi: int = 300
-
     geometry_dir: str = DEFAULT_GEOMETRY_DIR
     output_dir: str = DEFAULT_OUTPUT_DIR
-
     boundary_point_density: float = 1.0
     interior_point_density: float = 1.0
-
-    # Тип симметрии для нижней границы (для разомкнутого профиля)
-    symmetry_type: str = "symmetry"   # "symmetry" или "axis_symmetry"
-
-    # Тип верхней границы (может быть "inlet" или "outlet")
+    symmetry_type: str = "symmetry"
     top_boundary_type: str = "outlet"
+    sampling_method: str = "regular"
+    adaptive_alpha: float = 1.0
+    adaptive_epsilon_factor: float = 0.01
 
-    # Метод генерации внутренних точек
-    sampling_method: str = "regular"  # "regular", "irregular", "adaptive_foil", "adaptive_all"
+    def __post_init__(self) -> None:
+        """
+        Инициализация после создания dataclass.
 
-    # Параметры адаптивного сгущения
-    adaptive_alpha: float = 1.0               # степень сгущения
-    adaptive_epsilon_factor: float = 0.01     # доля характерного размера для масштаба сгущения
+        Создаёт директории и проверяет корректность top_boundary_type.
 
-    def __post_init__(self):
+        Raises:
+            ValueError: Если top_boundary_type не 'inlet' или 'outlet'
+        """
         os.makedirs(self.geometry_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
         if self.top_boundary_type not in ('inlet', 'outlet'):
             raise ValueError("top_boundary_type должно быть 'inlet' или 'outlet'")
+
+    def to_dict(self) -> SamplerConfigDict:
+        """
+        Преобразует конфигурацию в словарь.
+
+        Returns:
+            Словарь с параметрами конфигурации
+        """
+        return SamplerConfigDict(
+            num_processes=self.num_processes,
+            step_size=self.step_size,
+            step_units=self.step_units,
+            use_multiprocessing=self.use_multiprocessing,
+            show_progress=self.show_progress,
+            save_format=self.save_format,
+            plot_results=self.plot_results,
+            plot_dpi=self.plot_dpi,
+            geometry_dir=self.geometry_dir,
+            output_dir=self.output_dir,
+            boundary_point_density=self.boundary_point_density,
+            interior_point_density=self.interior_point_density,
+            symmetry_type=self.symmetry_type,
+            top_boundary_type=self.top_boundary_type,  # type: ignore
+            sampling_method=self.sampling_method,  # type: ignore
+            adaptive_alpha=self.adaptive_alpha,
+            adaptive_epsilon_factor=self.adaptive_epsilon_factor
+        )
 
 
 # ----------------------------------------------------------------------
 # Вспомогательные функции для многопроцессорной обработки (вынесены на уровень модуля)
 # ----------------------------------------------------------------------
 
-def _regular_worker(domain, step, bounds, proc_id, total_procs, result_queue, progress_queue):
-    """Worker для регулярной сетки (использует векторизованную проверку Path)."""
+def _regular_worker(
+    domain: np.ndarray,
+    step: float,
+    bounds: Tuple[float, float, float, float],
+    proc_id: int,
+    total_procs: int,
+    result_queue: Queue,
+    progress_queue: Queue
+) -> None:
+    """
+    Worker для регулярной сетки (использует векторизованную проверку Path).
+
+    Args:
+        domain: Массив точек области
+        step: Шаг сетки
+        bounds: Границы (x_min, x_max, y_min, y_max)
+        proc_id: ID процесса
+        total_procs: Общее количество процессов
+        result_queue: Очередь для результатов
+        progress_queue: Очередь для прогресса
+    """
     # Создаём Path для области
     path = Path(domain)
     x_min, x_max, y_min, y_max = bounds
@@ -147,17 +256,34 @@ def _regular_worker(domain, step, bounds, proc_id, total_procs, result_queue, pr
     progress_queue.put((proc_id, len(valid_points), len(points)))
 
 
-def _irregular_worker(domain, bounds, target, proc_id, result_queue, progress_queue):
-    """Worker для нерегулярной (случайной) сетки."""
+def _irregular_worker(
+    domain: np.ndarray,
+    bounds: Tuple[float, float, float, float],
+    target: int,
+    proc_id: int,
+    result_queue: Queue,
+    progress_queue: Queue
+) -> None:
+    """
+    Worker для нерегулярной (случайной) сетки.
+
+    Args:
+        domain: Массив точек области
+        bounds: Границы (x_min, x_max, y_min, y_max)
+        target: Целевое количество точек
+        proc_id: ID процесса
+        result_queue: Очередь для результатов
+        progress_queue: Очередь для прогресса
+    """
     path = Path(domain)
     x_min, x_max, y_min, y_max = bounds
     points = []
     attempts = 0
-    max_attempts = target * 20
+    max_attempts = target * MAX_ATTEMPTS_MULTIPLIER
     last_report = 0
     while len(points) < target and attempts < max_attempts:
         # Генерируем батч случайных точек
-        batch_size = min(10000, max_attempts - attempts)
+        batch_size = min(DEFAULT_BATCH_SIZE, max_attempts - attempts)
         xs = np.random.uniform(x_min, x_max, batch_size)
         ys = np.random.uniform(y_min, y_max, batch_size)
         candidates = np.column_stack((xs, ys))
@@ -176,11 +302,30 @@ def _irregular_worker(domain, bounds, target, proc_id, result_queue, progress_qu
     result_queue.put(points)
 
 
-def _adaptive_worker(domain, boundary_points, bounds, target, alpha, epsilon_factor, proc_id,
-                     result_queue, progress_queue):
+def _adaptive_worker(
+    domain: np.ndarray,
+    boundary_points: np.ndarray,
+    bounds: Tuple[float, float, float, float],
+    target: int,
+    alpha: float,
+    epsilon_factor: float,
+    proc_id: int,
+    result_queue: Queue,
+    progress_queue: Queue
+) -> None:
     """
     Worker для адаптивного метода (сгущение к заданным граничным точкам).
-    boundary_points – массив координат точек, к которым выполняется сгущение.
+
+    Args:
+        domain: Массив точек области
+        boundary_points: Массив координат точек, к которым выполняется сгущение
+        bounds: Границы (x_min, x_max, y_min, y_max)
+        target: Целевое количество точек
+        alpha: Степень сгущения
+        epsilon_factor: Масштаб сгущения
+        proc_id: ID процесса
+        result_queue: Очередь для результатов
+        progress_queue: Очередь для прогресса
     """
     path = Path(domain)
     # Строим дерево внутри процесса
@@ -190,8 +335,8 @@ def _adaptive_worker(domain, boundary_points, bounds, target, alpha, epsilon_fac
     eps = char_length * epsilon_factor
 
     points = []
-    batch_size = 10000
-    max_attempts = target * 20
+    batch_size = DEFAULT_BATCH_SIZE
+    max_attempts = target * MAX_ATTEMPTS_MULTIPLIER
     total_attempts = 0
     last_report = 0
 
@@ -222,16 +367,37 @@ def _adaptive_worker(domain, boundary_points, bounds, target, alpha, epsilon_fac
 
 
 class CollocationPoints:
-    def __init__(self, config: SamplerConfig):
+    """
+    Класс для генерации точек коллокации с классификацией граничных условий.
+
+    Attributes:
+        config: Конфигурация дискретизации
+        points: Список всех точек
+        points_interior: Список внутренних точек
+        points_boundary: Список граничных точек
+        metadata: Метаданные расчётной области
+        foil_metadata: Метаданные профиля
+        foil_coords: Координаты профиля
+        domain_coords: Координаты области
+        foil_is_closed: Флаг замкнутости профиля
+    """
+
+    def __init__(self, config: SamplerConfig) -> None:
+        """
+        Инициализирует генератор точек коллокации.
+
+        Args:
+            config: Конфигурация дискретизации
+        """
         self.config = config
         self.points: List[CollocationPoint] = []
         self.points_interior: List[CollocationPoint] = []
         self.points_boundary: List[CollocationPoint] = []
-        self.metadata = {}
-        self.foil_metadata = {}
+        self.metadata: Dict[str, Any] = {}
+        self.foil_metadata: Dict[str, Any] = {}
         self.next_id = 0
-        self.foil_coords = None
-        self.domain_coords = None
+        self.foil_coords: Optional[np.ndarray] = None
+        self.domain_coords: Optional[np.ndarray] = None
         self.foil_is_closed = False
 
         os.makedirs(config.output_dir, exist_ok=True)
@@ -240,8 +406,13 @@ class CollocationPoints:
         self.next_id += 1
         return self.next_id - 1
 
-    def find_geometry_files(self) -> Dict[str, str]:
-        """Поиск файлов геометрии"""
+    def find_geometry_files(self) -> Dict[str, Optional[str]]:
+        """
+        Поиск файлов геометрии в директории.
+
+        Returns:
+            Словарь с путями к файлам {'foil': path, 'domain': path, 'metadata': path}
+        """
         result = {'foil': None, 'domain': None, 'metadata': None}
         foil_names = ["airfoil_foil.npy", "airfoil_foil.txt"]
         domain_names = ["airfoil_domain.npy", "airfoil_domain.txt"]
@@ -268,6 +439,15 @@ class CollocationPoints:
         return result
 
     def load_geometries(self) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Загрузка файлов геометрии и метаданных.
+
+        Returns:
+            Кортеж (domain, foil) — массивы координат области и профиля
+
+        Raises:
+            FileNotFoundError: Если файл области не найден
+        """
         print("\n📂 Поиск файлов геометрии...")
         files = self.find_geometry_files()
         if files['domain'] is None:
@@ -301,6 +481,15 @@ class CollocationPoints:
         return domain, foil
 
     def _load_coords(self, filepath: str) -> np.ndarray:
+        """
+        Загрузка координат из файла.
+
+        Args:
+            filepath: Путь к файлу (.npy, .csv, .txt)
+
+        Returns:
+            Массив координат формы (N, 2)
+        """
         ext = os.path.splitext(filepath)[1].lower()
         if ext == '.npy':
             return np.load(filepath)
@@ -312,9 +501,23 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Генерация точек на внешнем контуре (прямоугольник)
     # ------------------------------------------------------------------
-    def sample_boundary_external(self, contour: np.ndarray, step: float,
-                                  bounds: Dict) -> List[CollocationPoint]:
-        """Точки на внешнем контуре области (равномерно)"""
+    def sample_boundary_external(
+        self,
+        contour: np.ndarray,
+        step: float,
+        bounds: Dict[str, float]
+    ) -> List[CollocationPoint]:
+        """
+        Точки на внешнем контуре области (равномерно).
+
+        Args:
+            contour: Массив координат контура
+            step: Шаг дискретизации [м]
+            bounds: Границы области
+
+        Returns:
+            Список точек на внешней границе
+        """
         line = LineString(contour)
         length = line.length
         # Удаляем замыкающую точку для расчёта длины
@@ -346,32 +549,61 @@ class CollocationPoints:
             logger.info(f"   {bt.value}: {cnt}")
         return points
 
-    def _classify_external_boundary(self, x: float, y: float,
-                                    bounds: Dict, step: float) -> BoundaryType:
-        """Определение типа точки на внешнем прямоугольном контуре"""
-        tol = step * 0.1
+    def _classify_external_boundary(
+        self,
+        x: float,
+        y: float,
+        bounds: Dict[str, float],
+        step: float
+    ) -> BoundaryType:
+        """
+        Определяет тип точки на внешнем прямоугольном контуре.
+
+        Args:
+            x: X-координата точки [м]
+            y: Y-координата точки [м]
+            bounds: Границы области (x_min, x_max, y_min, y_max)
+            step: Шаг дискретизации [м]
+
+        Returns:
+            Тип границы (INLET, OUTLET, WALL, SYMMETRY)
+        """
+        tol = step * CLASSIFICATION_TOLERANCE_FACTOR
         x_min, x_max = bounds['x_min'], bounds['x_max']
         y_min, y_max = bounds['y_min'], bounds['y_max']
 
+        # Проверяем границы в порядке приоритета
         if abs(x - x_min) < tol:
             return BoundaryType.INLET
-        elif abs(x - x_max) < tol:
+        
+        if abs(x - x_max) < tol:
             return BoundaryType.OUTLET
-        elif abs(y - y_max) < tol:
+        
+        if abs(y - y_max) < tol:
             return BoundaryType(self.config.top_boundary_type)
-        elif abs(y - y_min) < tol:
+        
+        if abs(y - y_min) < tol:
             if self.foil_is_closed:
                 return BoundaryType.INLET
             else:
                 return BoundaryType(self.config.symmetry_type)
-        else:
-            return BoundaryType.OUTLET
+        
+        return BoundaryType.OUTLET
 
     # ------------------------------------------------------------------
     # Генерация точек на профиле (WALL)
     # ------------------------------------------------------------------
     def sample_boundary_foil(self, foil: np.ndarray, step: float) -> List[CollocationPoint]:
-        """Точки на профиле (равномерно по длине)"""
+        """
+        Точки на профиле (равномерно по длине).
+
+        Args:
+            foil: Массив координат профиля
+            step: Шаг дискретизации [м]
+
+        Returns:
+            Список точек на профиле с типом WALL
+        """
         line = LineString(foil)
         length = line.length
         if self.foil_is_closed:
@@ -397,11 +629,26 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Генерация нижней границы (отдельно, если профиль не доходит до левой границы)
     # ------------------------------------------------------------------
-    def sample_bottom_edge(self, x_min_dom: float, x_min_foil: float,
-                           y_min_dom: float, step: float) -> List[CollocationPoint]:
+    def sample_bottom_edge(
+        self,
+        x_min_dom: float,
+        x_min_foil: float,
+        y_min_dom: float,
+        step: float
+    ) -> List[CollocationPoint]:
         """
         Генерация точек на нижней границе слева от профиля.
+
         ВСЕГДА используется равномерное распределение для граничных точек.
+
+        Args:
+            x_min_dom: Минимальная X-координата области [м]
+            x_min_foil: Минимальная X-координата профиля [м]
+            y_min_dom: Минимальная Y-координата области [м]
+            step: Шаг дискретизации [м]
+
+        Returns:
+            Список точек на нижней границе
         """
         if x_min_foil <= x_min_dom:
             return []
@@ -429,9 +676,20 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Внутренние точки: регулярный метод (векторизованный)
     # ------------------------------------------------------------------
-    def sample_interior_regular_sequential(self, domain: np.ndarray, step: float) -> List[CollocationPoint]:
+    def sample_interior_regular_sequential(
+        self,
+        domain: np.ndarray,
+        step: float
+    ) -> List[CollocationPoint]:
         """
         Генерация регулярных точек с использованием векторизованной проверки Path.
+
+        Args:
+            domain: Массив точек области
+            step: Шаг сетки [м]
+
+        Returns:
+            Список внутренних точек с типом INTERIOR
         """
         path = Path(domain)
         minx, miny, maxx, maxy = path.get_extents().bounds  # или np.min/max domain
@@ -454,10 +712,22 @@ class CollocationPoints:
         logger.info(f"✅ Внутренних точек (регулярный): {len(interior_points)}")
         return interior_points
 
-    def sample_interior_regular_parallel(self, domain: np.ndarray, step: float,
-                                         num_processes: int) -> List[CollocationPoint]:
+    def sample_interior_regular_parallel(
+        self,
+        domain: np.ndarray,
+        step: float,
+        num_processes: int
+    ) -> List[CollocationPoint]:
         """
         Параллельная версия для регулярной сетки (разбиение по X).
+
+        Args:
+            domain: Массив точек области
+            step: Шаг сетки [м]
+            num_processes: Количество процессов
+
+        Returns:
+            Список внутренних точек с типом INTERIOR
         """
         path = Path(domain)
         minx, miny, maxx, maxy = path.get_extents().bounds
@@ -529,32 +799,62 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Внутренние точки: нерегулярный метод (равномерный случайный)
     # ------------------------------------------------------------------
-    def sample_interior_irregular(self, domain: np.ndarray, num_points: int) -> List[CollocationPoint]:
+    def sample_interior_irregular(
+        self,
+        domain: np.ndarray,
+        num_points: int
+    ) -> List[CollocationPoint]:
+        """
+        Генерация внутренних точек методом нерегулярной выборки.
+
+        Args:
+            domain: Массив точек области
+            num_points: Целевое количество точек
+
+        Returns:
+            Список внутренних точек
+        """
         if self.config.use_multiprocessing and self.config.num_processes > 1:
             return self._sample_interior_irregular_parallel(domain, num_points)
         else:
             return self._sample_interior_irregular_sequential(domain, num_points)
 
-    def _sample_interior_irregular_sequential(self, domain: np.ndarray,
-                                              num_points: int) -> List[CollocationPoint]:
+    def _sample_interior_irregular_sequential(
+        self,
+        domain: np.ndarray,
+        num_points: int
+    ) -> List[CollocationPoint]:
+        """
+        Генерация внутренних точек методом нерегулярной выборки (последовательно).
+
+        Args:
+            domain: Массив точек, определяющих область
+            num_points: Целевое количество точек
+
+        Returns:
+            Список внутренних точек
+        """
         path = Path(domain)
         minx, miny, maxx, maxy = path.get_extents().bounds
         points = []
         attempts = 0
-        max_attempts = num_points * 10
+        max_attempts = num_points * MAX_ATTEMPTS_MULTIPLIER
+        
         if TQDM_AVAILABLE and self.config.show_progress:
             pbar = tqdm(total=num_points, desc="Внутренние (нерегулярный)")
         else:
             pbar = None
             last_log = time.time()
+            
         while len(points) < num_points and attempts < max_attempts:
             # Генерируем батч
-            batch_size = min(10000, max_attempts - attempts)
+            batch_size = min(DEFAULT_BATCH_SIZE, max_attempts - attempts)
             xs = np.random.uniform(minx, maxx, batch_size)
             ys = np.random.uniform(miny, maxy, batch_size)
             candidates = np.column_stack((xs, ys))
             inside = path.contains_points(candidates)
             valid = candidates[inside]
+            
             for x, y in valid:
                 if len(points) < num_points:
                     points.append(CollocationPoint(
@@ -567,9 +867,11 @@ class CollocationPoints:
                 else:
                     break
             attempts += batch_size
-            if not pbar and self.config.show_progress and time.time() - last_log > 2:
+            
+            if not pbar and self.config.show_progress and time.time() - last_log > QUEUE_TIMEOUT:
                 logger.info(f"⏳ Прогресс: {len(points)}/{num_points}")
                 last_log = time.time()
+                
         if pbar:
             pbar.close()
         if len(points) < num_points:
@@ -654,10 +956,29 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Внутренние точки: адаптивные методы (сгущение)
     # ------------------------------------------------------------------
-    def sample_interior_adaptive(self, domain: np.ndarray, num_points: int,
-                                 alpha: float, epsilon_factor: float, mode: str) -> List[CollocationPoint]:
+    def sample_interior_adaptive(
+        self,
+        domain: np.ndarray,
+        num_points: int,
+        alpha: float,
+        epsilon_factor: float,
+        mode: str
+    ) -> List[CollocationPoint]:
         """
-        mode: 'foil' - сгущение к профилю, 'all' - сгущение ко всем границам
+        Генерация внутренних точек адаптивным методом (сгущение).
+
+        Args:
+            domain: Массив точек области
+            num_points: Целевое количество точек
+            alpha: Степень сгущения (чем больше, тем сильнее концентрация)
+            epsilon_factor: Масштаб сгущения (доля от характерного размера)
+            mode: Режим сгущения ('foil' — к профилю, 'all' — ко всем границам)
+
+        Returns:
+            Список внутренних точек
+
+        Raises:
+            ValueError: Если режим адаптивного метода неизвестен
         """
         # Определяем, к каким точкам будем сгущаться
         if mode == 'foil':
@@ -691,6 +1012,20 @@ class CollocationPoints:
                                              alpha: float,
                                              epsilon_factor: float,
                                              mode: str) -> List[CollocationPoint]:
+        """
+        Генерация внутренних точек с адаптивным сгущением (последовательно).
+        
+        Args:
+            domain: Массив точек, определяющих область
+            boundary_points: Граничные точки для сгущения
+            num_points: Целевое количество точек
+            alpha: Степень сгущения
+            epsilon_factor: Масштаб сгущения
+            mode: Режим ('adaptive_foil' или 'adaptive_all')
+            
+        Returns:
+            Список внутренних точек
+        """
         path = Path(domain)
         minx, miny, maxx, maxy = path.get_extents().bounds
         char_length = (maxx - minx + maxy - miny) / 2
@@ -700,8 +1035,8 @@ class CollocationPoints:
         tree = cKDTree(boundary_points)
 
         points = []
-        batch_size = 10000
-        max_attempts = num_points * 50
+        batch_size = DEFAULT_BATCH_SIZE
+        max_attempts = num_points * MAX_ATTEMPTS_MULTIPLIER
         total_attempts = 0
 
         if TQDM_AVAILABLE and self.config.show_progress:
@@ -831,7 +1166,23 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Основной метод генерации всех точек
     # ------------------------------------------------------------------
-    def generate_all_points(self, domain: np.ndarray, foil: Optional[np.ndarray]) -> Dict:
+    def generate_all_points(
+        self,
+        domain: np.ndarray,
+        foil: Optional[np.ndarray]
+    ) -> Dict[str, Any]:
+        """
+        Основной метод генерации всех точек коллокации.
+
+        Генерирует точки на внешнем контуре, профиле (если есть) и внутренние точки.
+
+        Args:
+            domain: Массив координат расчётной области
+            foil: Массив координат профиля (или None)
+
+        Returns:
+            Словарь с результатами генерации
+        """
         logger.info("=" * 60)
         logger.info("ГЕНЕРАЦИЯ ТОЧЕК КОЛЛОКАЦИИ")
         logger.info("=" * 60)
@@ -939,8 +1290,20 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Визуализация и сохранение
     # ------------------------------------------------------------------
-    def plot_points(self, domain: np.ndarray, foil: Optional[np.ndarray] = None,
-                    save_path: Optional[str] = None):
+    def plot_points(
+        self,
+        domain: np.ndarray,
+        foil: Optional[np.ndarray] = None,
+        save_path: Optional[str] = None
+    ) -> None:
+        """
+        Визуализация точек коллокации.
+
+        Args:
+            domain: Массив координат области
+            foil: Массив координат профиля (или None)
+            save_path: Путь для сохранения изображения (опционально)
+        """
         plt.figure(figsize=(14, 10))
         plt.plot(domain[:, 0], domain[:, 1], 'k-', lw=1.5, alpha=0.5, label='Граница области')
         if foil is not None:
@@ -992,7 +1355,13 @@ class CollocationPoints:
         else:
             plt.close()
 
-    def save_points(self):
+    def save_points(self) -> None:
+        """
+        Сохранение точек коллокации и метаданных.
+
+        Сохраняет все точки, внутренние точки, граничные точки и метаданные
+        в форматах npy или csv в зависимости от конфигурации.
+        """
         base = self.output_base
         if self.config.save_format == 'npy':
             dtype = [('id', 'i4'), ('x', 'f8'), ('y', 'f8'),
@@ -1018,10 +1387,29 @@ class CollocationPoints:
         logger.info(f"✅ Метаданные сохранены")
 
     def get_points_by_type(self, btype: BoundaryType) -> List[CollocationPoint]:
+        """
+        Возвращает точки указанного типа.
+
+        Args:
+            btype: Тип границы для фильтрации
+
+        Returns:
+            Список точек заданного типа
+        """
         return [p for p in self.points if p.boundary_type == btype]
 
 
-def S2DR():
+def S2DR() -> None:
+    """
+    Главная функция модуля дискретизации S2DR (интерактивный режим).
+
+    Запускает интерактивный сеанс для генерации точек коллокации
+    с классификацией граничных условий.
+
+    Example:
+        >>> if __name__ == "__main__":
+        ...     S2DR()
+    """
     print('\033c' + "=" * 60 + "\nМОДУЛЬ ДИСКРЕТИЗАЦИИ S2DR".center(60) + "\n" + "=" * 60)
     try:
         if os.name == 'nt':

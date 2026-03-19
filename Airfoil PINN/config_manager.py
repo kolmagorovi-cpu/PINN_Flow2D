@@ -28,11 +28,11 @@ class ConfigManager:
     CONFIG_DIR = "Configs"
     FLUIDS_DIR = "Fluids"
 
-    def __init__(self):
+    def __init__(self) -> None:
         os.makedirs(self.CONFIG_DIR, exist_ok=True)
         os.makedirs(self.FLUIDS_DIR, exist_ok=True)
-        self.config = self._default_config()
-        self.name = "unnamed"
+        self.config: Dict[str, Any] = self._default_config()
+        self.name: str = "unnamed"
 
     def _default_config(self) -> Dict[str, Any]:
         """Возвращает конфигурацию по умолчанию с вложенной структурой, включая диагностику."""
@@ -232,7 +232,15 @@ class ConfigManager:
         logger.info(f"Конфигурация сохранена: {path}")
 
     def _prepare_for_save(self, d: Any) -> Any:
-        """Рекурсивно преобразует кортежи в списки для корректной сериализации YAML."""
+        """
+        Рекурсивно преобразует кортежи в списки для корректной сериализации YAML.
+
+        Args:
+            d: Данные для преобразования
+
+        Returns:
+            Данные с кортежами, преобразованными в списки
+        """
         if isinstance(d, dict):
             return {k: self._prepare_for_save(v) for k, v in d.items()}
         elif isinstance(d, list):
@@ -356,10 +364,14 @@ class ConfigManager:
         print(f"  save_rar_history         : {diag.get('save_rar_history', True)}")
         print("=" * 70)
 
-    def _deep_update(self, target: Dict, source: Dict) -> None:
+    def _deep_update(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
         """
         Рекурсивно обновляет словарь target значениями из source.
         Сохраняет ключи, отсутствующие в source.
+
+        Args:
+            target: Целевой словарь для обновления
+            source: Источник значений для обновления
         """
         for key, value in source.items():
             if key in target and isinstance(target[key], dict) and isinstance(value, dict):
@@ -386,8 +398,8 @@ def yes_no(prompt: str, default: bool = False) -> bool:
     Returns:
         bool: True если пользователь ввёл y/yes, иначе False
     """
-    suffix = " (Y/n): " if default else " (y/N): "
-    ans = input(prompt + suffix).strip().lower()
+    suffix: str = " (Y/n): " if default else " (y/N): "
+    ans: str = input(prompt + suffix).strip().lower()
     if default:
         return ans not in ['n', 'no']
     else:
@@ -442,43 +454,44 @@ ACTIVATION_WARNINGS = {
 }
 
 
-def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.0) -> tuple:
+def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.0) -> tuple[bool, float]:
     """
     Выводит предупреждение о выбранной функции активации.
-    
+
     Args:
         activation_name: название функции активации
         x_min: минимальное значение координат
         x_max: максимальное значение координат
-    
+
     Returns:
-        (bool, float): (пользователь согласен, scale_factor)
+        tuple[bool, float]: (пользователь согласен, scale_factor)
     """
-    activation_lower = activation_name.lower()
-    warning = ACTIVATION_WARNINGS.get(activation_lower)
-    
+    activation_lower: str = activation_name.lower()
+    warning: Optional[Dict[str, str]] = ACTIVATION_WARNINGS.get(activation_lower)
+
     if not warning:
         print(f"\n⚪ Неизвестная функция активации '{activation_name}'. Масштабирование не настроено.")
         return True, 1.0
-    
-    level_icons = {'critical': '🔴', 'warning': '🟡', 'info': '✅'}
-    icon = level_icons.get(warning['level'], '⚪')
-    
+
+    level_icons: Dict[str, str] = {'critical': '🔴', 'warning': '🟡', 'info': '✅'}
+    icon: str = level_icons.get(warning['level'], '⚪')
+
     print(f"\n{'='*70}")
     print(f"{icon} ПРЕДУПРЕЖДЕНИЕ: Функция активации '{activation_name}'")
     print(f"{'='*70}")
     print(f"   Диапазон координат: [{x_min:.2f}, {x_max:.2f}]")
     print(f"   {warning['message']}")
     print(f"   💡 Рекомендация: {warning['recommendation']}")
-    
+
     # Вычисляем рекомендуемый scale_factor
+    scale_factor: float
     if activation_lower in ['tanh', 'sigmoid']:
         # Масштабирование к [-2, 2]
-        max_abs = max(abs(x_min), abs(x_max))
+        max_abs: float = max(abs(x_min), abs(x_max))
         scale_factor = 2.0 / max_abs if max_abs > 0 else 1.0
     elif activation_lower == 'relu':
         # Масштабирование к [0, 6]
-        range_x = x_max - x_min
+        range_x: float = x_max - x_min
         scale_factor = 6.0 / range_x if range_x > 0 else 1.0
     elif activation_lower in ['leaky_relu', 'elu', 'swish', 'silu']:
         # Масштабирование к [-2, 5]
@@ -486,7 +499,7 @@ def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.
         scale_factor = 5.0 / max_abs if max_abs > 0 else 1.0
     else:  # siren
         scale_factor = 1.0
-    
+
     if warning['level'] == 'info':
         print(f"\n   ✅ Масштабирование не требуется (scale_factor = {scale_factor:.3f})")
         input("   Нажмите Enter для продолжения...")
@@ -498,22 +511,22 @@ def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.
     print(f"   1. Применить рекомендуемый scale_factor = {scale_factor:.4f}")
     print(f"   2. Ввести свой scale_factor")
     print(f"   3. Отключить масштабирование (не рекомендуется!)")
-    
-    mode_choice = input("\n   Ваш выбор (1/2/3): ").strip()
-    
+
+    mode_choice: str = input("\n   Ваш выбор (1/2/3): ").strip()
+
     if mode_choice == '1':
         print(f"   ✅ Масштабирование включено (scale_factor = {scale_factor:.4f})")
         return True, scale_factor
     elif mode_choice == '2':
         while True:
             try:
-                custom_scale = input(f"   Введите scale_factor (рекомендуется {scale_factor:.4f}): ").strip()
-                custom_scale = float(custom_scale)
-                if custom_scale <= 0:
+                custom_scale: str = input(f"   Введите scale_factor (рекомендуется {scale_factor:.4f}): ").strip()
+                custom_scale_float: float = float(custom_scale)
+                if custom_scale_float <= 0:
                     print("   ⚠️ scale_factor должен быть положительным числом!")
                     continue
-                print(f"   ✅ Масштабирование включено (scale_factor = {custom_scale:.4f})")
-                return True, custom_scale
+                print(f"   ✅ Масштабирование включено (scale_factor = {custom_scale_float:.4f})")
+                return True, custom_scale_float
             except ValueError:
                 print("   ⚠️ Введите корректное число!")
     else:  # mode_choice == '3'

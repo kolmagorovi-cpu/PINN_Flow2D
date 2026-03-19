@@ -449,17 +449,11 @@ class Visualizer:
             data_handler: объект DataHandler с метаданными
             savedir: директория для сохранения
             epoch: номер эпохи (для имени файла)
-            boundary_types: one-hot编码 типов границ
+            boundary_types: one-hot тензор типов границ
             boundary_type_names: список имён типов границ
             save_npy: сохранить ли как .npy файлы
             plot_physical: отображать физические или нормализованные величины
             config: конфигурация (для coordinate_scaling)
-        """
-            epoch: идентификатор эпохи
-            boundary_types: one-hot тензор типов границ
-            boundary_type_names: список имён типов границ
-            save_npy: сохранять ли поля в .npy
-            plot_physical: если True, графики строятся в физических единицах
         """
         # Сохраняем в .npy, если требуется
         if save_npy:

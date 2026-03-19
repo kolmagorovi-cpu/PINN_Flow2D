@@ -2,7 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 Модели нейронных сетей для проекта PINN Learning.
+
 Содержит классы PINNIncompressible и SelfAdaptiveWeights.
+
+Example:
+    >>> model = PINNIncompressible(
+    ...     input_dim=5,
+    ...     layers=[50, 50, 50],
+    ...     activation='tanh',
+    ...     output_dim=3
+    ... )
 
 Автор: Колмагоров И.Д.
 Версия: 3.260226 (с поддержкой выбора функции активации)
@@ -17,37 +26,63 @@ import math
 
 
 class Sine(nn.Module):
-    """Синусоидальная активация для SIREN."""
-    def forward(self, x):
+    """
+    Синусоидальная активация для SIREN.
+
+    Example:
+        >>> activation = Sine()
+        >>> x = torch.randn(10, 5)
+        >>> y = activation(x)
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Применяет синусоидальную активацию.
+
+        Args:
+            x: Входной тензор
+
+        Returns:
+            Тензор с применённой активацией sin(x)
+        """
         return torch.sin(x)
 
 
 class PINNIncompressible(nn.Module):
     """
     Полносвязная нейросеть для предсказания (u, v, p) по координатам (x, y) и SDF.
+
     Входные параметры могут включать дополнительные физические величины.
     Параметр output_bias задаёт начальное смещение выходного слоя.
     Поддерживает различные функции активации: tanh, relu, sigmoid, leaky_relu,
     elu, swish (SiLU) и siren.
     Поддерживает масштабирование координат для улучшения обусловленности.
+
+    Attributes:
+        input_dim: Размерность входного вектора
+        hidden_layers: Список слоёв сети
+        activation: Функция активации
+        output_layer: Выходной слой
+        coordinate_scaling: Параметры масштабирования координат
     """
-    def __init__(self, input_dim: int, layers: List[int], activation: str = 'tanh',
-                 output_dim: int = 3,
-                 output_bias: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-                 coordinate_scaling: Optional[Dict] = None):
+    def __init__(
+        self,
+        input_dim: int,
+        layers: List[int],
+        activation: str = 'tanh',
+        output_dim: int = 3,
+        output_bias: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        coordinate_scaling: Optional[Dict] = None
+    ) -> None:
         """
+        Инициализирует нейронную сеть.
+
         Args:
-            input_dim: размерность входного вектора
-            layers: список чисел нейронов в скрытых слоях
-            activation: тип функции активации ('tanh', 'relu', 'sigmoid',
-                       'leaky_relu', 'elu', 'swish', 'siren')
-            output_dim: размерность выхода (обычно 3: u, v, p)
-            output_bias: начальные значения смещения выходного слоя (u0, v0, p0)
-            coordinate_scaling: словарь с параметрами масштабирования:
-                - enabled: bool (включено ли масштабирование)
-                - scale_factor: float (коэффициент масштабирования)
-                - input_min: float (минимальное значение входа)
-                - input_max: float (максимальное значение входа)
+            input_dim: Размерность входного вектора
+            layers: Список чисел нейронов в скрытых слоях
+            activation: Тип функции активации
+            output_dim: Размерность выхода (обычно 3: u, v, p)
+            output_bias: Начальные значения смещения выходного слоя
+            coordinate_scaling: Параметры масштабирования координат
         """
         super().__init__()
         self.input_dim = input_dim
@@ -74,7 +109,18 @@ class PINNIncompressible(nn.Module):
             self.output_layer.bias.data = bias
 
     def _get_activation(self, name: str) -> nn.Module:
-        """Возвращает модуль активации по имени."""
+        """
+        Возвращает модуль активации по имени.
+
+        Args:
+            name: Название функции активации
+
+        Returns:
+            Модуль активации PyTorch
+
+        Raises:
+            ValueError: Если функция активации не поддерживается
+        """
         if name == 'tanh':
             return nn.Tanh()
         elif name == 'relu':
