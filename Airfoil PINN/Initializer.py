@@ -472,6 +472,10 @@ class Initializer:
         np.save(base, self.points_norm)
         logger.info(f"Сохранено: {base}")
 
+        # Вычисляем нормализованные значения скорости на входе
+        inlet_u_norm = self.conditions.u / self.U_inf if self.U_inf > 0 else 1.0
+        inlet_v_norm = self.conditions.v / self.U_inf if self.U_inf > 0 else 0.0
+        
         meta = {
             'description': description,
             'fluid_name': self.fluid_name,
@@ -490,6 +494,8 @@ class Initializer:
             'Re': self.Re,
             'normalized': True,
             'sdf_norm_factor': self.chord,
+            'inlet_u_norm': inlet_u_norm,
+            'inlet_v_norm': inlet_v_norm,
         }
         meta_path = os.path.join(self.output_dir, f"{description}_metadata.npy")
         np.save(meta_path, meta)

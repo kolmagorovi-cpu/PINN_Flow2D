@@ -100,6 +100,13 @@ class ConfigManager:
                 'batch_size': 10,
                 'gradient_accumulation_steps': 1,
                 'epochs': 1000,
+                # Early stopping
+                'early_stopping': {
+                    'enabled': False,
+                    'patience': 100,
+                    'min_delta': 1e-6,
+                    'restore_best': True,
+                },
             },
             'output': {
                 'console_only': True,
