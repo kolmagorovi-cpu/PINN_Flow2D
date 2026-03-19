@@ -50,14 +50,16 @@ class Visualizer:
     Также фиксирует количественные и качественные метрики.
     """
 
-    def __init__(self, plot_frequency: Optional[int] = None, config_name: str = "unnamed"):
+    def __init__(self, plot_frequency: Optional[int] = None, config_name: str = "unnamed", config: Optional[Dict] = None):
         """
         Args:
             plot_frequency: частота обновления графиков (эпох). Если None, графики отключены.
             config_name: название конфигурации для заголовков.
+            config: полная конфигурация (для coordinate_scaling)
         """
         self.plot_frequency = plot_frequency
         self.config_name = config_name
+        self.config = config  # Сохраняем конфигурацию для обратного масштабирования
         self.fig_pde = None
         self.fig_bc = None
         self.fig_diag = None
@@ -430,7 +432,8 @@ class Visualizer:
                                        boundary_types: Optional[torch.Tensor] = None,
                                        boundary_type_names: Optional[List[str]] = None,
                                        save_npy: bool = True,
-                                       plot_physical: bool = False) -> None:
+                                       plot_physical: bool = False,
+                                       config: Optional[Dict] = None) -> None:
         """
         Строит и сохраняет поля скорости и давления из готовых тензоров.
         Если plot_physical=True, отображаются физические величины (с размерностью),
@@ -445,6 +448,13 @@ class Visualizer:
             x_norm, y_norm: нормализованные координаты
             data_handler: объект DataHandler с метаданными
             savedir: директория для сохранения
+            epoch: номер эпохи (для имени файла)
+            boundary_types: one-hot编码 типов границ
+            boundary_type_names: список имён типов границ
+            save_npy: сохранить ли как .npy файлы
+            plot_physical: отображать физические или нормализованные величины
+            config: конфигурация (для coordinate_scaling)
+        """
             epoch: идентификатор эпохи
             boundary_types: one-hot тензор типов границ
             boundary_type_names: список имён типов границ
@@ -463,8 +473,14 @@ class Visualizer:
             v_plot = v_norm * data_handler.U_inf
             p_dyn = data_handler.rho * data_handler.U_inf ** 2
             p_plot = p_norm * p_dyn
-            x_plot = x_norm * data_handler.chord
-            y_plot = y_norm * data_handler.chord
+            # Обратное масштабирование координат (если использовалось масштабирование)
+            scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
+            if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
+                x_plot = (x_norm / scale_factor) * data_handler.chord
+                y_plot = (y_norm / scale_factor) * data_handler.chord
+            else:
+                x_plot = x_norm * data_handler.chord
+                y_plot = y_norm * data_handler.chord
             u_label = 'Скорость U, м/с'
             v_label = 'Скорость V, м/с'
             p_label = 'Избыточное давление, Па'
@@ -481,8 +497,14 @@ class Visualizer:
             u_plot = u_norm
             v_plot = v_norm
             p_plot = p_norm
-            x_plot = x_norm
-            y_plot = y_norm
+            # Обратное масштабирование координат (если использовалось масштабирование)
+            scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
+            if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
+                x_plot = x_norm / scale_factor
+                y_plot = y_norm / scale_factor
+            else:
+                x_plot = x_norm
+                y_plot = y_norm
             u_label = 'U (норм.)'
             v_label = 'V (норм.)'
             p_label = 'P (норм.)'
@@ -787,7 +809,8 @@ class Visualizer:
                                             data_handler, savedir, epoch,
                                             boundary_types=bt,
                                             boundary_type_names=data_handler.boundary_type_names,
-                                            plot_physical=plot_physical)
+                                            plot_physical=plot_physical,
+                                            config=self.config if hasattr(self, 'config') else None)
 
     def close(self) -> None:
         """Закрывает все окна matplotlib."""

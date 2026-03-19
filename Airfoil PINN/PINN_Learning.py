@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 # Импорты модулей проекта
-from config_manager import ConfigManager, yes_no
+from config_manager import ConfigManager, yes_no, warn_activation
 from solver import PINNSolver
 from checkpoint import CheckpointManager
 
@@ -388,7 +388,20 @@ def architecture_menu(cfg: ConfigManager) -> None:
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(activations):
-                    arch['activation'] = activations[idx]
+                    selected_activation = activations[idx]
+                    
+                    # Получаем диапазон координат из данных (если загружены)
+                    x_min = arch.get('coordinate_scaling', {}).get('input_min', -6.0)
+                    x_max = arch.get('coordinate_scaling', {}).get('input_max', 6.0)
+                    
+                    # Выводим предупреждение и получаем scale_factor
+                    enabled, scale_factor = warn_activation(selected_activation, x_min, x_max)
+                    
+                    arch['activation'] = selected_activation
+                    arch['coordinate_scaling']['enabled'] = enabled
+                    arch['coordinate_scaling']['scale_factor'] = scale_factor
+                    arch['coordinate_scaling']['input_min'] = x_min
+                    arch['coordinate_scaling']['input_max'] = x_max
                 else:
                     print("Неверный номер.")
             except ValueError:

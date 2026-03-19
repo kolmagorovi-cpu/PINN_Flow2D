@@ -51,6 +51,13 @@ class ConfigManager:
                 'activation': 'tanh',
                 'output_dim': 3,
                 'output_bias': [0.1, 0.0, 0.0],
+                # Масштабирование координат для функции активации
+                'coordinate_scaling': {
+                    'enabled': False,
+                    'scale_factor': 1.0,  # Будет вычислено автоматически
+                    'input_min': -6.0,
+                    'input_max': 6.0,
+                },
             },
             'pde': {
                 'system': 'incompressible_navier_stokes',
@@ -385,3 +392,116 @@ def yes_no(prompt: str, default: bool = False) -> bool:
         return ans not in ['n', 'no']
     else:
         return ans in ['y', 'yes']
+
+
+# ==============================================================================
+# ПРЕДУПРЕЖДЕНИЯ О ФУНКЦИЯХ АКТИВАЦИИ
+# ==============================================================================
+
+ACTIVATION_WARNINGS = {
+    'tanh': {
+        'level': 'critical',
+        'message': 'Требуется масштабирование координат к [-2, 2]. Без масштабирования градиенты затухнут на 95%+.',
+        'recommendation': 'Автоматическое масштабирование: x_scaled = x * scale_factor, где scale_factor = 2.0 / max(|x|)'
+    },
+    'sigmoid': {
+        'level': 'critical',
+        'message': 'Требуется масштабирование координат к [-2, 2]. Максимальный градиент всего 0.25, на краях затухает на 99%+.',
+        'recommendation': 'Автоматическое масштабирование: x_scaled = x * scale_factor, где scale_factor = 2.0 / max(|x|)'
+    },
+    'relu': {
+        'level': 'critical',
+        'message': 'Требуется масштабирование к [0, ∞). Отрицательные координаты убьют 50% нейронов (градиент = 0).',
+        'recommendation': 'Автоматическое масштабирование: x_scaled = (x - min(x)) / (max(x) - min(x)) * 6.0'
+    },
+    'leaky_relu': {
+        'level': 'warning',
+        'message': 'Отрицательные значения имеют градиент 0.01 (в 100 раз меньше положительного).',
+        'recommendation': 'Рекомендуется масштабирование к [-1, 5] для баланса.'
+    },
+    'elu': {
+        'level': 'warning',
+        'message': 'Отрицательные значения имеют затухающие градиенты (e^x). При x=-6 градиент ≈ 0.0025.',
+        'recommendation': 'Рекомендуется масштабирование к [-2, 5].'
+    },
+    'swish': {
+        'level': 'warning',
+        'message': 'Отрицательные значения имеют затухающие градиенты. При x=-6 градиент ≈ 0.0025.',
+        'recommendation': 'Рекомендуется масштабирование к [-2, 5].'
+    },
+    'silu': {
+        'level': 'warning',
+        'message': 'Отрицательные значения имеют затухающие градиенты. При x=-6 градиент ≈ 0.0025.',
+        'recommendation': 'Рекомендуется масштабирование к [-2, 5].'
+    },
+    'siren': {
+        'level': 'info',
+        'message': 'Масштабирование не требуется. SIREN (sin) работает с любым диапазоном — градиенты периодические.',
+        'recommendation': 'Специальная инициализация уже настроена в models.py'
+    },
+}
+
+
+def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.0) -> tuple:
+    """
+    Выводит предупреждение о выбранной функции активации.
+    
+    Args:
+        activation_name: название функции активации
+        x_min: минимальное значение координат
+        x_max: максимальное значение координат
+    
+    Returns:
+        (bool, float): (пользователь согласен, scale_factor)
+    """
+    activation_lower = activation_name.lower()
+    warning = ACTIVATION_WARNINGS.get(activation_lower)
+    
+    if not warning:
+        print(f"\n⚪ Неизвестная функция активации '{activation_name}'. Масштабирование не настроено.")
+        return True, 1.0
+    
+    level_icons = {'critical': '🔴', 'warning': '🟡', 'info': '✅'}
+    icon = level_icons.get(warning['level'], '⚪')
+    
+    print(f"\n{'='*70}")
+    print(f"{icon} ПРЕДУПРЕЖДЕНИЕ: Функция активации '{activation_name}'")
+    print(f"{'='*70}")
+    print(f"   Диапазон координат: [{x_min:.2f}, {x_max:.2f}]")
+    print(f"   {warning['message']}")
+    print(f"   💡 Рекомендация: {warning['recommendation']}")
+    
+    # Вычисляем рекомендуемый scale_factor
+    if activation_lower in ['tanh', 'sigmoid']:
+        # Масштабирование к [-2, 2]
+        max_abs = max(abs(x_min), abs(x_max))
+        scale_factor = 2.0 / max_abs if max_abs > 0 else 1.0
+    elif activation_lower == 'relu':
+        # Масштабирование к [0, 6]
+        range_x = x_max - x_min
+        scale_factor = 6.0 / range_x if range_x > 0 else 1.0
+    elif activation_lower in ['leaky_relu', 'elu', 'swish', 'silu']:
+        # Масштабирование к [-2, 5]
+        max_abs = max(abs(x_min), abs(x_max))
+        scale_factor = 5.0 / max_abs if max_abs > 0 else 1.0
+    else:  # siren
+        scale_factor = 1.0
+    
+    if warning['level'] == 'info':
+        print(f"\n   ✅ Масштабирование не требуется (scale_factor = {scale_factor:.3f})")
+        input("   Нажмите Enter для продолжения...")
+        return True, scale_factor
+    
+    print(f"\n   Рекомендуемый scale_factor: {scale_factor:.4f}")
+    print(f"   {'='*70}")
+    
+    if warning['level'] in ['critical', 'warning']:
+        choice = input("\n   Применить автоматическое масштабирование? (Y/n): ").strip().lower()
+        if choice == '' or choice == 'y' or choice == 'yes':
+            print(f"   ✅ Масштабирование включено (scale_factor = {scale_factor:.4f})")
+            return True, scale_factor
+        else:
+            print(f"   ⚠️ Масштабирование отключено. Возможны проблемы с обучением!")
+            return False, 1.0
+    
+    return True, scale_factor

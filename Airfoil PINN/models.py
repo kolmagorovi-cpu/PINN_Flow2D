@@ -11,7 +11,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import numpy as np
 import math
 
@@ -29,10 +29,12 @@ class PINNIncompressible(nn.Module):
     Параметр output_bias задаёт начальное смещение выходного слоя.
     Поддерживает различные функции активации: tanh, relu, sigmoid, leaky_relu,
     elu, swish (SiLU) и siren.
+    Поддерживает масштабирование координат для улучшения обусловленности.
     """
     def __init__(self, input_dim: int, layers: List[int], activation: str = 'tanh',
                  output_dim: int = 3,
-                 output_bias: Tuple[float, float, float] = (0.0, 0.0, 0.0)):
+                 output_bias: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                 coordinate_scaling: Optional[Dict] = None):
         """
         Args:
             input_dim: размерность входного вектора
@@ -41,12 +43,21 @@ class PINNIncompressible(nn.Module):
                        'leaky_relu', 'elu', 'swish', 'siren')
             output_dim: размерность выхода (обычно 3: u, v, p)
             output_bias: начальные значения смещения выходного слоя (u0, v0, p0)
+            coordinate_scaling: словарь с параметрами масштабирования:
+                - enabled: bool (включено ли масштабирование)
+                - scale_factor: float (коэффициент масштабирования)
+                - input_min: float (минимальное значение входа)
+                - input_max: float (максимальное значение входа)
         """
         super().__init__()
         self.input_dim = input_dim
         self.hidden_layers = nn.ModuleList()
         self.activation_name = activation
         self.activation = self._get_activation(activation)
+        
+        # Параметры масштабирования координат
+        self.coordinate_scaling = coordinate_scaling or {'enabled': False, 'scale_factor': 1.0}
+        self.scale_factor = self.coordinate_scaling.get('scale_factor', 1.0) if self.coordinate_scaling.get('enabled', False) else 1.0
 
         prev = input_dim
         for hidden in layers:
@@ -98,13 +109,19 @@ class PINNIncompressible(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Прямой проход.
+        Прямой проход с масштабированием координат (если включено).
+        
         Args:
             x: входной тензор формы (batch_size, input_dim)
         Returns:
             тензор формы (batch_size, output_dim)
         """
-        h = x
+        # Масштабирование координат для улучшения обусловленности
+        if self.coordinate_scaling.get('enabled', False):
+            h = x * self.scale_factor
+        else:
+            h = x
+        
         for layer in self.hidden_layers:
             h = layer(h)
             h = self.activation(h)
