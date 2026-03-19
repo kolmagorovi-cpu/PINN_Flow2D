@@ -491,17 +491,33 @@ def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.
         print(f"\n   ✅ Масштабирование не требуется (scale_factor = {scale_factor:.3f})")
         input("   Нажмите Enter для продолжения...")
         return True, scale_factor
-    
+
     print(f"\n   Рекомендуемый scale_factor: {scale_factor:.4f}")
     print(f"   {'='*70}")
+    print(f"\n   Выберите режим масштабирования:")
+    print(f"   1. Применить рекомендуемый scale_factor = {scale_factor:.4f}")
+    print(f"   2. Ввести свой scale_factor")
+    print(f"   3. Отключить масштабирование (не рекомендуется!)")
     
-    if warning['level'] in ['critical', 'warning']:
-        choice = input("\n   Применить автоматическое масштабирование? (Y/n): ").strip().lower()
-        if choice == '' or choice == 'y' or choice == 'yes':
-            print(f"   ✅ Масштабирование включено (scale_factor = {scale_factor:.4f})")
-            return True, scale_factor
-        else:
-            print(f"   ⚠️ Масштабирование отключено. Возможны проблемы с обучением!")
-            return False, 1.0
+    mode_choice = input("\n   Ваш выбор (1/2/3): ").strip()
     
+    if mode_choice == '1':
+        print(f"   ✅ Масштабирование включено (scale_factor = {scale_factor:.4f})")
+        return True, scale_factor
+    elif mode_choice == '2':
+        while True:
+            try:
+                custom_scale = input(f"   Введите scale_factor (рекомендуется {scale_factor:.4f}): ").strip()
+                custom_scale = float(custom_scale)
+                if custom_scale <= 0:
+                    print("   ⚠️ scale_factor должен быть положительным числом!")
+                    continue
+                print(f"   ✅ Масштабирование включено (scale_factor = {custom_scale:.4f})")
+                return True, custom_scale
+            except ValueError:
+                print("   ⚠️ Введите корректное число!")
+    else:  # mode_choice == '3'
+        print(f"   ⚠️ Масштабирование отключено. Возможны проблемы с обучением!")
+        return False, 1.0
+
     return True, scale_factor

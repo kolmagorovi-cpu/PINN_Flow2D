@@ -346,8 +346,9 @@ def architecture_menu(cfg: ConfigManager) -> None:
         print("1. Выбор входных параметров нейронной сети")
         print("2. Настройка скрытых слоёв")
         print(f"3. Функция активации (текущая: {arch.get('activation', 'tanh')})")
-        print("4. Настройка выходных параметров")
-        print("5. Визуализация сети (схема)")
+        print(f"4. Масштабирование координат (включено: {arch.get('coordinate_scaling', {}).get('enabled', False)}, scale_factor: {arch.get('coordinate_scaling', {}).get('scale_factor', 1.0):.4f})")
+        print("5. Настройка выходных параметров")
+        print("6. Визуализация сети (схема)")
         print("0. Выход")
         sub = input("Выберите пункт: ").strip()
 
@@ -389,11 +390,11 @@ def architecture_menu(cfg: ConfigManager) -> None:
                 idx = int(choice) - 1
                 if 0 <= idx < len(activations):
                     selected_activation = activations[idx]
-                    
+
                     # Получаем диапазон координат из данных (если загружены)
                     x_min = arch.get('coordinate_scaling', {}).get('input_min', -6.0)
                     x_max = arch.get('coordinate_scaling', {}).get('input_max', 6.0)
-                    
+
                     # Выводим предупреждение и получаем scale_factor
                     enabled, scale_factor = warn_activation(selected_activation, x_min, x_max)
                     
@@ -408,6 +409,43 @@ def architecture_menu(cfg: ConfigManager) -> None:
                 print("Введите число.")
             input("Нажмите Enter...")
         elif sub == '4':
+            # Меню настройки масштабирования координат
+            while True:
+                clear_screen()
+                print_submenu_header("Масштабирование координат")
+                scaling = arch.get('coordinate_scaling', {})
+                print(f"Включено: {scaling.get('enabled', False)}")
+                print(f"scale_factor: {scaling.get('scale_factor', 1.0):.4f}")
+                print(f"Диапазон координат: [{scaling.get('input_min', -6.0):.2f}, {scaling.get('input_max', 6.0):.2f}]")
+                print("\n1. Включить/выключить масштабирование")
+                print("2. Изменить scale_factor")
+                print("3. Изменить диапазон координат (input_min, input_max)")
+                print("0. Выход")
+                scale_sub = input("Выберите пункт: ").strip()
+                
+                if scale_sub == '1':
+                    scaling['enabled'] = not scaling.get('enabled', False)
+                    print(f"✅ Масштабирование {'включено' if scaling['enabled'] else 'выключено'}")
+                elif scale_sub == '2':
+                    try:
+                        new_scale = input(f"Введите scale_factor (текущее: {scaling.get('scale_factor', 1.0):.4f}): ").strip()
+                        scaling['scale_factor'] = float(new_scale)
+                        print(f"✅ scale_factor установлен: {scaling['scale_factor']:.4f}")
+                    except ValueError:
+                        print("⚠️ Введите корректное число!")
+                elif scale_sub == '3':
+                    try:
+                        new_min = input(f"Введите input_min (текущее: {scaling.get('input_min', -6.0):.2f}): ").strip()
+                        new_max = input(f"Введите input_max (текущее: {scaling.get('input_max', 6.0):.2f}): ").strip()
+                        scaling['input_min'] = float(new_min)
+                        scaling['input_max'] = float(new_max)
+                        print(f"✅ Диапазон установлен: [{scaling['input_min']:.2f}, {scaling['input_max']:.2f}]")
+                    except ValueError:
+                        print("⚠️ Введите корректные числа!")
+                elif scale_sub == '0':
+                    break
+                input("Нажмите Enter...")
+        elif sub == '5':
             print("Выходные параметры: 1 - только u,v,p (несжимаемая); 2 - добавить плотность (сжимаемая)")
             out_choice = input("Выберите (1/2): ").strip()
             if out_choice == '2':
@@ -422,7 +460,7 @@ def architecture_menu(cfg: ConfigManager) -> None:
                 float(bias_v) if bias_v else arch['output_bias'][1],
                 float(bias_p) if bias_p else arch['output_bias'][2],
             )
-        elif sub == '5':
+        elif sub == '6':
             filename = f"{cfg.name}_network.png"
             visualize_network(cfg.config, filename)
             input("Нажмите Enter...")
