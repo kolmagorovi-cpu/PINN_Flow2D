@@ -1,0 +1,10 @@
+
+# Конфигурация типа геометрии для модулей: geom_config.py и Collocation.py
+# Возможные значения geom_type:
+# - 'airfoil' (профиль крыла)
+# - 'junction' (тройник)
+# Возможные значения geom_name: 
+# - смотри в конфигурационных файлах каталога Geometry 
+
+geom_type: 'airfoil'
+geom_name: 'VMFL063'

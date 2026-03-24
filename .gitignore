@@ -55,6 +55,12 @@ Checkpoints/
 *.csv
 !requirements.txt
 
+# Каталог Sampler (результаты дискретизации)
+Sampler/
+
+# Конфигурация геометрии
+geom_config.yaml
+
 # Графики и визуализация
 *.png
 *.jpg
