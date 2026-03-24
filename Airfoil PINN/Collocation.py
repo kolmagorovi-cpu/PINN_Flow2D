@@ -47,7 +47,12 @@ import sys
 import queue
 from scipy.spatial import cKDTree
 
-from type_hints import CollocationPointDict, SamplerConfigDict
+from type_hints import (
+    CollocationPointDict,
+    SamplerConfigDict,
+    JunctionParamsDict,
+    JunctionMetadataDict,
+)
 
 # Попытка импорта tqdm для прогресс-бара
 try:
@@ -480,21 +485,11 @@ class CollocationPoints:
 
     def _load_junction_params(self) -> None:
         """Загрузка параметров тройника из junction_geoms.yaml"""
-        # Ищем файл junction_geoms.yaml
-        possible_paths = [
-            os.path.join(PROJECT_ROOT, "Geometry", "junction_geoms.yaml"),
-            os.path.join(PROJECT_ROOT, "Airfoil PINN", "Geometry", "junction_geoms.yaml"),
-            "Geometry/junction_geoms.yaml"
-        ]
+        # Используем фиксированный абсолютный путь
+        junctions_path = r"C:\Users\BelchikovDA\projects\dev\proj\pinn-solver\PINN_Flow2D\Airfoil PINN\Geometry\junction_geoms.yaml"
 
-        junctions_path = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                junctions_path = path
-                break
-
-        if junctions_path is None:
-            logger.error("❌ junction_geoms.yaml не найден")
+        if not os.path.exists(junctions_path):
+            logger.error(f"❌ junction_geoms.yaml не найден: {junctions_path}")
             return
 
         try:
@@ -513,7 +508,7 @@ class CollocationPoints:
                 logger.info(f"   Ширина канала: {self.channel_width}")
             else:
                 # Если конфигурация не найдена, пробуем загрузить из файла метаданных
-                logger.warning(f"⚠️ Конфигурация '{self.config.geom_name}' не найдена в junction_geoms.yaml")
+                logger.warning(f"⚠️ Конфигурация '{self.config.geom_name}' не найдена в {junctions_path}")
                 self._load_junction_metadata_file()
 
         except Exception as e:

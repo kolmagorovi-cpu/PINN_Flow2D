@@ -22,12 +22,12 @@ from typing_extensions import NotRequired
 
 
 # =============================================================================
-# ГЕОМЕТРИЯ (Geometry.py)
+# ГЕОМЕТРИЯ (Geometry2D.py, Geometry.py, junction_geom.py)
 # =============================================================================
 
 class GeometryConfigDict(TypedDict):
     """
-    Конфигурация для геометрических параметров профиля.
+    Конфигурация для геометрических параметров (универсальная).
 
     Attributes:
         save_format: Формат сохранения ('npy', 'csv', 'txt')
@@ -35,12 +35,112 @@ class GeometryConfigDict(TypedDict):
         plot_show: Показывать ли график сразу
         plot_dpi: DPI для сохранения графиков
         output_dir: Директория для выходных файлов
+        verbose: Подробный вывод в консоль
     """
     save_format: str
     plot_enabled: bool
     plot_show: bool
     plot_dpi: int
     output_dir: str
+    verbose: bool
+
+
+class GeomConfigFileParamsDict(TypedDict, total=False):
+    """
+    Параметры для загрузки геометрии из файла.
+
+    Attributes:
+        source_type: Тип источника ('file' или 'inline' для профиля, 'config' или 'file' для тройника)
+        file_path: Путь к файлу с геометрией
+        file_format: Формат файла ('csv', 'txt', 'dat', 'npy', 'step', 'iges')
+    """
+    source_type: Literal['file', 'inline', 'config']
+    file_path: str
+    file_format: str
+
+
+class AirfoilDomainParamsDict(TypedDict, total=False):
+    """
+    Параметры расчётной области для профиля.
+
+    Attributes:
+        front: Длина домена перед профилем [м]
+        rear: Длина домена за профилем [м] (для замкнутого профиля)
+        top: Высота домена над профилем [м]
+        bottom: Высота домена под профилем [м] (для замкнутого профиля)
+    """
+    front: float
+    rear: float
+    top: float
+    bottom: float
+
+
+class AirfoilParamsDict(TypedDict, total=False):
+    """
+    Параметры профиля (airfoil).
+
+    Attributes:
+        source_type: Тип источника ('file' или 'inline')
+        file_path: Путь к файлу профиля
+        file_format: Формат файла ('csv', 'txt', 'dat', 'npy')
+        contour_coef: Коэффициент масштабирования контура
+        x_domain_coef: Коэффициент масштабирования длины области
+        y_domain_coef: Коэффициент масштабирования высоты области
+        domain_params: Параметры расчётной области
+        auto_domain: Автоматический расчёт размеров области
+        normalize: Нормализация координат к хорде
+    """
+    source_type: Literal['file', 'inline']
+    file_path: str
+    file_format: Literal['csv', 'txt', 'dat', 'npy']
+    contour_coef: float
+    x_domain_coef: float
+    y_domain_coef: float
+    domain_params: AirfoilDomainParamsDict
+    auto_domain: bool
+    normalize: bool
+
+
+class JunctionParamsDict(TypedDict, total=False):
+    """
+    Параметры тройника (junction).
+
+    Attributes:
+        name: Название тройника
+        source_type: Тип источника ('config' или 'file')
+        chanel_width: Ширина каналов [м]
+        down_length: Длина входного канала (нижний) [м]
+        side_length: Длина бокового канала (правый) [м]
+        top_length: Длина выходного канала (верхний) [м]
+        top2side_angl: Угол между верхним и боковым каналами [°]
+        side2down_angl: Угол между боковым и нижним каналами [°]
+        auto_domain: Автоматическое построение контура
+        origin_at_junction: Начало координат в точке схождения каналов
+    """
+    name: str
+    source_type: Literal['config', 'file']
+    chanel_width: float
+    down_length: float
+    side_length: float
+    top_length: float
+    top2side_angl: float
+    side2down_angl: float
+    auto_domain: bool
+    origin_at_junction: bool
+
+
+class JunctionMetadataDict(TypedDict):
+    """
+    Метаданные геометрии тройника.
+
+    Attributes:
+        geom_type: Тип геометрии ('junction')
+        junction_params: Параметры тройника
+        num_domain_points: Количество точек области
+    """
+    geom_type: str
+    junction_params: Dict[str, Any]
+    num_domain_points: int
 
 
 class DomainParamsDict(TypedDict, total=False):
@@ -506,6 +606,11 @@ class L2ErrorDict(TypedDict):
 __all__ = [
     # Геометрия
     'GeometryConfigDict',
+    'GeomConfigFileParamsDict',
+    'AirfoilDomainParamsDict',
+    'AirfoilParamsDict',
+    'JunctionParamsDict',
+    'JunctionMetadataDict',
     'DomainParamsDict',
     'ClosedDomainParamsDict',
     'GeometryMetadataDict',
