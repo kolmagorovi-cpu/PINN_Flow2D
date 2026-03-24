@@ -48,16 +48,14 @@ Figure_*.png
 *.log
 
 # Данные (сгенерированные файлы)
-Fluids/*.json
-Conditions/*.json
-Configs/*.yaml
-Geometry/Data/*.npy
-Geometry/Data/*.txt
-Geometry/Data/*.csv
-Sampler/Data/*.npy
-Sampler/Data/*.csv
-Initial/Data/*.npy
-Initial/Plots/*.png
+Fluids/
+Conditions/
+Configs/
+Geometry/Data/
+Geometry/*.png
+Sampler/Data/
+Initial/Data/
+Initial/Plots/
 Pictures/
 *.msh
 *.npz

@@ -2,48 +2,74 @@
 # -*- coding: utf-8 -*-
 """
 Главный модуль управления программой моделирования течения около профилей
-с помощью физически-информированных нейронных сетей (PINNs)
+с помощью физически-информированных нейронных сетей (PINNs).
+
+Предоставляет главное меню для навигации по модулям проекта:
+- Геометрия (G2D) — загрузка контура профиля и построение расчётной области
+- Дискретизация (S2DR) — генерация точек коллокации
+- Свойства жидкости (Fluids) — задание плотности и вязкости
+- Граничные условия (Conditions) — давление и скорость на входе/выходе
+- Инициализация (Initializer) — нормализация данных и вычисление SDF
+- Обучение PINN (PINNLearning) — настройка и запуск обучения
 
 Автор: Колмагоров И.Д.
 Дата: 2026
 Версия: 3.260226 (исправленная)
+
+Example:
+    >>> if __name__ == '__main__':
+    ...     main()  # Запуск главного меню программы
 """
 
 import importlib
 import datetime
 import sys
 import os
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Callable, Any
+
+from constants import IS_WINDOWS
 
 
-# Константы для цветового оформления (работают в Unix-системах)
+# =============================================================================
+# ЦВЕТОВОЕ ОФОРМЛЕНИЕ
+# =============================================================================
+
 class Colors:
-    """Цвета для консольного вывода"""
-    GREEN = '\033[92m'
-    BLUE = '\033[94m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    CYAN = '\033[96m'
-    MAGENTA = '\033[95m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    RESET = '\033[0m'
+    """
+    Цвета для консольного вывода.
     
+    Работает в Unix-системах через ANSI escape-последовательности.
+    Для Windows цвета отключаются (автоматически).
+    
+    Example:
+        >>> print(f"{Colors.GREEN}Успех!{Colors.RESET}")
+        >>> print(f"{Colors.BOLD}{Colors.RED}Ошибка!{Colors.RESET}")
+    """
+    GREEN: str = '\033[92m'
+    BLUE: str = '\033[94m'
+    YELLOW: str = '\033[93m'
+    RED: str = '\033[91m'
+    CYAN: str = '\033[96m'
+    MAGENTA: str = '\033[95m'
+    BOLD: str = '\033[1m'
+    UNDERLINE: str = '\033[4m'
+    RESET: str = '\033[0m'
+
     # Для Windows можно отключить цвета
-    if sys.platform == 'win32':
+    if IS_WINDOWS:
         GREEN = BLUE = YELLOW = RED = CYAN = MAGENTA = BOLD = UNDERLINE = RESET = ''
 
 
-def clear_screen():
+def clear_screen() -> None:
     """Очищает экран консоли"""
     os.system('cls' if sys.platform == 'win32' else 'clear')
     print('\033c')
 
 
-def print_banner():
+def print_banner() -> None:
     """Выводит баннер программы с информацией о версии"""
-    current_year = datetime.datetime.now().year
-    banner = f"""
+    current_year: int = datetime.datetime.now().year
+    banner: str = f"""
     {Colors.CYAN}╔══════════════════════════════════════════════════════════════╗
     ║                    AEROPINN v1.0 ({current_year})                     ║
     ║         Physics-Informed Neural Networks for Airfoils        ║
@@ -57,12 +83,12 @@ def print_banner():
     print(banner)
 
 
-def print_menu_header(title: str):
+def print_menu_header(title: str) -> None:
     """Выводит заголовок меню"""
     print(f"\n{Colors.BOLD}{Colors.MAGENTA}═══ {title} ═══{Colors.RESET}")
 
 
-def print_module_info(modules: List[Dict]):
+def print_module_info(modules: List[Dict[str, Any]]) -> None:
     """
     Выводит информацию о доступных модулях в виде нумерованного списка
     
@@ -98,72 +124,72 @@ def print_module_info(modules: List[Dict]):
     print(f"{Colors.CYAN}{'─'*60}{Colors.RESET}")
 
 
-def print_main_menu():
+def print_main_menu() -> None:
     """Выводит главное меню программы"""
     print_menu_header("ГЛАВНОЕ МЕНЮ")
-    
-    menu_items = [
+
+    menu_items: List[Dict[str, Any]] = [
         {"num": 1, "action": "modules", "desc": "Работа с модулями"},
         {"num": 2, "action": "settings", "desc": "Настройки программы"},
         {"num": 3, "action": "help", "desc": "Справка"},
         {"num": 4, "action": "clear", "desc": "Очистить экран"},
         {"num": 0, "action": "exit", "desc": "Выход"}
     ]
-    
+
     for item in menu_items:
         if item["num"] == 0:
             print(f"  {Colors.BOLD}{Colors.RED}[{item['num']}]{Colors.RESET} {Colors.RED}{item['desc']}{Colors.RESET}")
         else:
             print(f"  {Colors.BOLD}{Colors.GREEN}[{item['num']}]{Colors.RESET} {item['desc']}")
-    
+
     print(f"{Colors.CYAN}{'─'*60}{Colors.RESET}")
 
 
-def print_settings_menu():
+def print_settings_menu() -> None:
     """Выводит меню настроек"""
     print_menu_header("НАСТРОЙКИ")
-    
-    settings_items = [
+
+    settings_items: List[Dict[str, Any]] = [
         {"num": 1, "setting": "color", "desc": "Цветной вывод", "value": True},
         {"num": 2, "setting": "autosave", "desc": "Автосохранение", "value": True},
         {"num": 3, "setting": "verbose", "desc": "Подробный вывод", "value": False},
         {"num": 4, "setting": "log_level", "desc": "Уровень логирования", "value": "INFO"},
         {"num": 0, "action": "back", "desc": "Назад в главное меню"}
     ]
-    
+
     for item in settings_items:
         if "action" in item and item["action"] == "back":
             print(f"  {Colors.BOLD}{Colors.YELLOW}[{item['num']}]{Colors.RESET} {Colors.YELLOW}{item['desc']}{Colors.RESET}")
         else:
             # Показываем текущее значение
-            value_str = f"{Colors.GREEN}{item['value']}{Colors.RESET}" if item['value'] else f"{Colors.RED}{item['value']}{Colors.RESET}"
+            value_str: str = f"{Colors.GREEN}{item['value']}{Colors.RESET}" if item['value'] else f"{Colors.RED}{item['value']}{Colors.RESET}"
             print(f"  {Colors.BOLD}{Colors.BLUE}[{item['num']}]{Colors.RESET} {item['desc']}: {value_str}")
-    
+
     print(f"{Colors.CYAN}{'─'*60}{Colors.RESET}")
     print(f"{Colors.YELLOW}💡 Для изменения настройки введите её номер{Colors.RESET}")
 
 
-def print_help():
+def print_help() -> None:
     """Выводит справочную информацию"""
     print_menu_header("СПРАВКА")
-    
-    help_text = f"""
+
+    help_text: str = f"""
     {Colors.BOLD}Как пользоваться программой:{Colors.RESET}
-    
+
     1. В главном меню выберите {Colors.GREEN}[1]{Colors.RESET} для работы с модулями
     2. В меню модулей выберите номер нужного модуля
     3. Следуйте инструкциям выбранного модуля
-    
+
     {Colors.BOLD}Статусы модулей:{Colors.RESET}
     {Colors.GREEN}✅ готов{Colors.RESET} - модуль полностью работает
     {Colors.YELLOW}🔄 разработка{Colors.RESET} - модуль в разработке (может быть нестабильным)
     {Colors.BLUE}📅 план{Colors.RESET} - модуль запланирован
-    
+
     {Colors.BOLD}Горячие клавиши:{Colors.RESET}
     • {Colors.CYAN}0{Colors.RESET} - вернуться в главное меню / выход
     • {Colors.CYAN}Enter{Colors.RESET} - подтвердить ввод
     • {Colors.CYAN}Ctrl+C{Colors.RESET} - прервать выполнение
-    
+
     {Colors.BOLD}Если возникли проблемы:{Colors.RESET}
     • Проверьте, что все файлы модулей находятся в той же директории
     • Убедитесь, что установлены все зависимости
@@ -200,10 +226,10 @@ def load_module(module_info: Dict) -> Optional[callable]:
         return None
 
 
-def run_modules_menu(modules: List[Dict]):
+def run_modules_menu(modules: List[Dict[str, Any]]) -> None:
     """
     Меню выбора и запуска модулей
-    
+
     Args:
         modules: Список модулей
     """
@@ -211,27 +237,27 @@ def run_modules_menu(modules: List[Dict]):
         clear_screen()
         print_banner()
         print_module_info(modules)
-        
+
         print(f"\n{Colors.BOLD}{Colors.BLUE}Выберите модуль (1-{len(modules)}) или 0 для возврата:{Colors.RESET} ", end="")
-        
+
         try:
-            choice = input().strip()
-            
+            choice: str = input().strip()
+
             if choice == "0":
                 break
-            
-            idx = int(choice)
+
+            idx: int = int(choice)
             if 1 <= idx <= len(modules):
-                module_info = modules[idx-1]
-                
+                module_info: Dict[str, Any] = modules[idx-1]
+
                 print(f"\n{Colors.YELLOW}┌─ Запуск модуля: {module_info['name']}{Colors.RESET}")
                 print(f"{Colors.YELLOW}│{Colors.RESET} Код: {module_info['code']}")
                 print(f"{Colors.YELLOW}│{Colors.RESET} Статус: {module_info['status']}")
                 print(f"{Colors.YELLOW}│{Colors.RESET} Описание: {module_info.get('description', 'Нет описания')}")
                 print(f"{Colors.YELLOW}└─{Colors.RESET}")
-                
+
                 if module_info["status"] == "готов":
-                    func = load_module(module_info)
+                    func: Optional[Callable] = load_module(module_info)
                     if func:
                         try:
                             print(f"{Colors.GREEN}▶ Запуск...{Colors.RESET}\n")
@@ -243,20 +269,20 @@ def run_modules_menu(modules: List[Dict]):
                         print(f"{Colors.RED}❌ Не удалось загрузить модуль{Colors.RESET}")
                 else:
                     print(f"{Colors.YELLOW}⚠️  Модуль в разработке. Доступные функции ограничены.{Colors.RESET}\n")
-                    
+
                     # Для модулей в разработке можно показать заглушку
                     if module_info["status"] == "разработка":
                         print(f"{Colors.CYAN}Заглушка модуля {module_info['name']}{Colors.RESET}")
                         print("Функциональность будет доступна в следующей версии.")
-                
+
                 print(f"\n{Colors.CYAN}Нажмите Enter чтобы продолжить...{Colors.RESET}", end="")
                 input()
-                
+
             else:
                 print(f"{Colors.RED}❌ Неверный номер. Введите число от 0 до {len(modules)}{Colors.RESET}")
                 print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
                 input()
-                
+
         except ValueError:
             print(f"{Colors.RED}❌ Ошибка: введите число!{Colors.RESET}")
             print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
@@ -266,29 +292,29 @@ def run_modules_menu(modules: List[Dict]):
             break
 
 
-def run_settings_menu():
+def run_settings_menu() -> None:
     """Меню настроек программы"""
-    settings = {
+    settings: Dict[str, Any] = {
         "color": True,
         "autosave": True,
         "verbose": False,
         "log_level": "INFO"
     }
-    
+
     while True:
         clear_screen()
         print_banner()
         print_settings_menu()
-        
+
         print(f"\n{Colors.BOLD}{Colors.BLUE}Выберите действие (0-4):{Colors.RESET} ", end="")
-        
+
         try:
-            choice = input().strip()
-            
+            choice: str = input().strip()
+
             if choice == "0":
                 break
-            
-            idx = int(choice)
+
+            idx: int = int(choice)
             if idx == 1:
                 settings["color"] = not settings["color"]
                 print(f"{Colors.GREEN}✓ Цветной вывод: {settings['color']}{Colors.RESET}")
@@ -320,11 +346,11 @@ def run_settings_menu():
             break
 
 
-def main():
+def main() -> None:
     """Главная функция программы"""
-    
+
     # Информация о модулях в виде списка для нумерации
-    modules = [
+    modules: List[Dict[str, Any]] = [
         {
             "code": "G2D",
             "name": "Геометрия (2D)",
@@ -388,8 +414,8 @@ def main():
         print(f"\n{Colors.BOLD}{Colors.BLUE}Выберите действие (0-4):{Colors.RESET} ", end="")
         
         try:
-            choice = input().strip()
-            
+            choice: str = input().strip()
+
             if choice == "0":
                 print(f"\n{Colors.GREEN}👋 Программа завершена. До свидания!{Colors.RESET}")
                 break

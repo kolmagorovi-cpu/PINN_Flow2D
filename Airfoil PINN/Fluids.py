@@ -2,7 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 Модуль управления параметрами жидкостей для PINNs решателя.
+
 Хранит данные о плотности и вязкости, сохраняет в JSON.
+
+Example:
+    >>> fluid = Fluid(
+    ...     name="Воздух (20°C)",
+    ...     density=1.204,
+    ...     kinematic_viscosity=1.516e-5,
+    ...     description="Сухой воздух при 20°C"
+    ... )
+    >>> lib = FluidLibrary()
+    >>> lib.save(fluid)
+
+Автор: Колмагоров И.Д.
+Версия: 3.260226 (исправленная)
 """
 
 import os
@@ -10,6 +24,8 @@ import json
 import logging
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
+
+from type_hints import FluidDict
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,13 +36,13 @@ logger = logging.getLogger(__name__)
 class Fluid:
     """
     Класс, описывающий жидкость/газ.
-    
+
     Attributes:
-        name (str): Название жидкости.
-        density (float): Плотность [кг/м³].
-        kinematic_viscosity (float): Кинематическая вязкость [м²/с].
-        dynamic_viscosity (float): Динамическая вязкость [Па·с] (опционально).
-        description (str): Краткое описание (температура, условия).
+        name: Название жидкости.
+        density: Плотность [кг/м³].
+        kinematic_viscosity: Кинематическая вязкость [м²/с].
+        dynamic_viscosity: Динамическая вязкость [Па·с] (опционально).
+        description: Краткое описание (температура, условия).
     """
     name: str
     density: float
@@ -34,7 +50,12 @@ class Fluid:
     dynamic_viscosity: Optional[float] = None
     description: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """
+        Проверка и вычисление параметров после создания dataclass.
+
+        Вычисляет динамическую вязкость, если она не задана.
+        """
         # Если динамическая вязкость не задана, вычисляем через плотность
         if self.dynamic_viscosity is None:
             self.dynamic_viscosity = self.kinematic_viscosity * self.density
@@ -43,17 +64,41 @@ class Fluid:
         if abs(self.dynamic_viscosity - self.kinematic_viscosity * self.density) > 1e-12:
             logger.warning(f"Несоответствие между кинематической и динамической вязкостью для {self.name}")
 
-    def to_dict(self) -> dict:
-        """Преобразование в словарь для JSON."""
-        return asdict(self)
+    def to_dict(self) -> FluidDict:
+        """
+        Преобразование в словарь для JSON.
+
+        Returns:
+            Словарь с данными жидкости
+        """
+        return FluidDict(
+            name=self.name,
+            density=self.density,
+            kinematic_viscosity=self.kinematic_viscosity,
+            dynamic_viscosity=self.dynamic_viscosity,
+            description=self.description
+        )
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Fluid':
-        """Создание объекта из словаря."""
+        """
+        Создание объекта из словаря.
+
+        Args:
+            data: Словарь с данными жидкости
+
+        Returns:
+            Объект Fluid
+        """
         return cls(**data)
 
     def display(self) -> str:
-        """Краткое отображение параметров."""
+        """
+        Краткое отображение параметров.
+
+        Returns:
+            Строка с описанием жидкости
+        """
         return (f"{self.name}: ρ={self.density:.3f} кг/м³, "
                 f"ν={self.kinematic_viscosity:.3e} м²/с, "
                 f"μ={self.dynamic_viscosity:.3e} Па·с")
@@ -62,16 +107,30 @@ class Fluid:
 class FluidLibrary:
     """
     Библиотека жидкостей, загружаемых из JSON-файлов.
+
+    Attributes:
+        directory: Директория для хранения файлов жидкостей
+        fluids: Словарь с загруженными жидкостями
     """
 
-    def __init__(self, directory: str = "Fluids"):
+    def __init__(self, directory: str = "Fluids") -> None:
+        """
+        Инициализирует библиотеку жидкостей.
+
+        Args:
+            directory: Директория для хранения файлов
+        """
         self.directory = directory
         self.fluids: Dict[str, Fluid] = {}
         os.makedirs(self.directory, exist_ok=True)
         self._load_all()
 
-    def _load_all(self):
-        """Загружает все JSON-файлы из директории."""
+    def _load_all(self) -> None:
+        """
+        Загружает все JSON-файлы из директории.
+
+        Загружает файлы жидкостей и создаёт объекты Fluid.
+        """
         self.fluids.clear()
         if not os.path.exists(self.directory):
             return
@@ -87,8 +146,14 @@ class FluidLibrary:
                 except Exception as e:
                     logger.error(f"Ошибка загрузки {filename}: {e}")
 
-    def save(self, fluid: Fluid, filename: Optional[str] = None):
-        """Сохраняет жидкость в JSON-файл."""
+    def save(self, fluid: Fluid, filename: Optional[str] = None) -> None:
+        """
+        Сохраняет жидкость в JSON-файл.
+
+        Args:
+            fluid: Объект жидкости для сохранения
+            filename: Имя файла (по умолчанию используется название жидкости)
+        """
         if filename is None:
             # Используем название, заменяя недопустимые символы
             filename = fluid.name.replace(" ", "_").replace("/", "_") + ".json"
@@ -98,8 +163,13 @@ class FluidLibrary:
         self.fluids[fluid.name] = fluid
         logger.info(f"Сохранена жидкость: {fluid.name} -> {filename}")
 
-    def delete(self, name: str):
-        """Удаляет жидкость из библиотеки и файл."""
+    def delete(self, name: str) -> None:
+        """
+        Удаляет жидкость из библиотеки и файловой системы.
+
+        Args:
+            name: Название жидкости для удаления
+        """
         if name in self.fluids:
             # Удаляем файл
             for filename in os.listdir(self.directory):
@@ -112,15 +182,32 @@ class FluidLibrary:
             logger.warning(f"Жидкость '{name}' не найдена")
 
     def list_fluids(self) -> List[str]:
-        """Возвращает список названий жидкостей."""
+        """
+        Возвращает список названий жидкостей.
+
+        Returns:
+            Список названий доступных жидкостей
+        """
         return list(self.fluids.keys())
 
     def get(self, name: str) -> Optional[Fluid]:
-        """Возвращает жидкость по имени."""
+        """
+        Возвращает жидкость по имени.
+
+        Args:
+            name: Название жидкости
+
+        Returns:
+            Объект Fluid или None если не найдена
+        """
         return self.fluids.get(name)
 
-    def create_default_library(self):
-        """Создаёт несколько примеров жидкостей."""
+    def create_default_library(self) -> None:
+        """
+        Создаёт несколько примеров жидкостей.
+
+        Сохраняет примеры: воздух, вода, масло, глицерин.
+        """
         default_fluids = [
             Fluid(
                 name="Воздух (20°C)",
@@ -157,8 +244,14 @@ class FluidLibrary:
             self.save(fl)
 
 
-def fluids_menu():
-    """Интерактивное меню для управления жидкостями."""
+def fluids_menu() -> None:
+    """
+    Интерактивное меню для управления жидкостями.
+
+    Example:
+        >>> if __name__ == "__main__":
+        ...     fluids_menu()
+    """
     lib = FluidLibrary()
     # Если библиотека пуста, предложим создать примеры
     if not lib.list_fluids():

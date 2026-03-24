@@ -134,7 +134,7 @@ class PINNSolver:
 
         # Исправление FutureWarning для GradScaler
         if self.use_amp and self.device.type == 'cuda':
-            self.scaler = torch.amp.GradScaler('cuda')
+            self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
 
@@ -185,7 +185,7 @@ class PINNSolver:
         # Визуализация
         out_cfg = config['output']
         plot_freq = out_cfg['plot_frequency'] if not out_cfg['console_only'] else None
-        self.visualizer = Visualizer(plot_freq, config_name=self.config_name)
+        self.visualizer = Visualizer(plot_freq, config_name=self.config_name, config=config)
         if plot_freq:
             self.visualizer.create_live_plot()
 
@@ -270,13 +270,17 @@ class PINNSolver:
             bt = None
         input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
         actual_input_dim = input_tensor.shape[1]
+        
+        # Получаем параметры масштабирования координат
+        coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0})
 
         return PINNIncompressible(
             input_dim=actual_input_dim,
             layers=arch['hidden_layers'],
             activation=arch.get('activation', 'tanh'),
             output_dim=arch['output_dim'],
-            output_bias=arch['output_bias']
+            output_bias=arch['output_bias'],
+            coordinate_scaling=coord_scaling
         )
 
     def _init_optimizer(self, optim_type='adam') -> optim.Optimizer:

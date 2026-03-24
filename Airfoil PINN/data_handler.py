@@ -4,9 +4,15 @@
 # -*- coding: utf-8 -*-
 """
 Обработка данных для проекта PINN Learning.
+
 Загружает точки коллокации и метаданные, предоставляет DataLoader.
 Поддерживает hard граничные условия (маски фиксированных компонент).
 Добавлены методы для диагностики и динамического расширения датасета (RAR).
+
+Example:
+    >>> handler = DataHandler('collocation_points.npy', batch_size=10)
+    >>> dataset = handler.dataset
+    >>> print(f"Загружено {handler.n_points} точек")
 
 Автор: Колмагоров И.Д.
 Версия: 3.260226 (исправленная, с поддержкой расширения датасета и фильтрации по y)
@@ -19,18 +25,45 @@ from torch.utils.data import Dataset, DataLoader
 import logging
 from typing import List, Tuple, Optional, Dict
 
+from type_hints import PointDtypeDict
+
 logger = logging.getLogger(__name__)
 
 
 class PINNDataset(Dataset):
     """
     Dataset для точек коллокации.
+
     Возвращает кортеж: (idx, x, y, sdf, boundary_types,
                         mask_u_fixed, mask_v_fixed, mask_p_fixed,
                         u_bc, v_bc, p_bc)
     Все тензоры хранятся в float32.
+
+    Attributes:
+        x: X-координаты (нормированные)
+        y: Y-координаты (нормированные)
+        sdf: Расстояние до стенки (нормированное)
+        p_target: Целевое давление
+        u_target: Целевая скорость U
+        v_target: Целевая скорость V
+        boundary_types: One-hot кодирование типов границ
+        mask_u_fixed: Маска фиксированных компонент U
+        mask_v_fixed: Маска фиксированных компонент V
+        mask_p_fixed: Маска фиксированных компонент P
+        u_bc: Значения BC для U
+        v_bc: Значения BC для V
+        p_bc: Значения BC для P
     """
-    def __init__(self, points_file: str):
+    def __init__(self, points_file: str) -> None:
+        """
+        Инициализирует датасет из файла.
+
+        Args:
+            points_file: Путь к файлу с точками коллокации
+
+        Raises:
+            ValueError: Если файл имеет неверный формат
+        """
         data = np.load(points_file, allow_pickle=True)
         if data.dtype.names is None:
             raise ValueError("Файл точек должен быть структурированным массивом")
@@ -109,8 +142,14 @@ class PINNDataset(Dataset):
         self.n_points = len(self.x)
         logger.info(f"Типы границ в данных: {self.boundary_type_names}")
 
-    def set_inlet_values(self, u_norm: float, v_norm: float):
-        """Устанавливает значения на inlet после загрузки метаданных."""
+    def set_inlet_values(self, u_norm: float, v_norm: float) -> None:
+        """
+        Устанавливает значения на inlet после загрузки метаданных.
+
+        Args:
+            u_norm: Нормированная скорость U
+            v_norm: Нормированная скорость V
+        """
         if self.boundary_types is None:
             logger.warning("Нет информации о границах, невозможно установить значения на inlet.")
             return
@@ -129,9 +168,24 @@ class PINNDataset(Dataset):
         self.v_bc[mask] = v_norm
 
     def __len__(self) -> int:
+        """
+        Возвращает количество точек в датасете.
+
+        Returns:
+            Количество точек
+        """
         return self.n_points
 
     def __getitem__(self, idx: int) -> Tuple:
+        """
+        Возвращает элемент датасета по индексу.
+
+        Args:
+            idx: Индекс элемента
+
+        Returns:
+            Кортеж с данными точки
+        """
         # Базовые тензоры
         result = (idx, self.x[idx], self.y[idx], self.sdf[idx])
 
@@ -154,7 +208,12 @@ class PINNDataset(Dataset):
     def extend(self, indices: torch.Tensor) -> 'PINNDataset':
         """
         Создаёт новый датасет, дополненный точками по указанным индексам.
-        Индексы должны быть целочисленным тензором на CPU.
+
+        Args:
+            indices: Индексы точек для добавления
+
+        Returns:
+            Новый расширенный датасет
         """
         new_dataset = PINNDataset.__new__(PINNDataset)
         # Копируем все атрибуты, конкатенируя тензоры
@@ -175,8 +234,25 @@ class PINNDataset(Dataset):
 
 
 class DataHandler:
-    """Загружает данные и метаданные, предоставляет DataLoader и методы для диагностики."""
-    def __init__(self, points_file: str, batch_size: int, shuffle: bool = True):
+    """
+    Загружает данные и метаданные, предоставляет DataLoader и методы для диагностики.
+
+    Attributes:
+        points_file: Путь к файлу с точками
+        batch_size: Размер батча
+        shuffle: Перемешивать ли данные
+        dataset: Объект датасета
+        dataloader: DataLoader для итерации по батчам
+    """
+    def __init__(self, points_file: str, batch_size: int, shuffle: bool = True) -> None:
+        """
+        Инициализирует обработчик данных.
+
+        Args:
+            points_file: Путь к файлу с точками коллокации
+            batch_size: Размер батча для обучения
+            shuffle: Перемешивать ли данные
+        """
         self.points_file = points_file
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -187,7 +263,12 @@ class DataHandler:
         self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
 
     def load_metadata(self) -> None:
-        """Загружает метаданные из файла _metadata.npy."""
+        """
+        Загружает метаданные из файла _metadata.npy.
+
+        Raises:
+            FileNotFoundError: Если файл метаданных не найден
+        """
         meta_path = self.points_file.replace('.npy', '_metadata.npy')
         if not os.path.exists(meta_path):
             raise FileNotFoundError(f"Файл метаданных {meta_path} не найден")
@@ -209,21 +290,40 @@ class DataHandler:
         logger.info(f"Вход: u_norm={self.inlet_u_norm:.3f}, v_norm={self.inlet_v_norm:.3f}")
 
     def get_dataloader(self) -> DataLoader:
-        """Возвращает DataLoader для полного датасета (все точки)."""
+        """
+        Возвращает DataLoader для полного датасета.
+
+        Returns:
+            DataLoader для итерации по батчам
+        """
         return self.dataloader
 
     @property
     def n_points(self) -> int:
+        """
+        Возвращает количество точек в датасете.
+
+        Returns:
+            Количество точек
+        """
         return self.dataset.n_points
 
     @property
     def boundary_type_names(self) -> List[str]:
+        """
+        Возвращает список имён типов границ.
+
+        Returns:
+            Список названий типов границ
+        """
         return self.dataset.boundary_type_names
 
     def add_points(self, indices: torch.Tensor) -> None:
         """
         Добавляет точки по индексам в датасет и обновляет DataLoader.
-        Индексы должны быть целочисленным тензором на CPU.
+
+        Args:
+            indices: Индексы точек для добавления
         """
         self.dataset = self.dataset.extend(indices)
         self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
@@ -235,8 +335,16 @@ class DataHandler:
     def get_points_by_type(self, type_name: str) -> Dict[str, torch.Tensor]:
         """
         Возвращает координаты и значения для точек заданного типа границы.
-        Возвращает словарь с ключами: 'x', 'y', 'u_target', 'v_target', 'p_target',
-        'sdf', 'mask_u', 'mask_v', 'mask_p', 'u_bc', 'v_bc', 'p_bc'.
+
+        Args:
+            type_name: Название типа границы
+
+        Returns:
+            Словарь с ключами: 'x', 'y', 'u_target', 'v_target', 'p_target',
+            'sdf', 'mask_u', 'mask_v', 'mask_p', 'u_bc', 'v_bc', 'p_bc'
+
+        Raises:
+            ValueError: Если тип границы не найден
         """
         if type_name not in self.boundary_type_names:
             raise ValueError(f"Тип границы '{type_name}' не найден в данных")
@@ -257,10 +365,27 @@ class DataHandler:
             'p_bc': self.dataset.p_bc[mask],
         }
 
-    def get_points_by_type_and_coordinate(self, type_name: str, coord: str, value: float, tol: float = 0.01) -> Dict[str, torch.Tensor]:
+    def get_points_by_type_and_coordinate(
+        self,
+        type_name: str,
+        coord: str,
+        value: float,
+        tol: float = 0.01
+    ) -> Dict[str, torch.Tensor]:
         """
-        Возвращает точки заданного типа, у которых координата coord ('x' или 'y')
-        близка к значению value с допуском tol (в нормированных единицах).
+        Возвращает точки заданного типа, у которых координата coord близка к value.
+
+        Args:
+            type_name: Название типа границы
+            coord: Координата ('x' или 'y')
+            value: Целевое значение координаты
+            tol: Допуск для сравнения
+
+        Returns:
+            Словарь с отфильтрованными данными
+
+        Raises:
+            ValueError: Если coord не 'x' или 'y'
         """
         pts = self.get_points_by_type(type_name)
         if coord == 'x':
@@ -271,15 +396,26 @@ class DataHandler:
             raise ValueError("coord должен быть 'x' или 'y'")
         return {k: v[mask] for k, v in pts.items()}
 
-    def interpolate_profile(self, x_target: float, u_vals: Optional[torch.Tensor] = None,
-                            y_grid: Optional[torch.Tensor] = None,
-                            num_points: int = 100, y_max_ratio: float = 0.95) -> Tuple[np.ndarray, np.ndarray]:
+    def interpolate_profile(
+        self,
+        x_target: float,
+        u_vals: Optional[torch.Tensor] = None,
+        y_grid: Optional[torch.Tensor] = None,
+        num_points: int = 100,
+        y_max_ratio: float = 0.95
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Интерполирует профиль u(y) в сечении x = x_target (нормированное).
-        Если u_vals не передан, используются начальные значения (self.dataset.u_target).
-        Игнорируются точки с y > y_max_ratio * self.y_max (для исключения приграничных эффектов).
-        Если y_grid не задан, создаётся равномерная сетка от y_min до y_max_ratio * y_max.
-        Возвращает (y_coords, u_interp) – массивы numpy.
+
+        Args:
+            x_target: Целевая X-координата (нормированная)
+            u_vals: Значения скорости U (если None, используются начальные значения)
+            y_grid: Сетка по Y для интерполяции
+            num_points: Количество точек для равномерной сетки
+            y_max_ratio: Доля от y_max для ограничения по Y
+
+        Returns:
+            Кортеж (y_coords, u_interp) – массивы numpy
         """
         tol = 0.05 * (self.x_max - self.x_min)
         # Выбираем точки, близкие к x_target

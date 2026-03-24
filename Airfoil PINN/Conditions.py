@@ -2,20 +2,39 @@
 # -*- coding: utf-8 -*-
 """
 Модуль граничных условий Conditions.
+
 Позволяет задавать давление на входе/выходе и скорость на входе.
 Поддерживает ввод скорости как (U, V) или как (скорость, угол атаки).
 При наличии симметрии автоматически обнуляет вертикальную компоненту/угол.
 Сохраняет настройки в JSON, включая имя выбранной жидкости.
+
+Example:
+    >>> cond = BoundaryConditions(
+    ...     fluid_name="Воздух (20°C)",
+    ...     inlet_pressure=101325.0,
+    ...     outlet_pressure=101325.0,
+    ...     inlet_velocity_mode='components',
+    ...     inlet_u=10.0,
+    ...     inlet_v=0.0,
+    ...     description="Обтекание при нулевом угле атаки"
+    ... )
+    >>> manager = ConditionsManager()
+    >>> manager.save(cond, "my_conditions")
+
+Автор: Колмагоров И.Д.
+Версия: 3.260226 (исправленная)
 """
 
 import os
 import json
 import logging
 import numpy as np
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
 
 from Fluids import FluidLibrary
+from utils import safe_input_number, input_with_default, confirm_action
+from type_hints import BoundaryConditionsDict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -25,18 +44,18 @@ logger = logging.getLogger(__name__)
 class BoundaryConditions:
     """
     Класс граничных условий для задачи обтекания профиля.
-    
+
     Attributes:
-        fluid_name (str): Название жидкости из библиотеки.
-        inlet_pressure (float): Давление на входе [Па].
-        outlet_pressure (float): Давление на выходе [Па].
-        inlet_velocity_mode (str): 'components' или 'magnitude_angle'.
-        inlet_u (float): Компонента скорости U на входе [м/с] (если mode='components').
-        inlet_v (float): Компонента скорости V на входе [м/с] (если mode='components').
-        inlet_speed (float): Модуль скорости [м/с] (если mode='magnitude_angle').
-        inlet_angle (float): Угол атаки [градусы] (если mode='magnitude_angle').
-        symmetry_type (Optional[str]): Тип симметрии ('symmetry', 'axis_symmetry' или None).
-        description (str): Описание набора условий.
+        fluid_name: Название жидкости из библиотеки.
+        inlet_pressure: Давление на входе [Па].
+        outlet_pressure: Давление на выходе [Па].
+        inlet_velocity_mode: 'components' или 'magnitude_angle'.
+        inlet_u: Компонента скорости U на входе [м/с] (если mode='components').
+        inlet_v: Компонента скорости V на входе [м/с] (если mode='components').
+        inlet_speed: Модуль скорости [м/с] (если mode='magnitude_angle').
+        inlet_angle: Угол атаки [градусы] (если mode='magnitude_angle').
+        symmetry_type: Тип симметрии ('symmetry', 'axis_symmetry' или None).
+        description: Описание набора условий.
     """
     fluid_name: str
     inlet_pressure: float
@@ -49,7 +68,13 @@ class BoundaryConditions:
     symmetry_type: Optional[str] = None
     description: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """
+        Проверка и инициализация после создания dataclass.
+
+        Raises:
+            ValueError: Если inlet_velocity_mode некорректен
+        """
         if self.inlet_velocity_mode not in ['components', 'magnitude_angle']:
             raise ValueError("inlet_velocity_mode должен быть 'components' или 'magnitude_angle'")
         # Принудительно обнуляем вертикальную составляющую при симметрии
@@ -61,8 +86,29 @@ class BoundaryConditions:
                 logger.warning("При симметрии угол атаки принудительно установлен в 0.")
                 self.inlet_angle = 0.0
 
+    def to_dict(self) -> BoundaryConditionsDict:
+        """Преобразует граничные условия в словарь."""
+        return BoundaryConditionsDict(
+            fluid_name=self.fluid_name,
+            inlet_pressure=self.inlet_pressure,
+            outlet_pressure=self.outlet_pressure,
+            inlet_velocity_mode=self.inlet_velocity_mode,  # type: ignore
+            inlet_u=self.inlet_u,
+            inlet_v=self.inlet_v,
+            inlet_speed=self.inlet_speed,
+            inlet_angle=self.inlet_angle,
+            symmetry_type=self.symmetry_type,
+            description=self.description
+        )
+
     @property
     def u(self) -> float:
+        """
+        Возвращает компоненту U скорости на входе.
+
+        Returns:
+            Компонента U скорости [м/с]
+        """
         if self.inlet_velocity_mode == 'components':
             return self.inlet_u
         else:
@@ -70,19 +116,55 @@ class BoundaryConditions:
 
     @property
     def v(self) -> float:
+        """
+        Возвращает компоненту V скорости на входе.
+
+        Returns:
+            Компонента V скорости [м/с]
+        """
         if self.inlet_velocity_mode == 'components':
             return self.inlet_v
         else:
             return self.inlet_speed * np.sin(np.radians(self.inlet_angle))
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def to_dict(self) -> BoundaryConditionsDict:
+        """Преобразует граничные условия в словарь."""
+        return BoundaryConditionsDict(
+            fluid_name=self.fluid_name,
+            inlet_pressure=self.inlet_pressure,
+            outlet_pressure=self.outlet_pressure,
+            inlet_velocity_mode=self.inlet_velocity_mode,  # type: ignore
+            inlet_u=self.inlet_u,
+            inlet_v=self.inlet_v,
+            inlet_speed=self.inlet_speed,
+            inlet_angle=self.inlet_angle,
+            symmetry_type=self.symmetry_type,
+            description=self.description
+        )
 
     @classmethod
     def from_dict(cls, data: dict) -> 'BoundaryConditions':
+        """
+        Создаёт объект из словаря.
+
+        Args:
+            data: Словарь с данными граничных условий
+
+        Returns:
+            Объект BoundaryConditions
+        """
         return cls(**data)
 
     def display(self, fluid_lib: FluidLibrary) -> str:
+        """
+        Возвращает строковое представление граничных условий.
+
+        Args:
+            fluid_lib: Библиотека жидкостей для получения информации о жидкости
+
+        Returns:
+            Строка с описанием граничных условий
+        """
         fluid = fluid_lib.get(self.fluid_name)
         fluid_str = fluid.display() if fluid else f"Жидкость '{self.fluid_name}' (не найдена)"
         lines = [
@@ -100,14 +182,36 @@ class BoundaryConditions:
 
 
 class ConditionsManager:
-    def __init__(self, directory: str = "Conditions"):
+    """
+    Менеджер для управления наборами граничных условий.
+
+    Загружает, сохраняет и предоставляет доступ к условиям через JSON-файлы.
+
+    Attributes:
+        directory: Директория для хранения файлов условий
+        conditions: Словарь с загруженными условиями
+        fluid_lib: Библиотека жидкостей
+    """
+
+    def __init__(self, directory: str = "Conditions") -> None:
+        """
+        Инициализирует менеджер граничных условий.
+
+        Args:
+            directory: Директория для хранения файлов условий
+        """
         self.directory = directory
         self.conditions: Dict[str, BoundaryConditions] = {}
         self.fluid_lib = FluidLibrary()
         os.makedirs(self.directory, exist_ok=True)
         self._load_all()
 
-    def _load_all(self):
+    def _load_all(self) -> None:
+        """
+        Загружает все условия из директории.
+
+        Загружает JSON-файлы и создаёт объекты BoundaryConditions.
+        """
         self.conditions.clear()
         if not os.path.exists(self.directory):
             return
@@ -129,15 +233,26 @@ class ConditionsManager:
                 except Exception as e:
                     logger.error(f"Ошибка загрузки {filename}: {e}")
 
-    def save(self, cond: BoundaryConditions, name: str):
-        filename = name.replace(" ", "_").replace("/", "_") + ".json"
-        path = os.path.join(self.directory, filename)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(cond.to_dict(), f, indent=4, ensure_ascii=False)
-        self.conditions[name] = cond
-        logger.info(f"Сохранены условия: {name} -> {filename}")
+    def save(self, cond: BoundaryConditions, name: str) -> None:
+        """
+        Сохраняет граничные условия в JSON файл.
 
-    def delete(self, name: str):
+        Args:
+            cond: Объект граничных условий
+            name: Имя для сохранения
+        """
+        from utils import save_json
+        save_json(cond.to_dict(), self.directory, name)
+        self.conditions[name] = cond
+        logger.info(f"Сохранены условия: {name}")
+
+    def delete(self, name: str) -> None:
+        """
+        Удаляет условия из библиотеки и файловой системы.
+
+        Args:
+            name: Имя условий для удаления
+        """
         if name in self.conditions:
             for filename in os.listdir(self.directory):
                 if filename.endswith(".json") and name in filename:
@@ -146,13 +261,33 @@ class ConditionsManager:
             del self.conditions[name]
             logger.info(f"Удалены условия: {name}")
 
-    def list_names(self) -> list:
+    def list_names(self) -> List[str]:
+        """
+        Возвращает список имён условий.
+
+        Returns:
+            Список имён сохранённых условий
+        """
         return list(self.conditions.keys())
 
     def get(self, name: str) -> Optional[BoundaryConditions]:
+        """
+        Возвращает условия по имени.
+
+        Args:
+            name: Имя условий
+
+        Returns:
+            Объект BoundaryConditions или None
+        """
         return self.conditions.get(name)
 
-    def create_defaults(self):
+    def create_defaults(self) -> None:
+        """
+        Создаёт примеры наборов граничных условий.
+
+        Использует первую доступную жидкость из библиотеки.
+        """
         fluid_names = self.fluid_lib.list_fluids()
         if not fluid_names:
             self.fluid_lib.create_default_library()
@@ -197,6 +332,15 @@ class ConditionsManager:
 
 
 def select_fluid(fluid_lib: FluidLibrary) -> Optional[str]:
+    """
+    Интерактивный выбор жидкости из библиотеки.
+
+    Args:
+        fluid_lib: Библиотека жидкостей
+
+    Returns:
+        Название выбранной жидкости или None
+    """
     fluids = fluid_lib.list_fluids()
     if not fluids:
         print("Библиотека жидкостей пуста. Сначала создайте жидкость в модуле Fluids.")
@@ -219,7 +363,14 @@ def select_fluid(fluid_lib: FluidLibrary) -> Optional[str]:
             print("Введите число.")
 
 
-def conditions_menu():
+def conditions_menu() -> None:
+    """
+    Интерактивное меню для управления граничными условиями.
+
+    Example:
+        >>> if __name__ == "__main__":
+        ...     conditions_menu()
+    """
     manager = ConditionsManager()
 
     if not manager.list_names():
@@ -273,7 +424,13 @@ def conditions_menu():
             print("Неверный выбор.")
 
 
-def create_conditions(manager: ConditionsManager):
+def create_conditions(manager: ConditionsManager) -> None:
+    """
+    Создаёт новые граничные условия через интерактивный ввод.
+
+    Args:
+        manager: Менеджер условий для сохранения
+    """
     print("\nВведите параметры новых граничных условий.")
     try:
         fluid_name = select_fluid(manager.fluid_lib)
@@ -346,22 +503,153 @@ def create_conditions(manager: ConditionsManager):
         print(f"❌ Ошибка ввода: {e}")
 
 
-def edit_conditions(manager: ConditionsManager):
+def _get_symmetry_selection(current_sym: Optional[str]) -> Optional[str]:
+    """
+    Запрашивает тип симметрии у пользователя.
+
+    Args:
+        current_sym: Текущий тип симметрии
+
+    Returns:
+        Выбранный тип симметрии или None
+    """
+    current_display = current_sym if current_sym else "нет"
+    symm_input = input(f"Симметрия (symmetry/axis_symmetry/нет) [{current_display}]: ").strip().lower()
+    
+    if symm_input in ['symmetry', 'axis_symmetry']:
+        return symm_input
+    elif symm_input == '':
+        return current_sym
+    else:
+        return None
+
+
+def _get_velocity_input_components(symmetry_type: Optional[str]) -> Tuple[float, float]:
+    """
+    Запрашивает скорость в режиме компонент (U, V).
+
+    Args:
+        symmetry_type: Тип симметрии (для обнуления V)
+
+    Returns:
+        Кортеж (U, V)
+    """
+    u = safe_input_number("U [м/с]: ", allow_empty=False)
+    
+    if symmetry_type:
+        v = 0.0
+        print("V автоматически 0 (симметрия)")
+    else:
+        v = safe_input_number("V [м/с]: ", allow_empty=False)
+    
+    return u, v
+
+
+def _get_velocity_input_magnitude_angle(symmetry_type: Optional[str]) -> Tuple[float, float]:
+    """
+    Запрашивает скорость в режиме модуль+угол.
+
+    Args:
+        symmetry_type: Тип симметрии (для обнуления угла)
+
+    Returns:
+        Кортеж (скорость, угол)
+    """
+    speed = safe_input_number("Модуль скорости [м/с]: ", allow_empty=False)
+    
+    if symmetry_type:
+        angle = 0.0
+        print("Угол=0 (симметрия)")
+    else:
+        angle = safe_input_number("Угол атаки [градусы]: ", allow_empty=False)
+    
+    return speed, angle
+
+
+def _update_velocity_data(
+    cond: BoundaryConditions,
+    new_fluid: str,
+    new_inlet_p: float,
+    new_outlet_p: float,
+    new_sym: Optional[str],
+    new_desc: str
+) -> BoundaryConditions:
+    """
+    Обновляет данные о скорости в граничных условиях.
+
+    Args:
+        cond: Текущие условия
+        new_fluid: Новая жидкость
+        new_inlet_p: Давление на входе
+        new_outlet_p: Давление на выходе
+        new_sym: Тип симметрии
+        new_desc: Описание
+
+    Returns:
+        Обновлённые граничные условия
+    """
+    print("Текущий режим скорости: ", "компоненты" if cond.inlet_velocity_mode == 'components' else "скорость+угол")
+    change_mode = input("Изменить режим? (y/N): ").strip().lower()
+    
+    # Определяем новый режим
+    if change_mode in ['y', 'yes']:
+        new_mode = 'magnitude_angle' if cond.inlet_velocity_mode == 'components' else 'components'
+        print("Ввод в режиме", "скорость+угол" if new_mode == 'magnitude_angle' else "компоненты U, V")
+    else:
+        new_mode = cond.inlet_velocity_mode
+    
+    # Получаем данные в зависимости от режима
+    if new_mode == 'magnitude_angle':
+        speed, angle = _get_velocity_input_magnitude_angle(new_sym)
+        return BoundaryConditions(
+            fluid_name=new_fluid,
+            inlet_pressure=new_inlet_p,
+            outlet_pressure=new_outlet_p,
+            inlet_velocity_mode=new_mode,
+            inlet_speed=speed,
+            inlet_angle=angle if not new_sym else 0.0,
+            symmetry_type=new_sym,
+            description=new_desc
+        )
+    else:  # components
+        u, v = _get_velocity_input_components(new_sym)
+        return BoundaryConditions(
+            fluid_name=new_fluid,
+            inlet_pressure=new_inlet_p,
+            outlet_pressure=new_outlet_p,
+            inlet_velocity_mode=new_mode,
+            inlet_u=u,
+            inlet_v=v if not new_sym else 0.0,
+            symmetry_type=new_sym,
+            description=new_desc
+        )
+
+
+def edit_conditions(manager: ConditionsManager) -> None:
+    """
+    Редактирование набора граничных условий.
+
+    Args:
+        manager: Менеджер условий
+    """
     names = manager.list_names()
     if not names:
         print("Библиотека пуста.")
         return
+    
     print("Выберите набор для редактирования:")
     for i, name in enumerate(names, 1):
         print(f"{i}. {name}")
+    
     try:
         idx = int(input("Номер: ")) - 1
         if idx < 0 or idx >= len(names):
             print("Неверный номер.")
             return
+        
         old_name = names[idx]
         cond = manager.get(old_name)
-        print(f"Редактирование '{old_name}'. Оставьте поле пустым, чтобы оставить без изменений.")
+        print(f"\nРедактирование '{old_name}'. Оставьте поле пустым, чтобы оставить без изменений.\n")
 
         # Смена жидкости
         print(f"Текущая жидкость: {cond.fluid_name}")
@@ -373,124 +661,41 @@ def edit_conditions(manager: ConditionsManager):
         else:
             new_fluid = cond.fluid_name
 
-        new_name = input(f"Новое название [{old_name}]: ").strip()
-        new_inlet_p = input(f"Давление на входе [{cond.inlet_pressure}] Па: ").strip()
-        new_outlet_p = input(f"Давление на выходе [{cond.outlet_pressure}] Па: ").strip()
+        # Новые названия и давления
+        new_name = input_with_default("Новое название", old_name)
+        new_inlet_p = safe_input_number("Давление на входе [Па]: ", default=cond.inlet_pressure)
+        new_outlet_p = safe_input_number("Давление на выходе [Па]: ", default=cond.outlet_pressure)
 
         # Симметрия
-        current_sym = cond.symmetry_type if cond.symmetry_type else "нет"
-        symm_input = input(f"Симметрия (symmetry/axis_symmetry/нет) [{current_sym}]: ").strip().lower()
-        if symm_input in ['symmetry', 'axis_symmetry']:
-            new_sym = symm_input
-        elif symm_input == '':
-            new_sym = cond.symmetry_type
-        else:
-            new_sym = None
+        new_sym = _get_symmetry_selection(cond.symmetry_type)
 
-        # Режим скорости
-        print("Текущий режим скорости: ", "компоненты" if cond.inlet_velocity_mode == 'components' else "скорость+угол")
-        change_mode = input("Изменить режим? (y/N): ").strip().lower()
-        if change_mode in ['y', 'yes']:
-            # Переключение режима
-            if cond.inlet_velocity_mode == 'components':
-                new_mode = 'magnitude_angle'
-                print("Ввод в режиме скорость+угол.")
-                speed = float(input(f"Модуль скорости [м/с]: "))
-                if new_sym:
-                    angle = 0.0
-                    print("Угол=0 (симметрия)")
-                else:
-                    angle = float(input(f"Угол атаки [градусы]: "))
-                updated = BoundaryConditions(
-                    fluid_name=new_fluid,
-                    inlet_pressure=float(new_inlet_p) if new_inlet_p else cond.inlet_pressure,
-                    outlet_pressure=float(new_outlet_p) if new_outlet_p else cond.outlet_pressure,
-                    inlet_velocity_mode=new_mode,
-                    inlet_speed=speed,
-                    inlet_angle=angle,
-                    symmetry_type=new_sym,
-                    description=cond.description
-                )
-            else:
-                new_mode = 'components'
-                print("Ввод в режиме компонент U, V.")
-                u = float(input(f"U [м/с]: "))
-                if new_sym:
-                    v = 0.0
-                    print("V=0 (симметрия)")
-                else:
-                    v = float(input(f"V [м/с]: "))
-                updated = BoundaryConditions(
-                    fluid_name=new_fluid,
-                    inlet_pressure=float(new_inlet_p) if new_inlet_p else cond.inlet_pressure,
-                    outlet_pressure=float(new_outlet_p) if new_outlet_p else cond.outlet_pressure,
-                    inlet_velocity_mode=new_mode,
-                    inlet_u=u,
-                    inlet_v=v,
-                    symmetry_type=new_sym,
-                    description=cond.description
-                )
-        else:
-            # Тот же режим
-            if cond.inlet_velocity_mode == 'components':
-                u = input(f"U [{cond.inlet_u}] м/с: ").strip()
-                if new_sym:
-                    v_val = 0.0
-                    if u:
-                        print("V автоматически 0 (симметрия)")
-                    else:
-                        print("V оставлена 0 (симметрия)")
-                else:
-                    v = input(f"V [{cond.inlet_v}] м/с: ").strip()
-                    v_val = float(v) if v else cond.inlet_v
-                u_val = float(u) if u else cond.inlet_u
-                updated = BoundaryConditions(
-                    fluid_name=new_fluid,
-                    inlet_pressure=float(new_inlet_p) if new_inlet_p else cond.inlet_pressure,
-                    outlet_pressure=float(new_outlet_p) if new_outlet_p else cond.outlet_pressure,
-                    inlet_velocity_mode='components',
-                    inlet_u=u_val,
-                    inlet_v=v_val if not new_sym else 0.0,
-                    symmetry_type=new_sym,
-                    description=cond.description
-                )
-            else:
-                speed = input(f"Скорость [{cond.inlet_speed}] м/с: ").strip()
-                if new_sym:
-                    angle_val = 0.0
-                    if speed:
-                        print("Угол=0 (симметрия)")
-                    else:
-                        print("Угол оставлен 0 (симметрия)")
-                else:
-                    angle = input(f"Угол [{cond.inlet_angle}] град: ").strip()
-                    angle_val = float(angle) if angle else cond.inlet_angle
-                speed_val = float(speed) if speed else cond.inlet_speed
-                updated = BoundaryConditions(
-                    fluid_name=new_fluid,
-                    inlet_pressure=float(new_inlet_p) if new_inlet_p else cond.inlet_pressure,
-                    outlet_pressure=float(new_outlet_p) if new_outlet_p else cond.outlet_pressure,
-                    inlet_velocity_mode='magnitude_angle',
-                    inlet_speed=speed_val,
-                    inlet_angle=angle_val if not new_sym else 0.0,
-                    symmetry_type=new_sym,
-                    description=cond.description
-                )
+        # Обновление данных о скорости
+        updated = _update_velocity_data(cond, new_fluid, new_inlet_p, new_outlet_p, new_sym, cond.description)
 
-        new_desc = input(f"Описание [{cond.description}]: ").strip()
-        updated.description = new_desc if new_desc else cond.description
+        # Описание
+        new_desc = input_with_default("Описание", cond.description)
+        updated.description = new_desc
 
+        # Сохранение
         if new_name and new_name != old_name:
             manager.delete(old_name)
             manager.save(updated, new_name)
         else:
             manager.save(updated, old_name)
+        
         print(f"✅ Условия обновлены.")
+        
     except ValueError as e:
         print(f"❌ Ошибка ввода: {e}")
 
 
-def delete_conditions(manager: ConditionsManager):
+def delete_conditions(manager: ConditionsManager) -> None:
+    """
+    Удаление набора граничных условий.
+
+    Args:
+        manager: Менеджер условий
+    """
     names = manager.list_names()
     if not names:
         print("Библиотека пуста.")

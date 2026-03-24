@@ -2,15 +2,25 @@
 # -*- coding: utf-8 -*-
 """
 Модуль инициализации расчётной области (Initializer) с поддержкой многопроцессорности.
+
 Возвращает данные в нормализованном виде для PINN:
-- координаты делятся на хорду
-- скорости делятся на U_inf
-- давление переводится в избыточное и делится на ρU_inf²
-- SDF нормализуется на хорду (sdf_norm = sdf / chord)
-- на стенке скорость обнуляется, на границах симметрии обнуляются соответствующие компоненты
-- добавлена возможность выбора начального поля скорости (constant, linear_x, perturbed)
-- добавлена возможность добавления шума к давлению
+    - координаты делятся на хорду
+    - скорости делятся на U_inf
+    - давление переводится в избыточное и делится на ρU_inf²
+    - SDF нормализуется на хорду (sdf_norm = sdf / chord)
+    - на стенке скорость обнуляется, на границах симметрии обнуляются соответствующие компоненты
+    - добавлена возможность выбора начального поля скорости (constant, linear_x, perturbed)
+    - добавлена возможность добавления шума к давлению
+
 Визуализация полей выполняется методом scatter, для SDF отображается физическое расстояние (умножением на chord).
+
+Example:
+    >>> init = Initializer()
+    >>> init.load_sampler_points()
+    >>> init.select_fluid()
+    >>> init.select_conditions()
+    >>> init.initialize_fields()
+    >>> init.save('initial')
 
 Автор: Колмагоров И.Д.
 Версия: 3.260226 (финальная исправленная)
@@ -20,18 +30,13 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import glob
 import multiprocessing as mp
 from functools import partial
 
-# Попытка импорта KDTree для ускорения
-try:
-    from scipy.spatial import cKDTree
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
-    logging.warning("scipy.spatial не доступен, SDF будет вычисляться медленно (перебором).")
+from scipy.spatial import cKDTree
+from type_hints import InitializerMetadataDict
 
 # Импортируем наши модули и классы
 from Fluids import FluidLibrary, Fluid
@@ -68,14 +73,27 @@ point_dtype = np.dtype([
 # ----------------------------------------------------------------------
 # Вспомогательная функция для многопроцессорного вычисления SDF (вынесена на уровень модуля)
 # ----------------------------------------------------------------------
-def _compute_sdf_chunk(indices: np.ndarray,
-                       xs: np.ndarray,
-                       ys: np.ndarray,
-                       wall_points: np.ndarray,
-                       use_scipy: bool) -> np.ndarray:
+def _compute_sdf_chunk(
+    indices: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    wall_points: np.ndarray,
+    use_scipy: bool
+) -> np.ndarray:
     """
     Вычисляет SDF (в метрах) для набора индексов.
+
     Строит KDTree внутри процесса, если доступен scipy.
+
+    Args:
+        indices: Индексы точек для вычисления
+        xs: X-координаты всех точек
+        ys: Y-координаты всех точек
+        wall_points: Координаты точек на стенке
+        use_scipy: Использовать ли KDTree
+
+    Returns:
+        Массив расстояний до стенки
     """
     sdf_chunk = np.zeros(len(indices))
     if use_scipy and len(wall_points) > 0:
@@ -100,9 +118,31 @@ def _compute_sdf_chunk(indices: np.ndarray,
 
 
 class Initializer:
-    """Класс для инициализации расчётной области с нормализацией."""
+    """
+    Класс для инициализации расчётной области с нормализацией.
 
-    def __init__(self):
+    Attributes:
+        geometry_dir: Директория с геометрией
+        sampler_dir: Директория с точками коллокации
+        fluids_dir: Директория с жидкостями
+        conditions_dir: Директория с граничными условиями
+        output_dir: Директория для выходных файлов
+        plots_dir: Директория для графиков
+        fluid_lib: Библиотека жидкостей
+        cond_manager: Менеджер граничных условий
+        points: Загруженные точки коллокации
+        points_norm: Нормализованные точки
+        wall_points: Точки на стенке для SDF
+        wall_tree: KDTree для быстрого поиска расстояний
+        fluid: Выбранная жидкость
+        conditions: Выбранные граничные условия
+        chord: Хорда профиля [м]
+        U_inf: Характерная скорость [м/с]
+        Re: Число Рейнольдса
+    """
+
+    def __init__(self) -> None:
+        """Инициализирует класс инициализации расчётной области."""
         self.geometry_dir = GEOMETRY_DIR
         self.sampler_dir = SAMPLER_DIR
         self.fluids_dir = FLUIDS_DIR
@@ -140,7 +180,19 @@ class Initializer:
         self.foil_coords: Optional[np.ndarray] = None
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
-        """Загружает точки коллокации из Sampler."""
+        """
+        Загружает точки коллокации из Sampler.
+
+        Args:
+            filename: Путь к файлу с точками (по умолчанию выбирается автоматически)
+
+        Returns:
+            Массив загруженных точек
+
+        Raises:
+            FileNotFoundError: Если нет файлов в директории Sampler
+            ValueError: Если файл имеет неверный формат
+        """
         if filename is None:
             files = glob.glob(os.path.join(self.sampler_dir, "*.npy"))
             if not files:
@@ -168,7 +220,12 @@ class Initializer:
         return self.points
 
     def extract_wall_points(self) -> None:
-        """Извлекает точки с типом WALL для построения SDF."""
+        """
+        Извлекает точки с типом WALL для построения SDF.
+
+        Raises:
+            RuntimeError: Если точки не загружены
+        """
         if self.points is None:
             raise RuntimeError("Сначала загрузите точки.")
         if 'boundary_type' not in self.points.dtype.names:
@@ -188,7 +245,11 @@ class Initializer:
                 logger.info("KDTree построен (будет использован в однопоточном режиме).")
 
     def load_foil_coords(self) -> None:
-        """Загружает координаты профиля для визуализации."""
+        """
+        Загружает координаты профиля для визуализации.
+
+        Ищет файлы профиля в директории Geometry/Data.
+        """
         foil_files = glob.glob(os.path.join(self.geometry_dir, "*foil*.npy"))
         if not foil_files:
             foil_files = glob.glob(os.path.join(self.geometry_dir, "*foil*.txt"))
@@ -219,7 +280,15 @@ class Initializer:
         return float(x_range)
 
     def select_fluid(self) -> str:
-        """Интерактивный выбор жидкости из библиотеки."""
+        """
+        Интерактивный выбор жидкости из библиотеки.
+
+        Returns:
+            Название выбранной жидкости
+
+        Raises:
+            RuntimeError: Если библиотека жидкостей пуста
+        """
         fluids = self.fluid_lib.list_fluids()
         if not fluids:
             raise RuntimeError("Библиотека жидкостей пуста.")
@@ -241,7 +310,15 @@ class Initializer:
                 print("Введите число.")
 
     def select_conditions(self) -> str:
-        """Интерактивный выбор граничных условий."""
+        """
+        Интерактивный выбор граничных условий.
+
+        Returns:
+            Название выбранных условий
+
+        Raises:
+            RuntimeError: Если библиотека условий пуста
+        """
         names = self.cond_manager.list_names()
         if not names:
             raise RuntimeError("Библиотека условий пуста.")
@@ -465,13 +542,25 @@ class Initializer:
         return arr_norm
 
     def save(self, description: str = "initial") -> None:
-        """Сохраняет нормализованные данные и метаданные."""
+        """
+        Сохраняет нормализованные данные и метаданные.
+
+        Args:
+            description: Описание для сохранения
+
+        Raises:
+            RuntimeError: Если нет данных для сохранения
+        """
         if self.points_norm is None:
             raise RuntimeError("Нет данных для сохранения.")
         base = os.path.join(self.output_dir, f"{description}.npy")
         np.save(base, self.points_norm)
         logger.info(f"Сохранено: {base}")
 
+        # Вычисляем нормализованные значения скорости на входе
+        inlet_u_norm = self.conditions.u / self.U_inf if self.U_inf > 0 else 1.0
+        inlet_v_norm = self.conditions.v / self.U_inf if self.U_inf > 0 else 0.0
+        
         meta = {
             'description': description,
             'fluid_name': self.fluid_name,
@@ -490,14 +579,29 @@ class Initializer:
             'Re': self.Re,
             'normalized': True,
             'sdf_norm_factor': self.chord,
+            'inlet_u_norm': inlet_u_norm,
+            'inlet_v_norm': inlet_v_norm,
         }
         meta_path = os.path.join(self.output_dir, f"{description}_metadata.npy")
         np.save(meta_path, meta)
         logger.info(f"Метаданные сохранены: {meta_path}")
 
-    def plot_field(self, field_name: str, title: Optional[str] = None,
-                   save: bool = True, show: bool = False) -> None:
-        """Строит scatter-график указанного поля."""
+    def plot_field(
+        self,
+        field_name: str,
+        title: Optional[str] = None,
+        save: bool = True,
+        show: bool = False
+    ) -> None:
+        """
+        Строит scatter-график указанного поля.
+
+        Args:
+            field_name: Имя поля для визуализации
+            title: Заголовок графика
+            save: Сохранить ли график
+            show: Показать ли график сразу
+        """
         if self.points_norm is None:
             raise RuntimeError("Нет данных для визуализации.")
         plt.figure(figsize=(12, 8))
@@ -534,7 +638,11 @@ class Initializer:
             plt.close()
 
     def plot_all_fields(self) -> None:
-        """Строит графики для всех основных полей."""
+        """
+        Строит графики для всех основных полей.
+
+        Визуализирует: p_norm, u_norm, v_norm, sdf_norm.
+        """
         self.load_foil_coords()
         fields = [
             ('p_norm', 'Нормализованное давление'),
@@ -547,7 +655,13 @@ class Initializer:
 
 
 def initialize_menu() -> None:
-    """Интерактивное меню для запуска инициализации."""
+    """
+    Интерактивное меню для запуска инициализации.
+
+    Example:
+        >>> if __name__ == "__main__":
+        ...     initialize_menu()
+    """
     init = Initializer()
 
     print("\n" + "=" * 60)

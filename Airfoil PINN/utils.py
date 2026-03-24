@@ -101,10 +101,14 @@ def safe_grad(y: torch.Tensor, x: torch.Tensor, create_graph: bool = True, silen
     """
     try:
         if not x.requires_grad:
+            if not silent:
+                logger.warning(f"safe_grad: x не требует градиента (requires_grad=False). Возвращаю ноль.")
             return torch.zeros_like(x)
         g = torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y),
                                 create_graph=create_graph, allow_unused=True)[0]
         if g is None:
+            if not silent:
+                logger.warning(f"safe_grad: градиент равен None (allow_unused=True). Возвращаю ноль.")
             return torch.zeros_like(x)
         return g
     except RuntimeError as e:
