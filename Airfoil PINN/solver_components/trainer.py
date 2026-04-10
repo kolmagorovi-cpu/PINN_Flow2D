@@ -159,26 +159,31 @@ class Trainer:
         if self.loss_computer.use_potential:
             # Для потенциала: out[:, 0:1] - это φ
             # Скорости вычисляются через градиенты потенциала
+            # ВАЖНО: retain_graph=True нужен для многократных вычислений градиентов
             phi = out[:, 0:1]
-            # Вычисляем скорости как градиенты потенциала
-            u = safe_grad(phi, x)  # u = ∂φ/∂x
-            v = safe_grad(phi, y)  # v = ∂φ/∂y
+            u = safe_grad(phi, x, retain_graph=True)  # u = ∂φ/∂x, сохраняем граф
+            v = safe_grad(phi, y, retain_graph=True)  # v = ∂φ/∂y, сохраняем граф
             # Для совместимости создаём фиктивное давление
             p = torch.zeros_like(phi)
-            u_raw, v_raw, p_raw = u, v, p
+            u_final, v_final, p_final = u, v, p  # Для использования ниже
         else:
             u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
             # Применение жёстких граничных условий (если необходимо)
             if self.loss_computer.bc_type == 'hard':
-                u, v, p = self.loss_computer.apply_hard_constraints(
+                u_final, v_final, p_final = self.loss_computer.apply_hard_constraints(
                     u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
                 )
             else:
-                u, v, p = u_raw, v_raw, p_raw
+                u_final, v_final, p_final = u_raw, v_raw, p_raw
 
         # Вычисление невязок PDE
-        res = self.loss_computer.compute_pde_residuals(u, v, p, x, y)
+        # Для потенциала: передаём phi как первый аргумент (u_final - это phi!)
+        # Для Навье-Стокса: u_final - это скорость
+        if self.loss_computer.use_potential:
+            res = self.loss_computer.compute_pde_residuals(phi, v_final, p_final, x, y)
+        else:
+            res = self.loss_computer.compute_pde_residuals(u_final, v_final, p_final, x, y)
         
         if self.loss_computer.use_potential:
             # Для потенциала только одна компонента - laplace
@@ -277,7 +282,11 @@ class Trainer:
 
         # Граничные условия (только для soft)
         if self.loss_computer.bc_type == 'soft':
-            bc_comp, extra_grad = self.loss_computer.compute_bc_loss(u, v, p, bt, x, y, sdf)
+            # Для потенциала: первый аргумент - phi, для НС - u
+            if self.loss_computer.use_potential:
+                bc_comp, extra_grad = self.loss_computer.compute_bc_loss(phi, v_final, p_final, bt, x, y, sdf)
+            else:
+                bc_comp, extra_grad = self.loss_computer.compute_bc_loss(u_final, v_final, p_final, bt, x, y, sdf)
             bc_loss = sum(
                 self.loss_computer.loss_weights.get(name, 0.0) * bc_comp[name]
                 for name in bc_comp
