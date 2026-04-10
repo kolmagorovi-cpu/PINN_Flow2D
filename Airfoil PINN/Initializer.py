@@ -383,7 +383,8 @@ class Initializer:
                           velocity_perturbation_amplitude: Optional[float] = None,
                           pressure_perturbation_amplitude: float = 0.0,
                           num_processes: Optional[int] = None,
-                          pde_system: str = 'incompressible_navier_stokes') -> np.ndarray:
+                          pde_system: str = 'incompressible_navier_stokes',
+                          potential_initial_mode: str = 'linear') -> np.ndarray:
         """
         Инициализирует нормализованные поля.
 
@@ -397,6 +398,7 @@ class Initializer:
                                              (доля от динамического напора 0.5*rho*U_inf^2)
             num_processes: количество процессов для параллельного вычисления SDF
             pde_system: тип PDE системы ('incompressible_navier_stokes' или 'potential')
+            potential_initial_mode: режим инициализации потенциала ('linear' или 'perturbed')
 
         Returns:
             Нормализованный массив точек.
@@ -439,29 +441,31 @@ class Initializer:
 
         # --- Инициализация для потенциала скорости ---
         if pde_system == 'potential':
-            # Для потенциала: φ = U_inf * x + небольшой шум
+            # Для потенциала: φ = U_inf * x + опциональный шум
             x = self.points['x']
-            phi_amp = 0.1 * self.U_inf * self.chord  # 10% от характерного значения потенциала
             
             # Базовое поле: φ = U_inf * x
             phi_phys = self.conditions.u * x  # U_inf_x * x
             
-            # Добавляем небольшой случайный шум для разнообразия
-            phi_phys += phi_amp * (2 * np.random.random(N) - 1)
-            
+            # Добавляем шум только если выбран режим perturbed
+            if potential_initial_mode == 'perturbed':
+                phi_amp = 0.1 * self.U_inf * self.chord  # 10% от характерного значения потенциала
+                phi_phys += phi_amp * (2 * np.random.random(N) - 1)
+                logger.info(f"Инициализация потенциала: φ = U_inf * x + шум (амплитуда={phi_amp:.3e})")
+            else:
+                logger.info(f"Инициализация потенциала: φ = U_inf * x (линейное)")
+
             # Нормализация потенциала: phi_norm = phi / (U_inf * chord)
             arr_norm['phi_norm'] = phi_phys / (self.U_inf * self.chord)
-            
-            logger.info(f"Инициализация потенциала: φ = U_inf * x + шум (амплитуда={phi_amp:.3e})")
-            
+
             # Для потенциала скорости вычисляются как градиенты φ,
             # но для совместимости заполняем u, v приближёнными значениями
             u_phys = np.full(N, self.conditions.u)
             v_phys = np.full(N, self.conditions.v)
-            
+
             # Давление для потенциала не используется, но заполняем для совместимости
             p_phys = np.zeros(N)
-            
+
         else:
             # --- Генерация начального поля скорости для Навье-Стокса ---
             x = self.points['x']
@@ -744,69 +748,131 @@ def initialize_menu() -> None:
     press_mode_choice = input("Выберите (1/2): ").strip()
     pressure_mode = 'constant' if press_mode_choice == '1' else 'linear_x'
 
-    print("\nРежим начального поля скорости:")
-    print("   1 - постоянное (равное входной скорости)")
-    print("   2 - линейное убывание по X")
-    print("   3 - постоянное + случайный шум")
-    vel_choice = input("Выберите (1/2/3): ").strip()
-    vel_map = {'1': 'constant', '2': 'linear_x', '3': 'perturbed'}
-    velocity_initial_mode = vel_map.get(vel_choice, 'constant')
+    # Спрашиваем о типе PDE системы
+    print("\nТип PDE системы:")
+    print("   1 - Навье-Стокс (u, v, p)")
+    print("   2 - Потенциал скорости (φ)")
+    pde_choice = input("Выберите (1/2): ").strip()
+    pde_system = 'incompressible_navier_stokes' if pde_choice == '1' else 'potential'
 
-    velocity_perturbation_amplitude = 0.01
-    if velocity_initial_mode == 'perturbed':
+    if pde_system == 'potential':
+        # Для потенциала - инициализация потенциала скорости
+        print("\nРежим начального поля потенциала скорости:")
+        print("   1 - линейное φ = U_inf * x (однородный поток)")
+        print("   2 - линейное + случайный шум")
+        phi_choice = input("Выберите (1/2): ").strip()
+        
+        velocity_initial_mode = 'constant'  # Не используется для потенциала
+        velocity_perturbation_amplitude = 0.0
+        pressure_perturbation_amplitude = 0.0
+        
         try:
-            amp = float(input("Амплитуда шума для скорости (относительная, по умолч. 0.01): ").strip() or "0.01")
-            velocity_perturbation_amplitude = amp
+            temp = float(input("Температура [K] (по умолчанию 293.15): ").strip() or "293.15")
         except ValueError:
-            velocity_perturbation_amplitude = 0.01
-            print("Использую значение по умолчанию 0.01")
-
-    add_pressure_noise = input("\nДобавить шум к давлению? (y/N): ").strip().lower()
-    pressure_perturbation_amplitude = 0.0
-    if add_pressure_noise in ('y', 'yes'):
+            temp = 293.15
+            print("Использую значение по умолчанию 293.15 K")
+        
         try:
-            amp = float(input("Амплитуда шума для давления (относительная доля от динамического напора, по умолч. 0.1): ").strip() or "0.1")
-            pressure_perturbation_amplitude = amp
+            num_proc_input = input("Количество процессов для параллельных вычислений (Enter для авто): ").strip()
+            num_proc = int(num_proc_input) if num_proc_input else None
         except ValueError:
-            pressure_perturbation_amplitude = 0.1
-            print("Использую значение по умолчанию 0.1")
-
-    try:
-        temp = float(input("Температура [K] (по умолчанию 293.15): ").strip() or "293.15")
-    except ValueError:
-        temp = 293.15
-        print("Использую значение по умолчанию 293.15 K")
-
-    try:
-        num_proc_input = input("Количество процессов для параллельных вычислений (Enter для авто): ").strip()
-        num_proc = int(num_proc_input) if num_proc_input else None
-    except ValueError:
-        num_proc = None
-        print("Использую автоматическое определение числа процессов.")
-
-    print("\n🔧 Вычисление нормализованных полей...")
-    try:
-        init.initialize_fields(pressure_mode=pressure_mode,
-                               velocity_initial_mode=velocity_initial_mode,
-                               temperature=temp,
-                               velocity_perturbation_amplitude=velocity_perturbation_amplitude,
-                               pressure_perturbation_amplitude=pressure_perturbation_amplitude,
-                               num_processes=num_proc)
-    except Exception as e:
-        print(f"❌ Ошибка при вычислении полей: {e}")
+            num_proc = None
+            print("Использую автоматическое определение числа процессов.")
+        
+        print("\n🔧 Вычисление нормализованных полей (потенциал скорости)...")
+        try:
+            init.initialize_fields(
+                pressure_mode=pressure_mode,
+                velocity_initial_mode=velocity_initial_mode,
+                temperature=temp,
+                velocity_perturbation_amplitude=velocity_perturbation_amplitude,
+                pressure_perturbation_amplitude=pressure_perturbation_amplitude,
+                num_processes=num_proc,
+                pde_system=pde_system,
+                potential_initial_mode='linear' if phi_choice == '1' else 'perturbed'
+            )
+        except Exception as e:
+            print(f"❌ Ошибка при вычислении полей: {e}")
+            input("Нажмите Enter для возврата...")
+            return
+        
+        desc = input("Введите описание для сохранения (по умолчанию 'initial_potential'): ").strip() or "initial_potential"
+        init.save(description=desc)
+        
+        plot_choice = input("Построить графики полей? (Y/n): ").strip().lower()
+        if plot_choice == '' or plot_choice == 'y' or plot_choice == 'yes':
+            init.plot_all_fields()
+            print(f"Графики сохранены в {init.plots_dir}")
+        
+        print("\n✅ Инициализация потенциала скорости завершена.")
         input("Нажмите Enter для возврата...")
         return
+    
+    else:
+        # Для Навье-Стокса - стандартная инициализация
+        print("\nРежим начального поля скорости:")
+        print("   1 - постоянное (равное входной скорости)")
+        print("   2 - линейное убывание по X")
+        print("   3 - постоянное + случайный шум")
+        vel_choice = input("Выберите (1/2/3): ").strip()
+        vel_map = {'1': 'constant', '2': 'linear_x', '3': 'perturbed'}
+        velocity_initial_mode = vel_map.get(vel_choice, 'constant')
 
-    desc = input("Введите описание для сохранения (по умолчанию 'initial'): ").strip() or "initial"
-    init.save(description=desc)
+        velocity_perturbation_amplitude = 0.01
+        if velocity_initial_mode == 'perturbed':
+            try:
+                amp = float(input("Амплитуда шума для скорости (относительная, по умолч. 0.01): ").strip() or "0.01")
+                velocity_perturbation_amplitude = amp
+            except ValueError:
+                velocity_perturbation_amplitude = 0.01
+                print("Использую значение по умолчанию 0.01")
 
-    plot_choice = input("Построить графики полей? (Y/n): ").strip().lower()
-    if plot_choice == '' or plot_choice == 'y' or plot_choice == 'yes':
-        init.plot_all_fields()
-        print(f"Графики сохранены в {init.plots_dir}")
+        add_pressure_noise = input("\nДобавить шум к давлению? (y/N): ").strip().lower()
+        pressure_perturbation_amplitude = 0.0
+        if add_pressure_noise in ('y', 'yes'):
+            try:
+                amp = float(input("Амплитуда шума для давления (относительная доля от динамического напора, по умолч. 0.1): ").strip() or "0.1")
+                pressure_perturbation_amplitude = amp
+            except ValueError:
+                pressure_perturbation_amplitude = 0.1
+                print("Использую значение по умолчанию 0.1")
 
-    print("\n✅ Инициализация завершена. Нормализованные данные готовы для PINN.")
-    input("Нажмите Enter для возврата...")
+        try:
+            temp = float(input("Температура [K] (по умолчанию 293.15): ").strip() or "293.15")
+        except ValueError:
+            temp = 293.15
+            print("Использую значение по умолчанию 293.15 K")
+
+        try:
+            num_proc_input = input("Количество процессов для параллельных вычислений (Enter для авто): ").strip()
+            num_proc = int(num_proc_input) if num_proc_input else None
+        except ValueError:
+            num_proc = None
+            print("Использую автоматическое определение числа процессов.")
+
+        print("\n🔧 Вычисление нормализованных полей...")
+        try:
+            init.initialize_fields(pressure_mode=pressure_mode,
+                                   velocity_initial_mode=velocity_initial_mode,
+                                   temperature=temp,
+                                   velocity_perturbation_amplitude=velocity_perturbation_amplitude,
+                                   pressure_perturbation_amplitude=pressure_perturbation_amplitude,
+                                   num_processes=num_proc)
+        except Exception as e:
+            print(f"❌ Ошибка при вычислении полей: {e}")
+            input("Нажмите Enter для возврата...")
+            return
+
+        desc = input("Введите описание для сохранения (по умолчанию 'initial'): ").strip() or "initial"
+        init.save(description=desc)
+
+        plot_choice = input("Построить графики полей? (Y/n): ").strip().lower()
+        if plot_choice == '' or plot_choice == 'y' or plot_choice == 'yes':
+            init.plot_all_fields()
+            print(f"Графики сохранены в {init.plots_dir}")
+
+        print("\n✅ Инициализация завершена. Нормализованные данные готовы для PINN.")
+        input("Нажмите Enter для возврата...")
 
 
 if __name__ == "__main__":

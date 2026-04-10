@@ -284,20 +284,37 @@ def _configure_coordinate_scaling(cfg: ConfigManager) -> None:
 def _configure_output_params(cfg: ConfigManager) -> None:
     """Настройка выходных параметров."""
     arch = cfg.config['architecture']
-    
-    print("Выходные параметры: 1 - только u,v,p (несжимаемая); 2 - добавить плотность (сжимаемая)")
-    out_choice = input("Выберите (1/2): ").strip()
-    arch['output_dim'] = 4 if out_choice == '2' else 3
-    
-    bias_u = input(f"Начальное смещение для U (текущее: {arch['output_bias'][0]}): ").strip()
-    bias_v = input(f"Начальное смещение для V (текущее: {arch['output_bias'][1]}): ").strip()
-    bias_p = input(f"Начальное смещение для P (текущее: {arch['output_bias'][2]}): ").strip()
-    
-    arch['output_bias'] = (
-        float(bias_u) if bias_u else arch['output_bias'][0],
-        float(bias_v) if bias_v else arch['output_bias'][1],
-        float(bias_p) if bias_p else arch['output_bias'][2],
-    )
+    pde_system = cfg.config['pde'].get('system', 'incompressible_navier_stokes')
+
+    # Проверяем, выбрана ли система потенциала
+    if pde_system == 'potential':
+        print("\n⚠️  ВНИМАНИЕ: Выбрана система уравнений ПОТЕНЦИАЛЬНОГО ТЕЧЕНИЯ")
+        print(f"   Система: {pde_system}")
+        print(f"   Уравнение: ∇²φ = 0 (Лаплас)")
+        print(f"\n📌 ВЫХОД НЕЙРОННОЙ СЕТИ:")
+        print(f"   Размерность выхода: 1 (потенциал скорости φ)")
+        print(f"   Начальное смещение: {arch.get('potential_output_bias', [0.0])}")
+        print(f"\n   Скорости вычисляются автоматически:")
+        print(f"   u = ∂φ/∂x, v = ∂φ/∂y")
+        print(f"\n   Давление вычисляется постпроцессингом по уравнению Бернулли:")
+        print(f"   p = p_inf + 0.5 * ρ * (U_inf² - (u² + v²))")
+        print(f"\n   Изменение выходных параметров невозможно для потенциала.")
+        print(f"   Для изменения параметров сначала выберите другую систему ДУ.")
+        input("\n   Нажмите Enter для возврата в меню...")
+    else:
+        print("Выходные параметры: 1 - только u,v,p (несжимаемая); 2 - добавить плотность (сжимаемая)")
+        out_choice = input("Выберите (1/2): ").strip()
+        arch['output_dim'] = 4 if out_choice == '2' else 3
+
+        bias_u = input(f"Начальное смещение для U (текущее: {arch['output_bias'][0]}): ").strip()
+        bias_v = input(f"Начальное смещение для V (текущее: {arch['output_bias'][1]}): ").strip()
+        bias_p = input(f"Начальное смещение для P (текущее: {arch['output_bias'][2]}): ").strip()
+
+        arch['output_bias'] = (
+            float(bias_u) if bias_u else arch['output_bias'][0],
+            float(bias_v) if bias_v else arch['output_bias'][1],
+            float(bias_p) if bias_p else arch['output_bias'][2],
+        )
 
 
 # =============================================================================
