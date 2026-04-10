@@ -41,6 +41,7 @@ from utils import (
     print_header,
     get_menu_choice,
 )
+from utils.ui_utils import Colors
 
 # Настройка логирования
 logging.basicConfig(
@@ -50,10 +51,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Корневая директория проекта
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 # Константы
 DEFAULT_POINTS_FILE = os.path.join("Initial", "Data", "initial.npy")
 PICTURES_DIR = "Pictures"
 CONFIG_DIR = ConfigManager.CONFIG_DIR
+
+
+def resolve_path(path: str) -> str:
+    """
+    Преобразует относительный путь в абсолютный относительно PROJECT_ROOT.
+    
+    Args:
+        path: путь (относительный или абсолютный)
+    
+    Returns:
+        Абсолютный путь
+    """
+    if os.path.isabs(path):
+        return path
+    return os.path.join(PROJECT_ROOT, path)
 
 
 def print_submenu_header(title: str) -> None:
@@ -301,8 +320,12 @@ def run_experiment(config_path: str, experiment_dir: str) -> None:
         logger.error(f"Не удалось загрузить конфигурацию {config_path}: {e}")
         sys.exit(1)
 
-    # Проверяем наличие файла с точками
+    # Проверяем наличие файла с точками (преобразуем путь в абсолютный)
     points_file = cfg.config['data'].get('points_file')
+    if points_file:
+        points_file = resolve_path(points_file)
+        cfg.config['data']['points_file'] = points_file
+    
     if not points_file or not os.path.exists(points_file):
         logger.error(f"Файл с точками не найден: {points_file}")
         sys.exit(1)
@@ -533,9 +556,27 @@ def loss_function_menu(cfg: ConfigManager) -> None:
         sub = input("Выберите пункт: ").strip()
 
         if sub == '1':
-            print("Система уравнений: 1 - вязкая несжимаемая, 2 - Эйлер (идеальная)")
-            sys_choice = input("Выберите (1/2): ").strip()
-            cfg.config['pde']['system'] = 'incompressible_navier_stokes' if sys_choice == '1' else 'euler'
+            print("Система уравнений:")
+            print("  1 - вязкая несжимаемая (Навье-Стокс)")
+            print("  2 - Эйлер (идеальная)")
+            print("  3 - потенциальное течение (Лаплас)")
+            sys_choice = input("Выберите (1/2/3): ").strip()
+            if sys_choice == '1':
+                cfg.config['pde']['system'] = 'incompressible_navier_stokes'
+            elif sys_choice == '2':
+                cfg.config['pde']['system'] = 'euler'
+            elif sys_choice == '3':
+                cfg.config['pde']['system'] = 'potential'
+                # Автоматически настраиваем параметры для потенциала
+                cfg.config['input_params']['use_potential'] = True
+                cfg.config['architecture']['output_dim'] = cfg.config['architecture'].get('potential_output_dim', 1)
+                cfg.config['architecture']['output_bias'] = cfg.config['architecture'].get('potential_output_bias', [0.0])
+                print(f"✅ Выбрано потенциальное течение (уравнение Лапласа ∇²φ = 0)")
+                print(f"   Выход сети: 1 (потенциал φ)")
+                print(f"   Скорости: u = ∂φ/∂x, v = ∂φ/∂y")
+                print(f"   Давление: постпроцессинг по Бернулли")
+            else:
+                print("Неверный выбор, оставлено без изменений.")
         elif sub == '2':
             bc_type = input("Тип граничных условий (soft/hard, по умолч. soft): ").strip().lower()
             cfg.config['boundary_conditions']['type'] = bc_type if bc_type in ['hard'] else 'soft'
@@ -543,15 +584,28 @@ def loss_function_menu(cfg: ConfigManager) -> None:
             weights_menu(cfg)
         elif sub == '4':
             lw = cfg.config['loss_weights']
+            pde_system = cfg.config['pde']['system']
             print("\n--- ТЕКУЩИЕ НАСТРОЙКИ ФУНКЦИИ ПОТЕРЬ ---")
-            print(f"Система ДУ: {cfg.config['pde']['system']}")
+            print(f"Система ДУ: {pde_system}")
+            if pde_system == 'potential':
+                pot_cfg = cfg.config['pde'].get('potential', {})
+                print(f"  U_inf: {pot_cfg.get('U_inf', 1.0)}")
+                print(f"  Угол атаки: {pot_cfg.get('angle_of_attack', 0.0)}°")
+                print(f"  Толщина ПС: {pot_cfg.get('boundary_layer_thickness', 0.05)}")
+                print(f"  Вес регуляризации: {pot_cfg.get('uniform_reg_weight', 0.01)}")
+                print(f"  Вес Лапласа: {lw.get('laplace_weight', 1.0)}")
+                print(f"  Веса BC (потенциал):")
+                for k, v in lw['bc_weights'].items():
+                    if k.endswith('_phi'):
+                        print(f"    {k}: {v:.2e}")
             print(f"Тип ГУ: {cfg.config['boundary_conditions']['type']}")
             print("Веса PDE:")
             for k, v in lw['pde_weights'].items():
                 print(f"  {k}: {v:.2e}")
             print("Веса BC:")
             for k, v in lw['bc_weights'].items():
-                print(f"  {k}: {v:.2e}")
+                if not k.endswith('_phi'):  # Не дублировать для потенциала
+                    print(f"  {k}: {v:.2e}")
             print(f"Адаптивные BC: {lw['adaptive_bc']}")
             print(f"SA-PINN: {lw['use_sa_weights']}")
             print(f"SA-PINN для BC: {lw['sa_apply_to_bc']}")
@@ -861,11 +915,58 @@ def process_settings(cfg: ConfigManager) -> None:
             else:
                 proc['load_model_path'] = None
         elif sub == '2':
-            proc['device'] = input(f"Устройство (auto/cuda/cpu) [{proc['device']}]: ").strip() or proc['device']
-            if torch.cuda.is_available() and proc['device'] != 'cpu':
-                proc['num_gpus'] = int(input(f"Количество GPU [{proc['num_gpus']}]: ") or proc['num_gpus'])
+            # Выбор устройства: цифровое меню
+            clear_screen()
+            print_submenu_header("Выбор вычислительного устройства")
+            
+            cuda_available = torch.cuda.is_available()
+            num_gpus = torch.cuda.device_count() if cuda_available else 0
+            
+            print(f"\nДоступные устройства:\n")
+            print(f"  1. cuda (принудительно GPU)")
+            if cuda_available:
+                for i in range(num_gpus):
+                    gpu_name = torch.cuda.get_device_name(i)
+                    mem = torch.cuda.get_device_properties(i).total_memory / 1e9
+                    print(f"     ↳ GPU {i}: {gpu_name} ({mem:.1f} ГБ)")
             else:
+                print(f"     ⚠️  CUDA недоступна!")
+            
+            print(f"  2. cpu (принудительно CPU)")
+            print(f"  3. auto (CUDA если доступен, иначе CPU)")
+            print(f"\nТекущее устройство: {proc['device']}")
+            print(f"  {'(ИСПОЛЬЗУЕТСЯ GPU)' if proc['device'] == 'cuda' and cuda_available else '(ИСПОЛЬЗУЕТСЯ CPU)' if proc['device'] == 'cpu' else '(АВТО)'}")
+            print("\n0. Отмена\n")
+            
+            choice = input("Выберите устройство (цифра): ").strip()
+            
+            if choice == '0':
+                pass  # Отмена
+            elif choice == '1':
+                # Принудительно CUDA
+                if cuda_available:
+                    proc['device'] = 'cuda'
+                    proc['num_gpus'] = num_gpus
+                    print(f"\n{Colors.GREEN}✓ Выбрано: cuda (GPU) - {torch.cuda.get_device_name(0)}{Colors.RESET}")
+                else:
+                    print(f"\n{Colors.RED}❌ ОШИБКА: CUDA недоступна на этом компьютере!{Colors.RESET}")
+                    print(f"{Colors.YELLOW}   Установите драйверы NVIDIA и CUDA Toolkit.{Colors.RESET}")
+                    input("\nНажмите Enter...")
+                    continue  # Возврат к началу цикла
+            elif choice == '2':
+                # Принудительно CPU
+                proc['device'] = 'cpu'
                 proc['num_gpus'] = 0
+                print(f"\n{Colors.GREEN}✓ Выбрано: cpu{Colors.RESET}")
+            elif choice == '3':
+                # Auto
+                proc['device'] = 'auto'
+                proc['num_gpus'] = num_gpus if cuda_available else 0
+                print(f"\n{Colors.GREEN}✓ Выбрано: auto{' (будет использован GPU)' if cuda_available else ' (CUDA недоступна, будет CPU)'}{Colors.RESET}")
+            else:
+                print(f"\n{Colors.RED}❌ Неверный выбор, оставлено: {proc['device']}{Colors.RESET}")
+            
+            input("\nНажмите Enter для продолжения...")
         elif sub == '3':
             proc['dtype'] = input(f"Тип данных (float32/float64/float16) [{proc['dtype']}]: ").strip() or proc['dtype']
             if proc['dtype'] == 'float32':
@@ -894,11 +995,15 @@ def start_training(cfg: ConfigManager, experiment_dir: Optional[str] = None) -> 
         cfg.config['data']['points_file'] = DEFAULT_POINTS_FILE
         print(f"Используется путь к точкам по умолчанию: {DEFAULT_POINTS_FILE}")
 
-    if not os.path.exists(cfg.config['data']['points_file']):
-        print(f"Файл с точками не найден: {cfg.config['data']['points_file']}")
+    # Преобразуем путь в абсолютный
+    points_file = resolve_path(cfg.config['data']['points_file'])
+    cfg.config['data']['points_file'] = points_file
+    
+    if not os.path.exists(points_file):
+        print(f"Файл с точками не найден: {points_file}")
         alt = input("Введите путь к файлу вручную (или Enter для отмены): ").strip()
         if alt and os.path.exists(alt):
-            cfg.config['data']['points_file'] = alt
+            cfg.config['data']['points_file'] = os.path.abspath(alt)
         else:
             print("Файл не найден. Обучение невозможно.")
             input("Нажмите Enter...")
