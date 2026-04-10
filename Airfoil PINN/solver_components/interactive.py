@@ -132,24 +132,41 @@ class InteractiveHandler:
 
         self.model.eval()
         with torch.no_grad():
-            input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
-            out = self.model(input_tensor)
-            u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
-
-            # Применяем hard constraints, если нужно (для отображения правильных значений на границах)
-            if self.loss_computer.bc_type == 'hard':
-                # Маски и значения нужно получить из датасета
-                u, v, p = self.loss_computer.apply_hard_constraints(
-                    u_raw, v_raw, p_raw,
-                    dataset.mask_u_fixed.to(self.device).view(-1, 1),
-                    dataset.mask_v_fixed.to(self.device).view(-1, 1),
-                    dataset.mask_p_fixed.to(self.device).view(-1, 1),
-                    dataset.u_bc.to(self.device, dtype=self.dtype).view(-1, 1),
-                    dataset.v_bc.to(self.device, dtype=self.dtype).view(-1, 1),
-                    dataset.p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
-                )
+            if self.loss_computer.use_potential:
+                # Для потенциала: вычисляем скорости через градиенты
+                with torch.enable_grad():
+                    x_norm_grad = x_norm.requires_grad_(True)
+                    y_norm_grad = y_norm.requires_grad_(True)
+                    input_tensor = self.loss_computer.build_input_tensor(x_norm_grad, y_norm_grad, sdf_norm, bt)
+                    phi = self.model(input_tensor)
+                    u = torch.autograd.grad(phi, x_norm_grad, grad_outputs=torch.ones_like(phi),
+                                            create_graph=False, retain_graph=False, allow_unused=True)[0]
+                    v = torch.autograd.grad(phi, y_norm_grad, grad_outputs=torch.ones_like(phi),
+                                            create_graph=False, retain_graph=False, allow_unused=True)[0]
+                    if u is None:
+                        u = torch.zeros_like(x_norm_grad)
+                    if v is None:
+                        v = torch.zeros_like(y_norm_grad)
+                    p = torch.zeros_like(phi)
             else:
-                u, v, p = u_raw, v_raw, p_raw
+                input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
+                out = self.model(input_tensor)
+                u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+
+                # Применяем hard constraints, если нужно (для отображения правильных значений на границах)
+                if self.loss_computer.bc_type == 'hard':
+                    # Маски и значения нужно получить из датасета
+                    u, v, p = self.loss_computer.apply_hard_constraints(
+                        u_raw, v_raw, p_raw,
+                        dataset.mask_u_fixed.to(self.device).view(-1, 1),
+                        dataset.mask_v_fixed.to(self.device).view(-1, 1),
+                        dataset.mask_p_fixed.to(self.device).view(-1, 1),
+                        dataset.u_bc.to(self.device, dtype=self.dtype).view(-1, 1),
+                        dataset.v_bc.to(self.device, dtype=self.dtype).view(-1, 1),
+                        dataset.p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                    )
+                else:
+                    u, v, p = u_raw, v_raw, p_raw
 
         # Сохраняем поля (нормализованные и физические)
         if self.plots_dir:
@@ -158,7 +175,9 @@ class InteractiveHandler:
                 self.plots_dir, epoch,
                 boundary_types=bt,
                 boundary_type_names=self.data_handler.boundary_type_names,
-                plot_physical=False
+                plot_physical=False,
+                use_potential=self.loss_computer.use_potential,
+                history=self.metrics.history
             )
         logger.info("Результаты сохранены.")
 

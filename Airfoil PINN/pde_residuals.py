@@ -143,7 +143,7 @@ class PDEResiduals:
         phi: torch.Tensor,
         x: torch.Tensor,
         y: torch.Tensor,
-        grad_fn: Callable = None
+        grad_fn: Callable
     ) -> dict:
         """
         Вычисляет невязки для уравнения Лапласа (потенциал скорости).
@@ -158,8 +158,7 @@ class PDEResiduals:
         Args:
             phi: потенциал скорости (тензор с requires_grad=True)
             x, y: координаты (тензоры с requires_grad=True)
-            grad_fn: функция градиента (например, safe_grad). 
-                    Если None, используется torch.autograd.grad напрямую.
+            grad_fn: функция градиента (например, safe_grad)
 
         Returns:
             словарь с ключами:
@@ -169,30 +168,15 @@ class PDEResiduals:
                 'phi_xx': ∂²φ/∂x² (для диагностики)
                 'phi_yy': ∂²φ/∂y² (для диагностики)
         """
-        # Используем torch.autograd.grad напрямую для точного вычисления производных
-        grad_outputs = torch.ones_like(phi)
-        
         # Первые производные (скорости)
-        phi_x = torch.autograd.grad(
-            phi, x, grad_outputs=grad_outputs, 
-            create_graph=True, retain_graph=True
-        )[0]  # u = ∂φ/∂x
-        
-        phi_y = torch.autograd.grad(
-            phi, y, grad_outputs=grad_outputs, 
-            create_graph=True, retain_graph=True
-        )[0]  # v = ∂φ/∂y
+        # retain_graph=True для всех вызовов — общий граф от phi через модель должен остаться
+        # для последующего total_loss.backward()
+        phi_x = grad_fn(phi, x, retain_graph=True)  # u = ∂φ/∂x
+        phi_y = grad_fn(phi, y, retain_graph=True)  # v = ∂φ/∂y
 
         # Вторые производные для Лапласиана
-        phi_xx = torch.autograd.grad(
-            phi_x, x, grad_outputs=torch.ones_like(phi_x), 
-            create_graph=True, retain_graph=True
-        )[0]
-        
-        phi_yy = torch.autograd.grad(
-            phi_y, y, grad_outputs=torch.ones_like(phi_y), 
-            create_graph=False, retain_graph=False
-        )[0]
+        phi_xx = grad_fn(phi_x, x, retain_graph=True)
+        phi_yy = grad_fn(phi_y, y, retain_graph=True)
 
         # Уравнение Лапласа: ∇²φ = phi_xx + phi_yy = 0
         laplace = (phi_xx + phi_yy) ** 2
@@ -213,7 +197,7 @@ class PDEResiduals:
         U_inf: float,
         p_inf: float,
         rho: float,
-        create_graph: bool = False
+        grad_fn: Callable
     ) -> dict:
         """
         Вычисляет давление из потенциала скорости по уравнению Бернулли.
@@ -228,8 +212,7 @@ class PDEResiduals:
             U_inf: характерная скорость на бесконечности [м/с]
             p_inf: давление на бесконечности [Па]
             rho: плотность жидкости [кг/м³]
-            create_graph: если True, создаётся граф для обратного распространения
-                         (используется для обучения, False - для визуализации)
+            grad_fn: функция градиента (например, safe_grad)
 
         Returns:
             словарь с ключами:
@@ -244,18 +227,9 @@ class PDEResiduals:
             На этапе 1.1 давление используется только для визуализации.
             На этапах 1.2–1.3 может войти в функцию потерь.
         """
-        # Вычисляем скорости через градиенты потенциала
-        grad_outputs = torch.ones_like(phi)
-
-        u = torch.autograd.grad(
-            phi, x, grad_outputs=grad_outputs,
-            create_graph=create_graph, retain_graph=True
-        )[0]
-
-        v = torch.autograd.grad(
-            phi, y, grad_outputs=grad_outputs,
-            create_graph=create_graph, retain_graph=False
-        )[0]
+        # Вычисляем скорости через градиенты потенциала (используем grad_fn)
+        u = grad_fn(phi, x)  # u = ∂φ/∂x
+        v = grad_fn(phi, y)  # v = ∂φ/∂y
 
         # Квадрат модуля скорости
         velocity_squared = u**2 + v**2

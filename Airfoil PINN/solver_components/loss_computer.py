@@ -75,7 +75,9 @@ class LossComputer:
             self.U_inf = potential_cfg.get('U_inf', 1.0)
             self.angle_of_attack = potential_cfg.get('angle_of_attack', 0.0)
             self.boundary_layer_thickness = potential_cfg.get('boundary_layer_thickness', 0.05)
-            self.uniform_reg_weight = potential_cfg.get('uniform_reg_weight', 0.01)
+            # uniform_reg_weight может быть в pde.potential или в loss_weights (для обратной совместимости)
+            lw = config.get('loss_weights', {})
+            self.uniform_reg_weight = lw.get('uniform_reg_weight', potential_cfg.get('uniform_reg_weight', 0.01))
             # Вычисляем компоненты скорости на бесконечности
             angle_rad = np.radians(self.angle_of_attack)
             self.U_inf_x = self.U_inf * np.cos(angle_rad)
@@ -85,9 +87,20 @@ class LossComputer:
 
         # Веса потерь
         lw = config['loss_weights']
-        self.loss_weights = lw['pde_weights'].copy()
+
+        # Для потенциала скорости: начинаем с laplace_weight
+        if self.use_potential:
+            self.loss_weights = {'laplace': lw.get('laplace_weight', 1.0)}
+        else:
+            # Для Навье-Стокса: используем pde_weights
+            self.loss_weights = lw.get('pde_weights', {}).copy()
+
         if self.bc_type == 'soft':
-            self.loss_weights.update(lw['bc_weights'])
+            self.loss_weights.update(lw.get('bc_weights', {}))
+
+        # Добавляем вес регуляризации однородного потока (для потенциала)
+        if self.use_potential:
+            self.loss_weights['uniform_reg'] = self.uniform_reg_weight
 
         # SA-веса (флаг)
         self.use_sa_weights = lw['use_sa_weights']

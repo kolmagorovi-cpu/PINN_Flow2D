@@ -32,6 +32,7 @@ import matplotlib.ticker as ticker
 import torch
 import torch.nn as nn
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 try:
     from scipy.interpolate import griddata
@@ -50,12 +51,16 @@ class Visualizer:
     Также фиксирует количественные и качественные метрики.
     """
 
-    def __init__(self, plot_frequency: Optional[int] = None, config_name: str = "unnamed", config: Optional[Dict] = None):
+    def __init__(self, plot_frequency: Optional[int] = None, config_name: str = "unnamed", 
+                 config: Optional[Dict] = None, use_tensorboard: bool = False, 
+                 log_dir: str = "logs"):
         """
         Args:
             plot_frequency: частота обновления графиков (эпох). Если None, графики отключены.
             config_name: название конфигурации для заголовков.
             config: полная конфигурация (для coordinate_scaling)
+            use_tensorboard: использовать ли TensorBoard для логирования
+            log_dir: директория для логов TensorBoard
         """
         self.plot_frequency = plot_frequency
         self.config_name = config_name
@@ -70,11 +75,71 @@ class Visualizer:
         self.lines_bc = {}
         self.lines_diag = {}
         self.enabled = plot_frequency is not None
+        
+        # TensorBoard
+        self.use_tensorboard = use_tensorboard
+        if use_tensorboard:
+            from datetime import datetime
+            run_name = f"{config_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.writer = SummaryWriter(log_dir=os.path.join(log_dir, run_name))
+            logger.info(f"TensorBoard инициализирован. Логи: {os.path.join(log_dir, run_name)}")
+        else:
+            self.writer = None
+    
+    def set_history(self, history: Dict) -> None:
+        """
+        Устанавливает ссылку на историю для сохранения графиков.
+        Вызывается из MetricsCollector или solver.
+        
+        Args:
+            history: словарь с историей потерь
+        """
+        self._history_for_save = history
 
-    def create_live_plot(self) -> None:
-        """Создаёт три окна: для PDE, граничных условий и диагностики."""
+    def create_live_plot(self, use_potential: bool = False) -> None:
+        """Создаёт окна для визуализации: PDE/BC или только диагностика.
+
+        Args:
+            use_potential: если True — создаёт только окно диагностики (без PDE/BC Навье-Стокса)
+        """
         if not self.enabled:
             return
+
+        if use_potential:
+            # Для потенциала — только диагностика (PDE/BC выводятся в консоль)
+            try:
+                self.fig_diag, self.axes_diag = plt.subplots(1, 3, figsize=(18, 4), constrained_layout=True)
+                diag_titles = ['Gradient Norms', 'Avg Inlet/Outlet Velocity', 'Mass Balance Error']
+                diag_keys = ['grad_norms', 'avg_vel', 'mass_balance']
+                for ax, title, key in zip(self.axes_diag, diag_titles, diag_keys):
+                    if key == 'grad_norms':
+                        line1, = ax.plot([], [], label='PDE grad')
+                        line2, = ax.plot([], [], label='BC grad')
+                        line3, = ax.plot([], [], label='cosine')
+                        self.lines_diag[key] = (line1, line2, line3)
+                    elif key == 'avg_vel':
+                        line1, = ax.plot([], [], label='avg u_in')
+                        line2, = ax.plot([], [], label='avg u_out')
+                        line3, = ax.plot([], [], label='avg v_in')
+                        line4, = ax.plot([], [], label='avg v_out')
+                        self.lines_diag[key] = (line1, line2, line3, line4)
+                    else:
+                        line, = ax.plot([], [])
+                        self.lines_diag[key] = line
+                    ax.set_xlabel('Epoch')
+                    ax.set_title(title)
+                    ax.grid(True)
+                    if key in ['grad_norms', 'avg_vel']:
+                        ax.legend()
+                    if key == 'mass_balance':
+                        ax.set_yscale('log', nonpositive='clip')
+                self.fig_diag.suptitle(f'Diagnostics - {self.config_name}')
+                plt.show(block=False)
+            except Exception as e:
+                logger.warning(f"Не удалось создать окно диагностики: {e}")
+                self.enabled = False
+            return
+
         try:
             # Окно для PDE (4 графика: cont, mom_x, mom_y, total_loss)
             self.fig_pde, self.axes_pde = plt.subplots(1, 4, figsize=(20, 4), constrained_layout=True)
@@ -123,7 +188,9 @@ class Visualizer:
                 elif key == 'avg_vel':
                     line1, = ax.plot([], [], label='avg u_in')
                     line2, = ax.plot([], [], label='avg u_out')
-                    self.lines_diag[key] = (line1, line2)
+                    line3, = ax.plot([], [], label='avg v_in')
+                    line4, = ax.plot([], [], label='avg v_out')
+                    self.lines_diag[key] = (line1, line2, line3, line4)
                 else:
                     line, = ax.plot([], [])
                     self.lines_diag[key] = line
@@ -141,7 +208,7 @@ class Visualizer:
             logger.warning(f"Не удалось создать мультиплот: {e}")
             self.enabled = False
 
-    def update_plot(self, epoch: int, history: Dict) -> None:
+    def update_plot(self, epoch: int, history: Dict, loss_components: Optional[Dict] = None) -> None:
         """Обновляет данные на графиках. При ошибке отключает live plot."""
         if not self.enabled or self.fig_pde is None or self.fig_bc is None or self.fig_diag is None:
             return
@@ -200,11 +267,15 @@ class Visualizer:
                         line3.set_data(epochs_range, history['grad_cosine'])
                 # Средние скорости
                 if 'avg_vel' in self.lines_diag:
-                    line1, line2 = self.lines_diag['avg_vel']
+                    line1, line2, line3, line4 = self.lines_diag['avg_vel']
                     if 'avg_u_in' in history and len(history['avg_u_in']) > 0:
                         line1.set_data(epochs_range, history['avg_u_in'])
                     if 'avg_u_out' in history and len(history['avg_u_out']) > 0:
                         line2.set_data(epochs_range, history['avg_u_out'])
+                    if 'avg_v_in' in history and len(history['avg_v_in']) > 0:
+                        line3.set_data(epochs_range, history['avg_v_in'])
+                    if 'avg_v_out' in history and len(history['avg_v_out']) > 0:
+                        line4.set_data(epochs_range, history['avg_v_out'])
                 # Ошибка баланса масс
                 if 'mass_balance' in self.lines_diag and 'mass_balance_error' in history and len(history['mass_balance_error']) > 0:
                     line = self.lines_diag['mass_balance']
@@ -226,17 +297,153 @@ class Visualizer:
             logger.warning(f"Ошибка обновления графика: {e}. Отключаю live plot.")
             self.enabled = False
             self.close()
+        
+        # Логируем в TensorBoard (всегда, если включен)
+        self.log_scalars(epoch, history, loss_components)
+
+    def log_scalars(self, epoch: int, history: Dict, loss_components: Optional[Dict] = None):
+        """
+        Логирует скалярные метрики в TensorBoard.
+        
+        Args:
+            epoch: номер эпохи (или итерации)
+            history: словарь с историей потерь (как в update_plot)
+            loss_components: дополнительные компоненты (например, {'laplace': 0.01, 'inlet_phi': 0.02})
+        """
+        if not self.use_tensorboard or self.writer is None:
+            return
+
+        try:
+            logged_count = 0
+            
+            # Общие потери
+            if 'loss' in history and len(history['loss']) > 0:
+                self.writer.add_scalar('Loss/total', history['loss'][-1], epoch)
+                logged_count += 1
+
+            # Компоненты PDE (если есть)
+            if 'pde' in history:
+                for key, values in history['pde'].items():
+                    if values:
+                        self.writer.add_scalar(f'PDE/{key}', values[-1], epoch)
+                        logged_count += 1
+
+            # Компоненты BC
+            if 'bc' in history:
+                for key, values in history['bc'].items():
+                    if values:
+                        self.writer.add_scalar(f'BC/{key}', values[-1], epoch)
+                        logged_count += 1
+
+            # Дополнительные компоненты (например, для потенциала)
+            if loss_components:
+                for key, val in loss_components.items():
+                    if isinstance(val, (int, float)):
+                        self.writer.add_scalar(f'Components/{key}', val, epoch)
+                        logged_count += 1
+
+            # Диагностика (нормы градиентов, косинус)
+            if 'grad_norm_pde' in history and history['grad_norm_pde']:
+                self.writer.add_scalar('Gradients/PDE_norm', history['grad_norm_pde'][-1], epoch)
+                logged_count += 1
+            if 'grad_norm_bc' in history and history['grad_norm_bc']:
+                self.writer.add_scalar('Gradients/BC_norm', history['grad_norm_bc'][-1], epoch)
+                logged_count += 1
+            if 'grad_cosine' in history and history['grad_cosine']:
+                self.writer.add_scalar('Gradients/cosine', history['grad_cosine'][-1], epoch)
+                logged_count += 1
+
+            # Массовый баланс
+            if 'mass_balance_error' in history and history['mass_balance_error']:
+                self.writer.add_scalar('Mass/balance_error', history['mass_balance_error'][-1], epoch)
+                logged_count += 1
+            
+            # Скорости (средние)
+            if 'avg_u_in' in history and history['avg_u_in']:
+                self.writer.add_scalar('Velocity/avg_u_in', history['avg_u_in'][-1], epoch)
+                logged_count += 1
+            if 'avg_u_out' in history and history['avg_u_out']:
+                self.writer.add_scalar('Velocity/avg_u_out', history['avg_u_out'][-1], epoch)
+                logged_count += 1
+            if 'avg_v_in' in history and history['avg_v_in']:
+                self.writer.add_scalar('Velocity/avg_v_in', history['avg_v_in'][-1], epoch)
+                logged_count += 1
+            if 'avg_v_out' in history and history['avg_v_out']:
+                self.writer.add_scalar('Velocity/avg_v_out', history['avg_v_out'][-1], epoch)
+                logged_count += 1
+            
+            # Ошибка регуляризации (extra_grad)
+            if 'extra_grad' in history and history['extra_grad']:
+                self.writer.add_scalar('Regularization/extra_grad', history['extra_grad'][-1], epoch)
+                logged_count += 1
+            
+            # Логируем только на первой эпохе для отладки
+            if epoch <= 2:
+                logger.debug(f"TensorBoard: logged {logged_count} metrics at epoch {epoch}")
+
+        except Exception as e:
+            logger.warning(f"Ошибка логирования в TensorBoard: {e}")
+
+    def log_image(self, tag: str, image_tensor: torch.Tensor, epoch: int):
+        """
+        Логирует изображение в TensorBoard.
+        
+        Args:
+            tag: имя тега (например, 'Fields/velocity_u')
+            image_tensor: тензор изображения формы (C, H, W) в диапазоне [0,1]
+            epoch: номер эпохи
+        """
+        if self.use_tensorboard and self.writer:
+            try:
+                self.writer.add_image(tag, image_tensor, epoch)
+            except Exception as e:
+                logger.warning(f"Ошибка логирования изображения {tag}: {e}")
+
+    def log_histogram(self, tag: str, values: torch.Tensor, epoch: int):
+        """
+        Логирует гистограмму значений в TensorBoard.
+        
+        Args:
+            tag: имя тега (например, 'Weights/layer1')
+            values: тензор со значениями
+            epoch: номер эпохи
+        """
+        if self.use_tensorboard and self.writer:
+            try:
+                self.writer.add_histogram(tag, values, epoch)
+            except Exception as e:
+                logger.warning(f"Ошибка логирования гистограммы {tag}: {e}")
+
+    def log_model_weights(self, model: nn.Module, epoch: int):
+        """
+        Логирует гистограммы всех весов модели.
+        
+        Args:
+            model: модель PyTorch
+            epoch: номер эпохи
+        """
+        if self.use_tensorboard and self.writer:
+            try:
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        self.writer.add_histogram(f'Weights/{name}', param.data, epoch)
+                        if param.grad is not None:
+                            self.writer.add_histogram(f'Gradients/{name}', param.grad.data, epoch)
+            except Exception as e:
+                logger.warning(f"Ошибка логирования весов модели: {e}")
 
     def save_plots(self, savedir: str, epoch: Optional[Union[int, str]] = None) -> None:
         """
-        Сохраняет текущие графики в файлы.
+        Сохраняет текущие графики в файлы (если они существуют).
 
         Args:
             savedir: директория для сохранения
             epoch: номер эпохи или строка-идентификатор (например, 'final')
         """
         if not self.enabled:
-            return
+            # Даже если live режим отключен, пробуем сохранить (фигуры могут быть созданы вручную)
+            pass
+        
         os.makedirs(savedir, exist_ok=True)
         suffix = f"_epoch_{epoch}" if epoch is not None else "_final"
         try:
@@ -251,6 +458,106 @@ class Visualizer:
                 logger.info(f"График диагностики сохранён: diagnostics{suffix}.png")
         except Exception as e:
             logger.warning(f"Не удалось сохранить графики: {e}")
+
+    def save_final_plots(self, savedir: str, epoch: Optional[Union[int, str]] = None) -> None:
+        """
+        Создает и сохраняет финальные графики из истории (независимо от live режима).
+        Этот метод работает даже когда self.enabled = False.
+
+        Args:
+            savedir: директория для сохранения
+            epoch: номер эпохи или строка-идентификатор (например, 'final')
+        """
+        os.makedirs(savedir, exist_ok=True)
+        suffix = f"_epoch_{epoch}" if epoch is not None else "_final"
+
+        # Получаем историю
+        history = getattr(self, '_history_for_save', None)
+        if history is None:
+            logger.warning("Нет истории для сохранения графиков")
+            return
+
+        try:
+            # График PDE (4 графика: cont, mom_x, mom_y, total_loss)
+            fig_pde, axes_pde = plt.subplots(1, 4, figsize=(20, 4), constrained_layout=True)
+            pde_items = [
+                ('cont', 'Continuity'),
+                ('mom_x', 'Momentum X'),
+                ('mom_y', 'Momentum Y'),
+                ('total', 'Total Loss')
+            ]
+            for ax, (key, title) in zip(axes_pde, pde_items):
+                if key == 'total':
+                    ax.plot(range(len(history['loss'])), history['loss'])
+                elif key in history.get('pde', {}):
+                    ax.plot(range(len(history['pde'][key])), history['pde'][key])
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('Value')
+                ax.set_title(title)
+                ax.set_yscale('log')
+                ax.grid(True)
+            fig_pde.suptitle(f'PDE Residuals & Total Loss - {self.config_name}')
+            fig_pde.savefig(os.path.join(savedir, f"pde_loss{suffix}.png"), dpi=150)
+            plt.close(fig_pde)
+            logger.info(f"График PDE сохранён: pde_loss{suffix}.png")
+
+            # График BC (6 графиков)
+            fig_bc, axes_bc = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+            axes_bc = axes_bc.flatten()
+            bc_titles = ['Inlet', 'Outlet', 'Wall', 'Symmetry', 'Axis Symmetry', 'Wall Speed']
+            for ax, title in zip(axes_bc, bc_titles):
+                key = title.lower().replace(' ', '_')
+                if key in history.get('bc', {}) and len(history['bc'][key]) > 0:
+                    ax.plot(range(len(history['bc'][key])), history['bc'][key])
+                elif key == 'wall_speed' and 'wall_speed' in history and len(history['wall_speed']) > 0:
+                    ax.plot(range(len(history['wall_speed'])), history['wall_speed'])
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('Value')
+                ax.set_title(title)
+                ax.set_yscale('log')
+                ax.grid(True)
+            fig_bc.suptitle(f'Boundary Conditions - {self.config_name}')
+            fig_bc.savefig(os.path.join(savedir, f"bc_loss{suffix}.png"), dpi=150)
+            plt.close(fig_bc)
+            logger.info(f"График BC сохранён: bc_loss{suffix}.png")
+
+            # График диагностики (3 графика)
+            fig_diag, axes_diag = plt.subplots(1, 3, figsize=(18, 4), constrained_layout=True)
+            diag_titles = ['Gradient Norms', 'Avg Inlet/Outlet Velocity', 'Mass Balance Error']
+            for ax, title in zip(axes_diag, diag_titles):
+                if title == 'Gradient Norms':
+                    if 'grad_norm_pde' in history:
+                        ax.plot(range(len(history['grad_norm_pde'])), history['grad_norm_pde'], label='PDE')
+                    if 'grad_norm_bc' in history:
+                        ax.plot(range(len(history['grad_norm_bc'])), history['grad_norm_bc'], label='BC')
+                    if 'grad_cosine' in history:
+                        ax.plot(range(len(history['grad_cosine'])), history['grad_cosine'], label='cosine')
+                    ax.legend()
+                elif title == 'Avg Inlet/Outlet Velocity':
+                    if 'avg_u_in' in history:
+                        ax.plot(range(len(history['avg_u_in'])), history['avg_u_in'], label='u_in')
+                    if 'avg_u_out' in history:
+                        ax.plot(range(len(history['avg_u_out'])), history['avg_u_out'], label='u_out')
+                    if 'avg_v_in' in history:
+                        ax.plot(range(len(history['avg_v_in'])), history['avg_v_in'], label='v_in')
+                    if 'avg_v_out' in history:
+                        ax.plot(range(len(history['avg_v_out'])), history['avg_v_out'], label='v_out')
+                    ax.legend()
+                elif title == 'Mass Balance Error' and 'mass_balance_error' in history:
+                    ax.plot(range(len(history['mass_balance_error'])), history['mass_balance_error'])
+                    ax.set_yscale('log')
+                ax.set_xlabel('Epoch')
+                ax.set_title(title)
+                ax.grid(True)
+            fig_diag.suptitle(f'Diagnostics - {self.config_name}')
+            fig_diag.savefig(os.path.join(savedir, f"diagnostics{suffix}.png"), dpi=150)
+            plt.close(fig_diag)
+            logger.info(f"График диагностики сохранён: diagnostics{suffix}.png")
+
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить финальные графики: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     def save_final_report(self, savedir: str, metrics: Dict) -> None:
         """
@@ -436,11 +743,15 @@ class Visualizer:
                                        boundary_type_names: Optional[List[str]] = None,
                                        save_npy: bool = True,
                                        plot_physical: bool = False,
-                                       config: Optional[Dict] = None) -> None:
+                                       config: Optional[Dict] = None,
+                                       use_potential: bool = False,
+                                       history: Optional[Dict] = None) -> None:
         """
         Строит и сохраняет поля скорости и давления из готовых тензоров.
         Если plot_physical=True, отображаются физические величины (с размерностью),
         иначе – нормализованные (безразмерные). По умолчанию нормализованные.
+
+        Если use_potential=True, строит только графики полной ошибки и ошибки Лапласа.
 
         Для нормализованной скорости цветовая шкала подстраивается динамически:
         vmin=0, vmax = max(1.0, u_norm.max()) – чтобы учесть возможные значения >1.
@@ -457,7 +768,15 @@ class Visualizer:
             save_npy: сохранить ли как .npy файлы
             plot_physical: отображать физические или нормализованные величины
             config: конфигурация (для coordinate_scaling)
+            use_potential: флаг режима потенциала (уравнение Лапласа)
+            history: история потерь (для построения графиков ошибок)
         """
+        # В режиме потенциала строим только графики ошибок
+        if use_potential:
+            self._plot_potential_error_fields(
+                history, savedir, epoch
+            )
+            return
         # Сохраняем в .npy, если требуется
         if save_npy:
             self.save_fields_as_npy(u_norm, v_norm, p_norm, x_norm, y_norm,
@@ -581,6 +900,70 @@ class Visualizer:
                 plt.close()
             except Exception as e:
                 logger.warning(f"Не удалось построить график для {name}: {e}")
+
+    # ------------------------------------------------------------------
+    # Методы для режима потенциала (уравнение Лапласа)
+    # ------------------------------------------------------------------
+
+    def _plot_potential_error_fields(self,
+                                     history: Optional[Dict],
+                                     savedir: str,
+                                     epoch: Optional[Union[int, str]] = None) -> None:
+        """
+        Строит графики полной ошибки и ошибки Лапласа для режима потенциала.
+
+        Args:
+            history: история потерь (словарь с 'loss' и 'pde')
+            savedir: директория для сохранения
+            epoch: номер эпохи (для имени файла)
+        """
+        os.makedirs(savedir, exist_ok=True)
+        suffix = f"_epoch_{epoch}" if epoch is not None else "_final"
+
+        # Проверяем, есть ли история
+        if history is None:
+            logger.warning("История потерь не предоставлена, пропускаем построение графиков ошибок.")
+            return
+
+        # График 1: Полная ошибка (Total Loss)
+        if 'loss' in history and len(history['loss']) > 0:
+            try:
+                fig1, ax1 = plt.subplots(figsize=(10, 6))
+                epochs = range(1, len(history['loss']) + 1)
+                ax1.plot(epochs, history['loss'], 'k-', linewidth=2, label='Total Loss')
+                ax1.set_xlabel('Epoch')
+                ax1.set_ylabel('Loss')
+                ax1.set_title(f'Полная ошибка - {self.config_name}')
+                ax1.set_yscale('log')
+                ax1.grid(True, alpha=0.3)
+                ax1.legend()
+
+                filename1 = os.path.join(savedir, f'total_loss{suffix}.png')
+                fig1.savefig(filename1, dpi=150, bbox_inches='tight')
+                logger.info(f"Сохранено: {filename1}")
+                plt.close(fig1)
+            except Exception as e:
+                logger.warning(f"Не удалось построить график полной ошибки: {e}")
+
+        # График 2: Ошибка Лапласа (Laplace Error)
+        if 'pde' in history and 'laplace' in history['pde'] and len(history['pde']['laplace']) > 0:
+            try:
+                fig2, ax2 = plt.subplots(figsize=(10, 6))
+                epochs = range(1, len(history['pde']['laplace']) + 1)
+                ax2.plot(epochs, history['pde']['laplace'], 'b-', linewidth=2, label='Laplace Error')
+                ax2.set_xlabel('Epoch')
+                ax2.set_ylabel('Loss')
+                ax2.set_title(f'Ошибка уравнения Лапласа (∇²φ) - {self.config_name}')
+                ax2.set_yscale('log')
+                ax2.grid(True, alpha=0.3)
+                ax2.legend()
+
+                filename2 = os.path.join(savedir, f'laplace_error{suffix}.png')
+                fig2.savefig(filename2, dpi=150, bbox_inches='tight')
+                logger.info(f"Сохранено: {filename2}")
+                plt.close(fig2)
+            except Exception as e:
+                logger.warning(f"Не удалось построить график ошибки Лапласа: {e}")
 
     # ------------------------------------------------------------------
     # Диагностические методы
@@ -789,7 +1172,9 @@ class Visualizer:
     def plot_final_fields(self, model: nn.Module, data_handler,
                           device: torch.device, savedir: str,
                           epoch: Optional[Union[int, str]] = None,
-                          plot_physical: bool = False) -> None:
+                          plot_physical: bool = False,
+                          use_potential: bool = False,
+                          history: Optional[Dict] = None) -> None:
         """
         Устаревший метод – сохранён для совместимости.
         Рекомендуется использовать plot_final_fields_from_tensors.
@@ -815,7 +1200,9 @@ class Visualizer:
                                             boundary_types=bt,
                                             boundary_type_names=data_handler.boundary_type_names,
                                             plot_physical=plot_physical,
-                                            config=self.config if hasattr(self, 'config') else None)
+                                            config=self.config if hasattr(self, 'config') else None,
+                                            use_potential=use_potential,
+                                            history=history)
 
     def plot_potential_fields(self,
                               phi_norm: torch.Tensor,
@@ -1206,7 +1593,7 @@ class Visualizer:
         logger.info(f"Сохранены данные: {npy_filename}")
 
     def close(self) -> None:
-        """Закрывает все окна matplotlib."""
+        """Закрывает все окна matplotlib и TensorBoard writer."""
         try:
             if self.fig_pde is not None:
                 plt.close(self.fig_pde)
@@ -1219,3 +1606,13 @@ class Visualizer:
                 self.fig_diag = None
         except Exception:
             pass
+        
+        # Закрываем TensorBoard writer
+        if self.writer:
+            try:
+                self.writer.close()
+                logger.info("TensorBoard writer закрышен.")
+            except Exception as e:
+                logger.warning(f"Ошибка закрытия TensorBoard writer: {e}")
+            finally:
+                self.writer = None

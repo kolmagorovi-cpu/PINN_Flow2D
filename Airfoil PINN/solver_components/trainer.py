@@ -154,18 +154,14 @@ class Trainer:
 
         # Прямой проход модели
         out = self.model(input_tensor)
-        
+
         # Обработка выхода модели в зависимости от типа PDE
         if self.loss_computer.use_potential:
             # Для потенциала: out[:, 0:1] - это φ
-            # Скорости вычисляются через градиенты потенциала
-            # ВАЖНО: retain_graph=True нужен для многократных вычислений градиентов
+            # PDE невязки вычисляются ПЕРВЫМИ — они сами посчитают u=∂φ/∂x, v=∂φ/∂y
             phi = out[:, 0:1]
-            u = safe_grad(phi, x, retain_graph=True)  # u = ∂φ/∂x, сохраняем граф
-            v = safe_grad(phi, y, retain_graph=True)  # v = ∂φ/∂y, сохраняем граф
-            # Для совместимости создаём фиктивное давление
-            p = torch.zeros_like(phi)
-            u_final, v_final, p_final = u, v, p  # Для использования ниже
+            # Фиктивные значения, будут перезаписаны из res
+            u_final, v_final, p_final = phi, torch.zeros_like(phi), torch.zeros_like(phi)
         else:
             u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
@@ -178,10 +174,13 @@ class Trainer:
                 u_final, v_final, p_final = u_raw, v_raw, p_raw
 
         # Вычисление невязок PDE
-        # Для потенциала: передаём phi как первый аргумент (u_final - это phi!)
+        # Для потенциала: передаём phi как первый аргумент
         # Для Навье-Стокса: u_final - это скорость
         if self.loss_computer.use_potential:
             res = self.loss_computer.compute_pde_residuals(phi, v_final, p_final, x, y)
+            # Извлекаем u и v из результата (они вычислены внутри compute_residuals_potential)
+            u_final = res['u']
+            v_final = res['v']
         else:
             res = self.loss_computer.compute_pde_residuals(u_final, v_final, p_final, x, y)
         
@@ -222,8 +221,9 @@ class Trainer:
                 w_bc = None
 
             # PDE потеря с учётом весов из конфигурации
+            # После исправления: ключ 'laplace' вместо 'laplace_weight'
             pde_loss = pde_mult * (
-                self.loss_computer.loss_weights.get('laplace_weight', 1.0) * loss_laplace
+                self.loss_computer.loss_weights.get('laplace', 1.0) * loss_laplace
             )
         else:
             # Оригинальная логика для Навье-Стокса
@@ -303,25 +303,21 @@ class Trainer:
                     bc_loss += torch.mean(w_bc[:, i] * bc_comp[name])
 
         # Интегральная потеря
-        integral_loss = self.loss_computer.compute_integral_loss(u, v, bt, x, y) * self.loss_computer.integral_weight
+        integral_loss = self.loss_computer.compute_integral_loss(u_final, v_final, bt, x, y) * self.loss_computer.integral_weight
 
         # Полная потеря
         total_loss = pde_loss + bc_loss + integral_loss
 
         # Средняя скорость на стенке (для мониторинга)
         wall_speed = None
-        if self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp.get('wall_phi', 0) > 0 and bt is not None:
-            wall_idx = self.data_handler.boundary_type_names.index('wall')
-            u_wall = u[bt[:, wall_idx] > 0.5]
-            v_wall = v[bt[:, wall_idx] > 0.5]
-            if len(u_wall) > 0:
-                wall_speed = torch.sqrt(u_wall**2 + v_wall**2).mean().item()
-        elif self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp.get('wall', 0) > 0 and bt is not None:
-            wall_idx = self.data_handler.boundary_type_names.index('wall')
-            u_wall = u[bt[:, wall_idx] > 0.5]
-            v_wall = v[bt[:, wall_idx] > 0.5]
-            if len(u_wall) > 0:
-                wall_speed = torch.sqrt(u_wall**2 + v_wall**2).mean().item()
+        if self.loss_computer.bc_type == 'soft' and ('wall' in bc_comp or 'wall_phi' in bc_comp) and bt is not None:
+            wall_key = 'wall_phi' if 'wall_phi' in bc_comp else 'wall'
+            if bc_comp.get(wall_key, 0) > 0:
+                wall_idx = self.data_handler.boundary_type_names.index('wall')
+                u_wall = u_final[bt[:, wall_idx] > 0.5]
+                v_wall = v_final[bt[:, wall_idx] > 0.5]
+                if len(u_wall) > 0:
+                    wall_speed = torch.sqrt(u_wall**2 + v_wall**2).mean().item()
 
         # Формируем возвращаемые компоненты потерь
         if self.loss_computer.use_potential:
@@ -349,8 +345,8 @@ class Trainer:
             'wall_speed': wall_speed,
             # Возвращаем отдельные тензоры потерь для градиентного анализа
             'loss_components': loss_components,
-            'u': u.detach(),  # для профилей и спектров
-            'v': v.detach(),
+            'u': u_final.detach(),  # для профилей и спектров
+            'v': v_final.detach(),
             'x': x.detach(),
             'y': y.detach(),
             'idx': idx.cpu()
@@ -580,12 +576,31 @@ class Trainer:
             y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
             sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
             bt_pts = dataset.boundary_types[indices].to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
-            input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
-            out = self.model(input_tensor)
-            u_vals = out[:, 0:1]
-        # Вычисляем градиент du/dy через autograd
-        u_vals.sum().backward(retain_graph=True)
-        grad_u_y = y_pts.grad
+
+            if self.loss_computer.use_potential:
+                # Для потенциала: u = ∂φ/∂x, затем du/dy
+                with torch.enable_grad():
+                    x_pts = x_pts.requires_grad_(True)
+                    y_pts = y_pts.requires_grad_(True)
+                    # Пересобираем input_tensor с requires_grad
+                    input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
+                    phi = self.model(input_tensor)
+                    u = torch.autograd.grad(phi, x_pts, grad_outputs=torch.ones_like(phi),
+                                            create_graph=True, retain_graph=True, allow_unused=True)[0]
+                    if u is None:
+                        u = torch.zeros_like(x_pts)
+                    # Теперь du/dy
+                    u.sum().backward(retain_graph=True)
+                    grad_u_y = y_pts.grad
+            else:
+                with torch.enable_grad():
+                    input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
+                    out = self.model(input_tensor)
+                    u_vals = out[:, 0:1]
+                    # Вычисляем градиент du/dy через autograd
+                    u_vals.sum().backward(retain_graph=True)
+                    grad_u_y = y_pts.grad
+                
         if grad_u_y is not None:
             mean_grad = grad_u_y.mean().item()
         else:
@@ -772,6 +787,8 @@ class Trainer:
                 epoch_losses['pde_max'][k] += v
             if self.loss_computer.bc_type == 'soft':
                 for k, v in batch_losses['bc_comp'].items():
+                    if k not in epoch_losses['bc_comp']:
+                        epoch_losses['bc_comp'][k] = 0.0
                     epoch_losses['bc_comp'][k] += v
                 epoch_losses['extra_grad'] += batch_losses['extra_grad']
             epoch_losses['integral_loss'] += batch_losses['integral_loss']
@@ -803,9 +820,13 @@ class Trainer:
 
         # Обновление скользящих средних для адаптивных весов
         for comp, val in avg_pde.items():
+            if comp not in self.loss_ma:
+                self.loss_ma[comp] = deque(maxlen=self.adapt_window)
             self.loss_ma[comp].append(val)
         if self.loss_computer.bc_type == 'soft':
             for comp, val in avg_bc.items():
+                if comp not in self.loss_ma:
+                    self.loss_ma[comp] = deque(maxlen=self.adapt_window)
                 self.loss_ma[comp].append(val)
 
         # Вычисление rate (отношение к предыдущему значению) – для отчёта
@@ -881,8 +902,12 @@ class Trainer:
             avg_max[key] = np.mean(vals_max) if vals_max else 0.0
 
         if self.loss_computer.bc_type == 'soft':
+            # Собираем все уникальные ключи из bc_comp_list
+            all_bc_keys = set()
+            for d in bc_comp_list:
+                all_bc_keys.update(d.keys())
             avg_bc = {}
-            for key in self.data_handler.boundary_type_names:
+            for key in all_bc_keys:
                 vals = [d.get(key, 0.0) for d in bc_comp_list]
                 avg_bc[key] = np.mean(vals) if vals else 0.0
         else:
@@ -926,8 +951,15 @@ class Trainer:
         eps = 1e-8
         new_weights = {}
         for key in self.data_handler.boundary_type_names:
-            if key in self.loss_ma and self.loss_ma[key]:
-                avg_bc = np.mean(list(self.loss_ma[key]))
+            # Для потенциала ключи могут быть с суффиксом '_phi'
+            ma_key = key
+            if ma_key not in self.loss_ma:
+                # Попробуем вариант с '_phi'
+                ma_key_phi = f'{key}_phi'
+                if ma_key_phi in self.loss_ma:
+                    ma_key = ma_key_phi
+            if ma_key in self.loss_ma and self.loss_ma[ma_key]:
+                avg_bc = np.mean(list(self.loss_ma[ma_key]))
                 new_weights[key] = target / (avg_bc + eps)
                 new_weights[key] = np.clip(new_weights[key], 0.1, 10000.0)
             else:

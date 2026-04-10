@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from utils import check_memory_usage, set_seed
+from utils.tensorboard_launcher import TensorBoardLauncher
 from data_handler import DataHandler
 from models import PINNIncompressible, PotentialPINN, SelfAdaptiveWeights
 from checkpoint import CheckpointManager
@@ -45,6 +46,9 @@ from solver_components.metrics import MetricsCollector
 from solver_components.interactive import InteractiveHandler
 
 logger = logging.getLogger(__name__)
+
+# Корневая директория проекта (родительская папка для solver.py)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 class PINNSolver:
@@ -188,9 +192,65 @@ class PINNSolver:
         # Визуализация
         out_cfg = config['output']
         plot_freq = out_cfg['plot_frequency'] if not out_cfg['console_only'] else None
-        self.visualizer = Visualizer(plot_freq, config_name=self.config_name, config=config)
-        if plot_freq:
-            self.visualizer.create_live_plot()
+
+        # Настройки TensorBoard - преобразуем в абсолютный путь
+        tb_cfg = out_cfg.get('use_tensorboard', True)
+        tb_port = out_cfg.get('tensorboard_port', 6006)
+        tb_auto_launch = out_cfg.get('tensorboard_auto_launch', True)
+        tb_log_dir_rel = out_cfg.get('tensorboard_log_dir', 'logs')
+        
+        # Преобразуем относительный путь в абсолютный
+        if not os.path.isabs(tb_log_dir_rel):
+            tb_log_dir = os.path.join(PROJECT_ROOT, tb_log_dir_rel)
+        else:
+            tb_log_dir = tb_log_dir_rel
+        
+        logger.info(f"📊 TensorBoard логи: {tb_log_dir}")
+
+        # Создаем Visualizer с поддержкой TensorBoard
+        # plot_freq=None означает что matplotlib окна не создаются (используем только TensorBoard)
+        self.visualizer = Visualizer(
+            plot_frequency=plot_freq,  # Обычно None - без live окон
+            config_name=self.config_name,
+            config=config,
+            use_tensorboard=tb_cfg,
+            log_dir=tb_log_dir
+        )
+        
+        # Не создаем live matplotlib окна (они лагают)
+        # Графики будут сохраняться только на чекпоинтах
+        if plot_freq and not config.get('enable_matplotlib_live', False):
+            logger.info("📊 Live matplotlib окна отключены (используется TensorBoard)")
+            logger.info("📈 Графики сохраняются только на чекпоинтах")
+        elif plot_freq:
+            self.visualizer.create_live_plot(use_potential=self.loss_computer.use_potential)
+        
+        # Передаем ссылку на историю для сохранения графиков
+        self.visualizer.set_history(self.metrics.history)
+
+        # Автоматический запуск TensorBoard
+        self.tensorboard_launcher = None
+        if tb_cfg and tb_auto_launch:
+            self.tensorboard_launcher = TensorBoardLauncher(
+                log_dir=tb_log_dir,
+                port=tb_port,
+                auto_launch=True
+            )
+            # Запускаем TensorBoard в фоне (не блокируем основной поток)
+            import threading
+            def launch_tb():
+                try:
+                    success = self.tensorboard_launcher.launch(wait_for_ready=True, timeout=10)
+                    if success:
+                        logger.info(f"✅ TensorBoard доступен: {self.tensorboard_launcher.get_url()}")
+                    else:
+                        logger.warning("⚠️ TensorBoard не смог запуститься")
+                except Exception as e:
+                    logger.warning(f"Не удалось запустить TensorBoard: {e}")
+
+            tb_thread = threading.Thread(target=launch_tb, daemon=True, name="TB-Launcher")
+            tb_thread.start()
+            logger.info(f"🚀 TensorBoard запускается в фоновом режиме...")
 
         # Клавиатурный слушатель
         self.key_listener = None
@@ -477,9 +537,25 @@ class PINNSolver:
                 y_t = dataset.y.to(self.device, dtype=self.dtype)
                 sdf_t = dataset.sdf.to(self.device, dtype=self.dtype)
                 bt_t = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
-                input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt_t)
-                out = self.model(input_tensor)
-                u_norm = out[:, 0].cpu().numpy().flatten()
+                
+                if self.loss_computer.use_potential:
+                    # Для потенциала: u = ∂φ/∂x, нужен enable_grad внутри no_grad
+                    with torch.enable_grad():
+                        x_t = x_t.requires_grad_(True)
+                        input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt_t)
+                        phi = self.model(input_tensor)
+                        u_norm_t = torch.autograd.grad(
+                            phi, x_t, grad_outputs=torch.ones_like(phi),
+                            create_graph=False, retain_graph=False, allow_unused=True
+                        )[0]
+                        if u_norm_t is None:
+                            u_norm_t = torch.zeros_like(x_t)
+                else:
+                    input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt_t)
+                    out = self.model(input_tensor)
+                    u_norm_t = out[:, 0]
+                
+                u_norm = u_norm_t.cpu().numpy().flatten()
                 # Переводим в физические единицы
                 u_phys = u_norm * self.data_handler.U_inf
 
@@ -546,33 +622,23 @@ class PINNSolver:
                 if self.loss_computer.use_potential:
                     # Для потенциала: модель возвращает φ
                     # Скорости вычисляются через градиенты
-                    # Для no_grad режима используем конечные разности
-                    phi = self.model(input_tensor)
-                    
-                    # Численное вычисление градиентов (для inference без autograd)
-                    # Используем малый epsilon для конечных разностей
-                    eps = 1e-6
-                    
-                    # du/dx через конечные разности
-                    x_plus = x + eps
-                    x_minus = x - eps
-                    input_plus = self.loss_computer.build_input_tensor(x_plus, y, sdf, bt)
-                    input_minus = self.loss_computer.build_input_tensor(x_minus, y, sdf, bt)
-                    phi_plus = self.model(input_plus)
-                    phi_minus = self.model(input_minus)
-                    u = (phi_plus - phi_minus) / (2 * eps)
-                    
-                    # dv/dy через конечные разности
-                    y_plus = y + eps
-                    y_minus = y - eps
-                    input_plus = self.loss_computer.build_input_tensor(x, y_plus, sdf, bt)
-                    input_minus = self.loss_computer.build_input_tensor(x, y_minus, sdf, bt)
-                    phi_plus = self.model(input_plus)
-                    phi_minus = self.model(input_minus)
-                    v = (phi_plus - phi_minus) / (2 * eps)
-                    
-                    p = torch.zeros_like(phi)
-                    all_phi.append(phi.cpu().numpy().flatten())
+                    with torch.enable_grad():
+                        x_grad = x.requires_grad_(True)
+                        y_grad = y.requires_grad_(True)
+                        input_tensor_grad = self.loss_computer.build_input_tensor(x_grad, y_grad, sdf, bt)
+                        phi = self.model(input_tensor_grad)
+
+                        u = torch.autograd.grad(phi, x_grad, grad_outputs=torch.ones_like(phi),
+                                                create_graph=False, retain_graph=True, allow_unused=True)[0]
+                        v = torch.autograd.grad(phi, y_grad, grad_outputs=torch.ones_like(phi),
+                                                create_graph=False, retain_graph=False, allow_unused=True)[0]
+                        if u is None:
+                            u = torch.zeros_like(x)
+                        if v is None:
+                            v = torch.zeros_like(y)
+
+                        p = torch.zeros_like(phi)
+                        all_phi.append(phi.cpu().numpy().flatten())
                 else:
                     out = self.model(input_tensor)
                     u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
@@ -659,13 +725,15 @@ class PINNSolver:
                     extra_diag['grad_norm_bc'] = grad_metrics['bc_norm']
                     extra_diag['grad_cosine'] = grad_metrics['cosine']
 
-                # Вычисляем avg_u_in, avg_u_out, mass_balance_error (уже в metrics)
-                avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(epoch)
+                # Вычисляем avg_u_in, avg_u_out, avg_v_in, avg_v_out
+                avg_u_in, avg_u_out, avg_v_in, avg_v_out = self.metrics.get_boundary_avg_velocities(epoch)
                 Qin = avg_u_in
                 Qout = avg_u_out
                 mass_error = abs(Qin - Qout) / (abs(Qin) + 1e-12) if Qin != 0 else 0.0
                 extra_diag['avg_u_in'] = avg_u_in
                 extra_diag['avg_u_out'] = avg_u_out
+                extra_diag['avg_v_in'] = avg_v_in
+                extra_diag['avg_v_out'] = avg_v_out
                 extra_diag['mass_balance_error'] = mass_error
 
                 # Обновление метрик
@@ -673,6 +741,11 @@ class PINNSolver:
                     loss, pde_raw, bc_comp, integral_loss, wall_speed, pde_max, pde_rate, grad_norm,
                     extra_diag=extra_diag
                 )
+                
+                # Сохраняем extra_grad в истории для TensorBoard
+                if 'extra_grad' not in self.metrics.history:
+                    self.metrics.history['extra_grad'] = []
+                self.metrics.history['extra_grad'].append(extra_grad)
 
                 epoch_time = time.time() - start_time
                 total_time = time.time() - self.start_time
@@ -705,6 +778,14 @@ class PINNSolver:
                 # Обновление графиков
                 if self.visualizer.enabled and epoch % self.visualizer.plot_frequency == 0:
                     self.visualizer.update_plot(epoch, self.metrics.history)
+                
+                # TensorBoard: логируем на КАЖДОЙ эпохе (независимо от matplotlib)
+                if self.visualizer.use_tensorboard:
+                    # Передаем дополнительные компоненты (включая регуляризацию)
+                    loss_components = {
+                        'extra_grad': extra_grad,
+                    }
+                    self.visualizer.log_scalars(epoch, self.metrics.history, loss_components)
 
                 # Шаг планировщика (если используется и не L-BFGS)
                 if self.scheduler is not None and not self.using_lbfgs:
@@ -715,12 +796,18 @@ class PINNSolver:
                     # Другие типы планировщиков (например, StepLR) должны быть обработаны аналогично
 
                 # Вывод в консоль
-                avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(epoch)
+                avg_u_in, avg_u_out, avg_v_in, avg_v_out = self.metrics.get_boundary_avg_velocities(epoch)
                 self.metrics.print_epoch_table(
                     epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time,
                     extra_grad=extra_grad
                 )
-                line2 = f"   avg u_inlet = {avg_u_in:.4f} (норм.), avg u_outlet = {avg_u_out:.4f} (норм.)"
+
+                # Для потенциала: показываем обе компоненты, для НС — только u
+                if self.loss_computer.use_potential:
+                    line2 = (f"  Velocities (norm):  u_in={avg_u_in:8.4f}  v_in={avg_v_in:8.4f}  "
+                             f"u_out={avg_u_out:8.4f}  v_out={avg_v_out:8.4f}")
+                else:
+                    line2 = f"  Velocities (norm):  u_in={avg_u_in:8.4f}  u_out={avg_u_out:8.4f}"
                 print(line2)
                 self.metrics.save_log(f"Epoch {epoch}: loss={loss:.2e}, " +
                                       ", ".join([f"{k}={v:.2e}" for k, v in pde_raw.items()]))
@@ -730,7 +817,8 @@ class PINNSolver:
                 checkpoint_interval = self.config['checkpoint']['interval']
                 if checkpoint_interval > 0 and epoch % checkpoint_interval == 0:
                     self._save_checkpoint(epoch)
-                    self.visualizer.save_plots(self._get_plots_dir(), epoch)
+                    # Сохраняем графики из истории (работает даже без live matplotlib)
+                    self.visualizer.save_final_plots(self._get_plots_dir(), epoch)
 
                 # Диагностика
                 if epoch % self.diagnostics_interval == 0:
@@ -743,7 +831,8 @@ class PINNSolver:
         except KeyboardInterrupt:
             logger.warning("Обучение прервано пользователем. Сохраняю модель и метрики...")
             self._save_checkpoint('interrupted')
-            self.visualizer.save_plots(self._get_plots_dir(), 'interrupted')
+            # Сохраняем графики из истории (работает даже без live matplotlib)
+            self.visualizer.save_final_plots(self._get_plots_dir(), 'interrupted')
             self.interactive._save_current_results(epoch)
             self._finalize()
         except Exception as e:
@@ -756,7 +845,8 @@ class PINNSolver:
                 torch.cuda.empty_cache()
 
         self._save_checkpoint('final')
-        self.visualizer.save_plots(self._get_plots_dir(), 'final')
+        # Сохраняем финальные графики
+        self.visualizer.save_final_plots(self._get_plots_dir(), 'final')
         self.interactive._save_current_results(epochs)
         self._finalize()
 
@@ -793,8 +883,15 @@ class PINNSolver:
         logger.info("Оптимизатор пересоздан.")
 
     def _finalize(self):
+        """Завершение работы и очистка ресурсов."""
         if self.key_listener:
             self.key_listener.stop()
+        
+        # Останавливаем TensorBoard
+        if self.tensorboard_launcher:
+            logger.info(f"📊 TensorBoard доступен по адресу: {self.tensorboard_launcher.get_url()}")
+            self.tensorboard_launcher.stop()
+        
         self.visualizer.close()
         self.metrics.close()
         plt.close('all')

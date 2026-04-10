@@ -1,0 +1,134 @@
+architecture:
+  activation: siren
+  coordinate_scaling:
+    enabled: true
+    input_max: 6.0
+    input_min: -6.0
+    scale_factor: 1.0
+  hidden_layers:
+  - 256
+  - 256
+  - 256
+  - 256
+  output_bias:
+  - 0.0
+  output_dim: 1
+  potential_output_bias:
+  - 0.0
+  potential_output_dim: 1
+boundary_conditions:
+  type: soft
+checkpoint:
+  interval: 500
+  model_name_pattern: '{project_name}_{timestamp}'
+  name_pattern: '{project_name}_{timestamp}'
+checkpoint_dir: Checkpoints
+data:
+  points_file: Initial\Data\initial.npy
+diagnostics:
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  interval: 50
+  plot_2d_spectrum: false
+  plot_profiles: true
+  plot_residual_map: true
+  plot_spectrum: true
+  profile_sections:
+  - 0.2
+  - 0.5
+  - 0.8
+  save_rar_history: true
+  spectrum_2d_resolution: 256
+  spectrum_section_x: 0.5
+enable_key_listener: true
+input_params:
+  coordinates: true
+  density: true
+  fluid_file: Воздух_(20°C)
+  inlet_velocity: true
+  sdf: true
+  use_potential: true
+  viscosity: true
+loss_weights:
+  adaptive_bc: false
+  bc_weights:
+    axis_symmetry: 1.0
+    axis_symmetry_grad: 1.0
+    inlet: 1.0
+    inlet_phi: 100.0
+    outlet: 1.0
+    outlet_phi: 10.0
+    symmetry: 1.0
+    symmetry_grad: 1.0
+    symmetry_phi: 10.0
+    wall: 1.0
+    wall_phi: 100.0
+  integral_condition: false
+  integral_weight: 0.0
+  laplace_weight: 10.0
+  pde_weights:
+    cont: 1.0
+    mom_x: 1.0
+    mom_y: 1.0
+  sa_apply_to_bc: false
+  uniform_reg_weight: 1000.0
+  use_sa_weights: false
+output:
+  console_only: false
+  enable_matplotlib_live: false
+  graphical_window:
+    bc: true
+    loss: true
+    pde: true
+  plot_frequency: 1
+  tensorboard_auto_launch: true
+  tensorboard_log_dir: logs
+  tensorboard_port: 6006
+  use_tensorboard: true
+pde:
+  flow_type: 2d
+  potential:
+    U_inf: 1.0
+    angle_of_attack: 0.0
+    boundary_layer_thickness: 0.05
+    uniform_reg_weight: 0.01
+  system: potential
+process:
+  device: cuda
+  dtype: float32
+  load_model_path: null
+  num_gpus: 1
+  seed: 42
+  use_amp: false
+project_name: Test9
+reference:
+  path: null
+training:
+  batch_size: 25000
+  early_stopping:
+    enabled: false
+    min_delta: 1.0e-06
+    patience: 100
+    restore_best: true
+  epochs: 1000
+  grad_clip: 1.0
+  gradient_accumulation_steps: 1
+  lbfgs_history_size: 100
+  lbfgs_max_iter: 20
+  lr_cyclic_amplitude: 0.5
+  lr_cyclic_period: 100
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  lr_schedule: constant
+  rar_enable: false
+  rar_interval: 100
+  rar_num_points: 200
+  reset_interval: 0
+  reset_noise: 0.01
+  stage1_epochs: 100
+  stage2_pde_weight_end: 100000.0
+  stage2_pde_weight_start: 1.0
+  stage2_ramp_epochs: 500
+  switch_to_lbfgs_epoch: 0
+  two_stage: false

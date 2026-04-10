@@ -1,0 +1,22 @@
+Collecting shapely
+  Using cached shapely-2.1.2-cp314-cp314-win_amd64.whl.metadata (7.1 kB)
+Collecting pyyaml
+  Using cached pyyaml-6.0.3-cp314-cp314-win_amd64.whl.metadata (2.4 kB)
+Collecting keyboard
+  Using cached keyboard-0.13.5-py3-none-any.whl.metadata (4.0 kB)
+Collecting tqdm
+  Using cached tqdm-4.67.3-py3-none-any.whl.metadata (57 kB)
+Collecting psutil
+  Using cached psutil-7.2.2-cp37-abi3-win_amd64.whl.metadata (22 kB)
+Requirement already satisfied: numpy>=1.21 in c:\users\ivan\source\repos\airfoil pinn\venv\lib\site-packages (from shapely) (2.4.4)
+Collecting colorama (from tqdm)
+  Using cached colorama-0.4.6-py2.py3-none-any.whl.metadata (17 kB)
+Using cached shapely-2.1.2-cp314-cp314-win_amd64.whl (1.8 MB)
+Using cached pyyaml-6.0.3-cp314-cp314-win_amd64.whl (156 kB)
+Using cached keyboard-0.13.5-py3-none-any.whl (58 kB)
+Using cached tqdm-4.67.3-py3-none-any.whl (78 kB)
+Using cached psutil-7.2.2-cp37-abi3-win_amd64.whl (137 kB)
+Using cached colorama-0.4.6-py2.py3-none-any.whl (25 kB)
+Installing collected packages: keyboard, shapely, pyyaml, psutil, colorama, tqdm
+
+Successfully installed colorama-0.4.6 keyboard-0.13.5 psutil-7.2.2 pyyaml-6.0.3 shapely-2.1.2 tqdm-4.67.3

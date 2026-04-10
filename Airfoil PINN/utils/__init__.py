@@ -91,14 +91,14 @@ def check_memory_usage(device: torch.device,
 def safe_grad(y: torch.Tensor, x: torch.Tensor, create_graph: bool = True, retain_graph: bool = False, silent: bool = False) -> torch.Tensor:
     """
     Безопасное вычисление градиента dy/dx.
-    
+
     Args:
         y: зависимая переменная
         x: независимая переменная
         create_graph: если True, создаётся граф для вычисления производных высших порядков
         retain_graph: если True, граф сохраняется после вычисления (нужно для многократных вызовов)
         silent: если True, не выводить предупреждения
-    
+
     Returns:
         dy/dx тензор той же формы, что и x
     """
@@ -111,7 +111,9 @@ def safe_grad(y: torch.Tensor, x: torch.Tensor, create_graph: bool = True, retai
                                 create_graph=create_graph, retain_graph=retain_graph, allow_unused=True)[0]
         if g is None:
             if not silent:
-                logger.warning(f"safe_grad: градиент равен None (allow_unused=True). Возвращаю ноль.")
+                # Диагностика: проверяем, связан ли y с x
+                y_name = getattr(y, '_debug_name', '?')
+                logger.warning(f"safe_grad: градиент None для y={y_name} (requires_grad={y.requires_grad}, grad_fn={y.grad_fn}). Возвращаю ноль.")
             return torch.zeros_like(x)
         return g
     except RuntimeError as e:

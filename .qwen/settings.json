@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch)",
+      "Bash(git merge *)",
+      "Bash(pip install *)",
+      "Bash(venv\\scripts\\activate.ps1)",
+      "Bash(exist *)",
+      "Bash(venv\\scripts\\python.exe *)",
+      "Bash(python *)",
+      "Bash(..\\venv\\scripts\\python.exe *)",
+      "Bash(nvidia-smi)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(dir *)",
+      "Bash(c:\\users\\ivan\\source\\repos\\airfoil *)",
+      "Bash(del *)"
+    ]
+  },
+  "$version": 3
+}

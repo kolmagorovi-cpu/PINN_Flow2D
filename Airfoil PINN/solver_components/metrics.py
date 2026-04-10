@@ -87,6 +87,8 @@ class MetricsCollector:
             'max_v_top': [],
             'avg_u_out': [],
             'avg_u_in': [],
+            'avg_v_in': [],
+            'avg_v_out': [],
             'wall_gradient': [],
         }
 
@@ -94,6 +96,8 @@ class MetricsCollector:
         self._last_avg_epoch = -1
         self._cached_u_in_norm = 0.0
         self._cached_u_out_norm = 0.0
+        self._cached_v_in_norm = 0.0
+        self._cached_v_out_norm = 0.0
 
         # Файл лога
         self.log_file = None
@@ -171,15 +175,19 @@ class MetricsCollector:
                 self.history['avg_u_in'].append(extra_diag['avg_u_in'])
             if 'avg_u_out' in extra_diag:
                 self.history['avg_u_out'].append(extra_diag['avg_u_out'])
+            if 'avg_v_in' in extra_diag:
+                self.history['avg_v_in'].append(extra_diag['avg_v_in'])
+            if 'avg_v_out' in extra_diag:
+                self.history['avg_v_out'].append(extra_diag['avg_v_out'])
             if 'wall_gradient' in extra_diag:
                 self.history['wall_gradient'].append(extra_diag['wall_gradient'])
 
     # ------------------------------------------------------------------
     # Вычисление средней скорости на входе/выходе (с кэшированием)
     # ------------------------------------------------------------------
-    def get_boundary_avg_velocities(self, epoch: int, interval: int = 1) -> Tuple[float, float]:
+    def get_boundary_avg_velocities(self, epoch: int, interval: int = 1) -> Tuple[float, float, float, float]:
         """
-        Возвращает средние значения u на inlet и outlet (НОРМИРОВАННЫЕ).
+        Возвращает средние значения u и v на inlet и outlet (НОРМИРОВАННЫЕ).
         Вычисление происходит только если epoch кратно interval и эпоха изменилась.
 
         Args:
@@ -187,19 +195,25 @@ class MetricsCollector:
             interval: интервал обновления (по умолчанию 1 – обновляется каждую эпоху)
 
         Returns:
-            (avg_u_in_norm, avg_u_out_norm) – средние скорости на входе и выходе (нормированные).
+            (avg_u_in_norm, avg_u_out_norm, avg_v_in_norm, avg_v_out_norm) – 
+            средние скорости на входе и выходе (нормированные).
         """
         if epoch % interval == 0 and epoch != self._last_avg_epoch:
             self._update_boundary_avg_velocities()
             self._last_avg_epoch = epoch
-        return self._cached_u_in_norm, self._cached_u_out_norm
+        return self._cached_u_in_norm, self._cached_u_out_norm, self._cached_v_in_norm, self._cached_v_out_norm
 
-    def get_boundary_avg_velocities_physical(self, epoch: int, interval: int = 1) -> Tuple[float, float]:
+    def get_boundary_avg_velocities_physical(self, epoch: int, interval: int = 1) -> Tuple[float, float, float, float]:
         """
-        Возвращает средние значения u на inlet и outlet в физических единицах (м/с).
+        Возвращает средние значения u и v на inlet и outlet в физических единицах (м/с).
         """
-        u_in_norm, u_out_norm = self.get_boundary_avg_velocities(epoch, interval)
-        return u_in_norm * self.data_handler.U_inf, u_out_norm * self.data_handler.U_inf
+        u_in_norm, u_out_norm, v_in_norm, v_out_norm = self.get_boundary_avg_velocities(epoch, interval)
+        return (
+            u_in_norm * self.data_handler.U_inf,
+            u_out_norm * self.data_handler.U_inf,
+            v_in_norm * self.data_handler.U_inf,
+            v_out_norm * self.data_handler.U_inf,
+        )
 
     def _update_boundary_avg_velocities(self) -> None:
         """Вычисляет средние скорости на inlet/outlet с помощью модели (нормированные)."""
@@ -207,8 +221,13 @@ class MetricsCollector:
         dataloader = self.data_handler.get_dataloader()
         u_inlet_sum = 0.0
         u_outlet_sum = 0.0
+        v_inlet_sum = 0.0
+        v_outlet_sum = 0.0
         count_inlet = 0
         count_outlet = 0
+
+        # Для потенциала скорости нужно вычислять u = ∂φ/∂x, v = ∂φ/∂y через градиент
+        is_potential = self.loss_computer.use_potential
 
         with torch.no_grad():
             for batch in dataloader:
@@ -217,7 +236,7 @@ class MetricsCollector:
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
                 sdf = sdf.to(self.device, dtype=self.dtype)
-                if bt.shape[1] > 0:
+                if bt is not None and bt.shape[1] > 0:
                     bt = bt.to(self.device, dtype=self.dtype)
                 else:
                     bt = None
@@ -226,30 +245,62 @@ class MetricsCollector:
 
                 # Построение входного тензора
                 input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
-                out = self.model(input_tensor)
-                u_raw = out[:, 0:1]
 
-                # Применение hard constraints (если нужно)
-                if self.loss_computer.bc_type == 'hard':
-                    u = torch.where(mask_u, u_bc, u_raw)
+                if is_potential:
+                    # Для потенциала: вычисляем u = ∂φ/∂x, v = ∂φ/∂y через градиент
+                    # Внутри no_grad нужен enable_grad для вычисления градиентов
+                    with torch.enable_grad():
+                        x = x.requires_grad_(True)
+                        y = y.requires_grad_(True)
+                        input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                        phi = self.model(input_tensor)
+                        u = torch.autograd.grad(
+                            phi, x, grad_outputs=torch.ones_like(phi),
+                            create_graph=False, retain_graph=False, allow_unused=True
+                        )[0]
+                        v = torch.autograd.grad(
+                            phi, y, grad_outputs=torch.ones_like(phi),
+                            create_graph=False, retain_graph=False, allow_unused=True
+                        )[0]
+                        if u is None:
+                            u = torch.zeros_like(x)
+                        if v is None:
+                            v = torch.zeros_like(y)
                 else:
-                    u = u_raw
+                    # Для Навье-Стокса: u, v — это прямой выход модели
+                    out = self.model(input_tensor)
+                    u_raw = out[:, 0:1]
+                    v_raw = out[:, 1:2]
+
+                    # Применение hard constraints (если нужно)
+                    if self.loss_computer.bc_type == 'hard':
+                        u = torch.where(mask_u, u_bc, u_raw)
+                        mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
+                        v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        v = torch.where(mask_v, v_bc, v_raw)
+                    else:
+                        u = u_raw
+                        v = v_raw
 
                 if 'inlet' in self.data_handler.boundary_type_names:
                     inlet_idx = self.data_handler.boundary_type_names.index('inlet')
                     mask = bt[:, inlet_idx] > 0.5 if bt is not None else torch.zeros_like(u, dtype=torch.bool)
                     if mask.sum() > 0:
                         u_inlet_sum += u[mask].sum().item()
+                        v_inlet_sum += v[mask].sum().item()
                         count_inlet += mask.sum().item()
                 if 'outlet' in self.data_handler.boundary_type_names:
                     outlet_idx = self.data_handler.boundary_type_names.index('outlet')
                     mask = bt[:, outlet_idx] > 0.5 if bt is not None else torch.zeros_like(u, dtype=torch.bool)
                     if mask.sum() > 0:
                         u_outlet_sum += u[mask].sum().item()
+                        v_outlet_sum += v[mask].sum().item()
                         count_outlet += mask.sum().item()
 
         self._cached_u_in_norm = u_inlet_sum / count_inlet if count_inlet > 0 else 0.0
         self._cached_u_out_norm = u_outlet_sum / count_outlet if count_outlet > 0 else 0.0
+        self._cached_v_in_norm = v_inlet_sum / count_inlet if count_inlet > 0 else 0.0
+        self._cached_v_out_norm = v_outlet_sum / count_outlet if count_outlet > 0 else 0.0
 
     # ------------------------------------------------------------------
     # Вывод таблицы потерь в консоль
@@ -269,100 +320,192 @@ class MetricsCollector:
     ) -> None:
         """
         Выводит подробную таблицу с компонентами потерь за эпоху.
+        Для потенциала скорости — упрощённый вывод (без PDE таблицы).
+        Для Навье-Стокса — полная таблица с PDE невязками.
 
-        Args:
-            epoch: текущая эпоха
-            total_epochs: общее число эпох
-            loss: полная потеря
-            pde_raw: словарь средних PDE невязок
-            bc_comp: словарь потерь на границах
-            integral_loss: интегральная потеря
-            pde_max: словарь максимальных PDE невязок
-            epoch_time: время выполнения эпохи (сек)
-            total_time: общее время с начала обучения (сек)
-            extra_grad: дополнительная потеря (регуляризация, symmetry_grad и т.д.)
+        Все столбцы имеют фиксированную ширину — ничего не съезжает.
         """
-        print("\n" + "=" * 100)
-        print(f"Epoch = {epoch:4d}/{total_epochs}    Time = {epoch_time:6.2f} s    Total time = {total_time:8.2f} s")
-        print("-" * 100)
-        print("|       Loss       | Rate | RMS    | Max    | Weight |  W RMS  |  W Max  |")
-        print("+------------------+------+--------+--------+--------+---------+---------+")
-
-        def fmt_line(name, rate, rms, max_val, weight, w_rms, w_max):
-            return f"| {name:<16} | {rate:4.2f} | {rms:7.1e} | {max_val:7.1e} | {weight:7.1e} | {w_rms:7.1e} | {w_max:7.1e} |"
-
+        is_potential = self.loss_computer.use_potential
         w = self.loss_computer.loss_weights
 
-        # PDE компоненты — выводим все динамически
-        pde_display_names = {
-            'cont': 'Continuity',
-            'mom_x': 'Momentum X' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum R',
-            'mom_y': 'Momentum Y' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum Z',
-            'laplace': 'Laplace (Potential)',
-        }
+        # Форматирование строки с фиксированной шириной столбцов
+        # | Название         | Rate | RMS       | Max       | Weight    | W RMS     | W Max     |
+        #  18                 6      11          11          11          11          11
+        COL_NAME   = 18
+        COL_RATE   = 6
+        COL_RMS    = 11
+        COL_MAX    = 11
+        COL_WEIGHT = 11
+        COL_WRMS   = 11
+        COL_WMAX   = 11
 
-        for comp in self.loss_computer.pde_components:
-            disp_name = pde_display_names.get(comp, comp.upper())
-            rate_comp = self._compute_rate('pde', comp, pde_raw.get(comp, 0))
-            w_comp = w.get(comp, 0)
-            rms_val = pde_raw.get(comp, 0)
-            max_val = pde_max.get(comp, 0)
-            w_rms = rms_val * w_comp
-            w_max = max_val * w_comp
-            print(fmt_line(disp_name, rate_comp, rms_val, max_val, w_comp, w_rms, w_max))
+        def fmt_line(name, rate, rms, max_val, weight, w_rms, w_max):
+            return (
+                f"| {name:<{COL_NAME}} "
+                f"| {rate:>{COL_RATE}.2f} "
+                f"| {rms:>{COL_RMS}.1e} "
+                f"| {max_val:>{COL_MAX}.1e} "
+                f"| {weight:>{COL_WEIGHT}.1e} "
+                f"| {w_rms:>{COL_WRMS}.1e} "
+                f"| {w_max:>{COL_WMAX}.1e} |"
+            )
 
-        # Boundary conditions — динамически по фактическим ключам
-        if self.loss_computer.bc_type == 'soft':
-            # Собираем все BC ключи из bc_comp (могут быть 'inlet' или 'inlet_phi' и т.д.)
-            bc_keys = list(bc_comp.keys())
-            for name in bc_keys:
-                val = bc_comp.get(name, 0)
-                rate_bc = self._compute_rate('bc', name, val)
-                # Определяем weight_key: убираем '_phi' если есть
-                base_name = name.replace('_phi', '')
-                weight_key = base_name
-                if base_name == 'symmetry':
-                    weight_key = 'symmetry_grad'
-                elif base_name == 'axis_symmetry':
-                    weight_key = 'axis_symmetry_grad'
-                weight = w.get(weight_key, 0)
-                w_rms_bc = val * weight
-                w_max_bc = val * weight
-                disp_name = name.replace('_', ' ').title()
-                print(fmt_line(disp_name, rate_bc, val, val, weight, w_rms_bc, w_max_bc))
+        # Ширина всей таблицы: 1 + COL_NAME+2 + 1 + COL_RATE+2 + 1 + COL_RMS+2 + 1 + COL_MAX+2
+        #                      + 1 + COL_WEIGHT+2 + 1 + COL_WRMS+2 + 1 + COL_WMAX+2 + 1
+        TABLE_WIDTH = (
+            1
+            + (COL_NAME + 2) + 1 + (COL_RATE + 2) + 1 + (COL_RMS + 2) + 1 + (COL_MAX + 2)
+            + 1 + (COL_WEIGHT + 2) + 1 + (COL_WRMS + 2) + 1 + (COL_WMAX + 2) + 1
+        )
+
+        HEADER = "|       Loss       | Rate | RMS       | Max       | Weight    | W RMS     | W Max     |"
+        SEPARATOR = "+" + "-" * (COL_NAME + 2) + "+" + "-" * (COL_RATE + 2) + "+" \
+                    + "-" * (COL_RMS + 2) + "+" + "-" * (COL_MAX + 2) + "+" \
+                    + "-" * (COL_WEIGHT + 2) + "+" + "-" * (COL_WRMS + 2) + "+" \
+                    + "-" * (COL_WMAX + 2) + "+"
+
+        print()
+        print("=" * TABLE_WIDTH)
+        print(f"Epoch = {epoch:4d}/{total_epochs}    Time = {epoch_time:6.2f} s    Total time = {total_time:8.2f} s")
+        print("-" * TABLE_WIDTH)
+
+        if is_potential:
+            # Для потенциала — компактный вывод без таблицы PDE
+            laplace_val = pde_raw.get('laplace', 0.0)
+            laplace_max = pde_max.get('laplace', 0.0)
+            w_laplace = w.get('laplace', 1.0)
+
+            print(f"  Laplace (PDE):  RMS = {laplace_val:11.1e}   Max = {laplace_max:11.1e}   "
+                  f"Weight = {w_laplace:10.1e}   W_RMS = {laplace_val * w_laplace:11.1e}")
+            print()
+
+            # BC компоненты
+            print(HEADER)
+            print(SEPARATOR)
+
+            pde_display_names = {
+                'laplace': 'Laplace',
+            }
+
+            # PDE компонента (laplace)
+            for comp in self.loss_computer.pde_components:
+                disp_name = pde_display_names.get(comp, comp.upper())
+                rate_comp = self._compute_rate('pde', comp, pde_raw.get(comp, 0))
+                w_comp = w.get(comp, 0)
+                rms_val = pde_raw.get(comp, 0)
+                max_val = pde_max.get(comp, 0)
+                w_rms = rms_val * w_comp
+                w_max = max_val * w_comp
+                print(fmt_line(disp_name, rate_comp, rms_val, max_val, w_comp, w_rms, w_max))
+
+            # BC компоненты — только _phi ключи для потенциала
+            if self.loss_computer.bc_type == 'soft':
+                bc_keys = [k for k in bc_comp.keys() if k.endswith('_phi')]
+                for name in bc_keys:
+                    val = bc_comp.get(name, 0)
+                    rate_bc = self._compute_rate('bc', name, val)
+                    weight = w.get(name, 0)
+                    if weight == 0 and name.endswith('_phi'):
+                        base_name = name[:-4]
+                        weight = w.get(base_name, 0)
+                    # symmetry_grad и axis_symmetry_grad
+                    base_name = name.replace('_phi', '')
+                    if base_name == 'symmetry' and weight == 0:
+                        weight = w.get('symmetry_grad', 0)
+                    elif base_name == 'axis_symmetry' and weight == 0:
+                        weight = w.get('axis_symmetry_grad', 0)
+                    w_rms_bc = val * weight
+                    w_max_bc = val * weight
+                    disp_name = name.replace('_', ' ').title()
+                    print(fmt_line(disp_name, rate_bc, val, val, weight, w_rms_bc, w_max_bc))
+            else:
+                for name in self.data_handler.boundary_type_names:
+                    print(fmt_line(name.replace('_', ' ').title(), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+            # Extra grad (регуляризация)
+            if extra_grad > 0:
+                rate_eg = self._compute_rate('extra_grad', None, extra_grad)
+                w_reg = w.get('uniform_reg', 0.0)
+                print(fmt_line('Regularization', rate_eg, extra_grad, extra_grad, w_reg, extra_grad, extra_grad))
+
+            # Totals
+            total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0
+            rate_tot_bc = self._compute_rate('total_bc', None, total_bc)
+            print(fmt_line('Total BC', rate_tot_bc, total_bc, total_bc, 0.0, 0.0, 0.0))
+
+            total_pde = sum(pde_raw.values())
+            rate_tot_pde = self._compute_rate('total_pde', None, total_pde)
+            print(fmt_line('Total PDE', rate_tot_pde, total_pde, total_pde, 0.0, 0.0, 0.0))
+
+            rate_tot = self._compute_rate('loss', None, loss)
+            print(fmt_line('Total Loss', rate_tot, loss, loss, 0.0, 0.0, 0.0))
+
         else:
-            # При hard границах потерь BC нет, но выводим заглушки
-            for name in self.data_handler.boundary_type_names:
-                print(fmt_line(name.replace('_', ' ').title(), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            # Навье-Стокс — полная таблица
+            print(HEADER)
+            print(SEPARATOR)
 
-        # Integral loss
-        if self.loss_computer.integral_condition:
-            rate_int = self._compute_rate('integral', None, integral_loss)
-            w_int = self.loss_computer.integral_weight
-            w_rms_int = integral_loss * w_int
-            w_max_int = integral_loss * w_int
-            print(fmt_line('Integral Flow', rate_int, integral_loss, integral_loss,
-                           w_int, w_rms_int, w_max_int))
+            pde_display_names = {
+                'cont': 'Continuity',
+                'mom_x': 'Momentum X' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum R',
+                'mom_y': 'Momentum Y' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum Z',
+            }
 
-        # Extra grad (регуляризация, symmetry_grad и т.д.)
-        if extra_grad > 0:
-            rate_eg = self._compute_rate('extra_grad', None, extra_grad)
-            # Вес не отображаем, так как он уже включён в extra_grad
-            print(fmt_line('Regularization', rate_eg, extra_grad, extra_grad, 0.0, 0.0, 0.0))
+            for comp in self.loss_computer.pde_components:
+                disp_name = pde_display_names.get(comp, comp.upper())
+                rate_comp = self._compute_rate('pde', comp, pde_raw.get(comp, 0))
+                w_comp = w.get(comp, 0)
+                rms_val = pde_raw.get(comp, 0)
+                max_val = pde_max.get(comp, 0)
+                w_rms = rms_val * w_comp
+                w_max = max_val * w_comp
+                print(fmt_line(disp_name, rate_comp, rms_val, max_val, w_comp, w_rms, w_max))
 
-        # Totals
-        total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0
-        rate_tot_bc = self._compute_rate('total_bc', None, total_bc)
-        print(fmt_line('Total BC', rate_tot_bc, total_bc, total_bc, 0.0, 0.0, 0.0))
+            # Boundary conditions — Навье-Стокс (ключи без '_phi')
+            if self.loss_computer.bc_type == 'soft':
+                bc_keys = [k for k in bc_comp.keys() if not k.endswith('_phi')]
+                for name in bc_keys:
+                    val = bc_comp.get(name, 0)
+                    rate_bc = self._compute_rate('bc', name, val)
+                    weight = w.get(name, 0)
+                    w_rms_bc = val * weight
+                    w_max_bc = val * weight
+                    disp_name = name.replace('_', ' ').title()
+                    print(fmt_line(disp_name, rate_bc, val, val, weight, w_rms_bc, w_max_bc))
+            else:
+                for name in self.data_handler.boundary_type_names:
+                    print(fmt_line(name.replace('_', ' ').title(), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
-        total_pde = sum(pde_raw.values())
-        rate_tot_pde = self._compute_rate('total_pde', None, total_pde)
-        print(fmt_line('Total PDE', rate_tot_pde, total_pde, total_pde, 0.0, 0.0, 0.0))
+            # Integral loss
+            if self.loss_computer.integral_condition:
+                rate_int = self._compute_rate('integral', None, integral_loss)
+                w_int = self.loss_computer.integral_weight
+                w_rms_int = integral_loss * w_int
+                w_max_int = integral_loss * w_int
+                print(fmt_line('Integral Flow', rate_int, integral_loss, integral_loss,
+                               w_int, w_rms_int, w_max_int))
 
-        rate_tot = self._compute_rate('loss', None, loss)
-        print(fmt_line('Total Loss', rate_tot, loss, loss, 0.0, 0.0, 0.0))
+            # Extra grad
+            if extra_grad > 0:
+                rate_eg = self._compute_rate('extra_grad', None, extra_grad)
+                w_reg = w.get('symmetry_grad', 0)
+                if w_reg == 0:
+                    w_reg = w.get('axis_symmetry_grad', 0)
+                print(fmt_line('Extra Grad', rate_eg, extra_grad, extra_grad, w_reg, extra_grad, extra_grad))
 
-        print("=" * 100)
+            # Totals
+            total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0
+            rate_tot_bc = self._compute_rate('total_bc', None, total_bc)
+            print(fmt_line('Total BC', rate_tot_bc, total_bc, total_bc, 0.0, 0.0, 0.0))
+
+            total_pde = sum(pde_raw.values())
+            rate_tot_pde = self._compute_rate('total_pde', None, total_pde)
+            print(fmt_line('Total PDE', rate_tot_pde, total_pde, total_pde, 0.0, 0.0, 0.0))
+
+            rate_tot = self._compute_rate('loss', None, loss)
+            print(fmt_line('Total Loss', rate_tot, loss, loss, 0.0, 0.0, 0.0))
+
+        print("=" * TABLE_WIDTH)
 
     def _compute_rate(self, category: str, key: Optional[str], current: float) -> float:
         """
@@ -457,9 +600,12 @@ class MetricsCollector:
         final_integral_loss = self.history['integral_loss'][-1] if self.history['integral_loss'] else 0.0
 
         # Средние скорости на границах (нормированные)
-        avg_u_in_norm, avg_u_out_norm = self._cached_u_in_norm, self._cached_u_out_norm
+        avg_u_in_norm, avg_u_out_norm, avg_v_in_norm, avg_v_out_norm = \
+            self._cached_u_in_norm, self._cached_u_out_norm, self._cached_v_in_norm, self._cached_v_out_norm
         avg_u_in_phys = avg_u_in_norm * self.data_handler.U_inf
         avg_u_out_phys = avg_u_out_norm * self.data_handler.U_inf
+        avg_v_in_phys = avg_v_in_norm * self.data_handler.U_inf
+        avg_v_out_phys = avg_v_out_norm * self.data_handler.U_inf
 
         # Ошибка баланса масс (по нормализованным значениям)
         Qin = avg_u_in_norm
@@ -479,6 +625,10 @@ class MetricsCollector:
             'final_u_in_phys': avg_u_in_phys,
             'final_u_out_norm': avg_u_out_norm,
             'final_u_in_norm': avg_u_in_norm,
+            'final_v_out_phys': avg_v_out_phys,
+            'final_v_in_phys': avg_v_in_phys,
+            'final_v_out_norm': avg_v_out_norm,
+            'final_v_in_norm': avg_v_in_norm,
             'mass_balance_error': mass_balance_error,
             'final_pde_loss': final_pde_loss,
             'final_bc_loss': final_bc_loss,
@@ -503,11 +653,32 @@ class MetricsCollector:
 
                 self.model.eval()
                 with torch.no_grad():
-                    input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
-                    out = self.model(input_tensor)
-                    u_pred = out[:, 0:1].cpu().numpy().flatten()
-                    v_pred = out[:, 1:2].cpu().numpy().flatten()
-                    p_pred = out[:, 2:3].cpu().numpy().flatten()
+                    if self.loss_computer.use_potential:
+                        # Для потенциала: вычисляем скорости через градиенты
+                        with torch.enable_grad():
+                            x_norm_grad = x_norm.requires_grad_(True)
+                            y_norm_grad = y_norm.requires_grad_(True)
+                            input_tensor = self.loss_computer.build_input_tensor(x_norm_grad, y_norm_grad, sdf_norm, bt)
+                            phi = self.model(input_tensor)
+                            u_pred = torch.autograd.grad(phi, x_norm_grad, grad_outputs=torch.ones_like(phi),
+                                                         create_graph=False, retain_graph=False, allow_unused=True)[0]
+                            v_pred = torch.autograd.grad(phi, y_norm_grad, grad_outputs=torch.ones_like(phi),
+                                                         create_graph=False, retain_graph=False, allow_unused=True)[0]
+                            if u_pred is None:
+                                u_pred = torch.zeros_like(x_norm_grad)
+                            if v_pred is None:
+                                v_pred = torch.zeros_like(y_norm_grad)
+                            p_pred = torch.zeros_like(phi)
+                    else:
+                        input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
+                        out = self.model(input_tensor)
+                        u_pred = out[:, 0:1]
+                        v_pred = out[:, 1:2]
+                        p_pred = out[:, 2:3]
+                    
+                    u_pred = u_pred.cpu().numpy().flatten()
+                    v_pred = v_pred.cpu().numpy().flatten()
+                    p_pred = p_pred.cpu().numpy().flatten()
 
                 # Физические координаты
                 x_phys = x_norm.cpu().numpy().flatten() * self.data_handler.chord

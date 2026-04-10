@@ -140,7 +140,13 @@ class ConfigManager:
                     'pde': True,
                     'bc': False,
                 },
-                'plot_frequency': 10,
+                'plot_frequency': None,  # Отключено live обновление (None = без окон)
+                'enable_matplotlib_live': False,  # Включить live окна matplotlib (по умолчанию выкл)
+                # TensorBoard настройки
+                'use_tensorboard': True,
+                'tensorboard_port': 6006,
+                'tensorboard_auto_launch': True,
+                'tensorboard_log_dir': 'logs',
             },
             'checkpoint': {
                 'interval': 500,
