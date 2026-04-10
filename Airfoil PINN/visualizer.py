@@ -160,6 +160,7 @@ class Visualizer:
                     ax.relim()
                     ax.autoscale_view()
                 self.fig_pde.canvas.draw()
+                plt.pause(0.001)
                 self.fig_pde.canvas.flush_events()
             else:
                 logger.info("Окно PDE графика закрыто, отключаю live plot")
@@ -179,6 +180,7 @@ class Visualizer:
                     ax.relim()
                     ax.autoscale_view()
                 self.fig_bc.canvas.draw()
+                plt.pause(0.001)
                 self.fig_bc.canvas.flush_events()
             else:
                 logger.info("Окно BC графика закрыто, отключаю live plot")
@@ -212,13 +214,14 @@ class Visualizer:
                     ax.relim()
                     ax.autoscale_view()
                 self.fig_diag.canvas.draw()
+                plt.pause(0.001)
                 self.fig_diag.canvas.flush_events()
             else:
                 logger.info("Окно диагностики закрыто, отключаю live plot")
                 self.enabled = False
                 return
 
-            plt.pause(0.1)
+            plt.pause(0.001)
         except Exception as e:
             logger.warning(f"Ошибка обновления графика: {e}. Отключаю live plot.")
             self.enabled = False
@@ -468,10 +471,14 @@ class Visualizer:
             p_dyn = data_handler.rho * data_handler.U_inf ** 2
             p_plot = p_norm * p_dyn
             # Обратное масштабирование координат (если использовалось масштабирование)
-            scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
-            if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
-                x_plot = (x_norm / scale_factor) * data_handler.chord
-                y_plot = (y_norm / scale_factor) * data_handler.chord
+            if config is not None:
+                scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
+                if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
+                    x_plot = (x_norm / scale_factor) * data_handler.chord
+                    y_plot = (y_norm / scale_factor) * data_handler.chord
+                else:
+                    x_plot = x_norm * data_handler.chord
+                    y_plot = y_norm * data_handler.chord
             else:
                 x_plot = x_norm * data_handler.chord
                 y_plot = y_norm * data_handler.chord
@@ -492,10 +499,14 @@ class Visualizer:
             v_plot = v_norm
             p_plot = p_norm
             # Обратное масштабирование координат (если использовалось масштабирование)
-            scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
-            if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
-                x_plot = x_norm / scale_factor
-                y_plot = y_norm / scale_factor
+            if config is not None:
+                scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
+                if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
+                    x_plot = x_norm / scale_factor
+                    y_plot = y_norm / scale_factor
+                else:
+                    x_plot = x_norm
+                    y_plot = y_norm
             else:
                 x_plot = x_norm
                 y_plot = y_norm
@@ -805,6 +816,394 @@ class Visualizer:
                                             boundary_type_names=data_handler.boundary_type_names,
                                             plot_physical=plot_physical,
                                             config=self.config if hasattr(self, 'config') else None)
+
+    def plot_potential_fields(self,
+                              phi_norm: torch.Tensor,
+                              u_norm: torch.Tensor,
+                              v_norm: torch.Tensor,
+                              x_norm: torch.Tensor,
+                              y_norm: torch.Tensor,
+                              data_handler,
+                              savedir: str,
+                              epoch: Optional[Union[int, str]] = None,
+                              plot_physical: bool = True,
+                              config: Optional[Dict] = None) -> None:
+        """
+        Строит и сохраняет поля потенциала φ и скоростей (u, v), вычисленных из φ.
+        
+        Для потенциала скорости:
+            - φ визуализируется как контурное поле
+            - u = ∂φ/∂x, v = ∂φ/∂y визуализируются как отдельные поля
+            - Давление не отображается (не используется для потенциала)
+
+        Args:
+            phi_norm: нормализованный потенциал (Tensor)
+            u_norm: нормализованная скорость u = ∂φ/∂x (Tensor)
+            v_norm: нормализованная скорость v = ∂φ/∂y (Tensor)
+            x_norm, y_norm: нормализованные координаты (Tensor)
+            data_handler: объект DataHandler с метаданными
+            savedir: директория для сохранения
+            epoch: номер эпохи (для имени файла)
+            plot_physical: отображать физические или нормализованные величины
+            config: конфигурация (для coordinate_scaling)
+        """
+        os.makedirs(savedir, exist_ok=True)
+        
+        # Преобразуем в numpy
+        phi_np = phi_norm.detach().cpu().numpy().flatten()
+        u_np = u_norm.detach().cpu().numpy().flatten()
+        v_np = v_norm.detach().cpu().numpy().flatten()
+        x_np = x_norm.detach().cpu().numpy().flatten()
+        y_np = y_norm.detach().cpu().numpy().flatten()
+        
+        # Определяем, какие величины отображать
+        if plot_physical:
+            phi_plot = phi_np * data_handler.U_inf * data_handler.chord
+            u_plot = u_np * data_handler.U_inf
+            v_plot = v_np * data_handler.U_inf
+            x_plot = x_np * data_handler.chord
+            y_plot = y_np * data_handler.chord
+            phi_label = 'Потенциал φ, м²/с'
+            u_label = 'Скорость U, м/с'
+            v_label = 'Скорость V, м/с'
+            x_label = 'x, м'
+            y_label = 'y, м'
+            title_suffix = ' (physical)'
+            phi_vmin, phi_vmax = None, None
+            u_vmin, u_vmax = 0, max(data_handler.U_inf, u_plot.max())
+            v_vmin, v_vmax = -max(data_handler.U_inf, abs(v_plot.min()), abs(v_plot.max())), max(data_handler.U_inf, abs(v_plot.max()))
+        else:
+            phi_plot = phi_np
+            u_plot = u_np
+            v_plot = v_np
+            x_plot = x_np
+            y_plot = y_np
+            phi_label = 'φ (норм.)'
+            u_label = 'U (норм.)'
+            v_label = 'V (норм.)'
+            x_label = 'x (норм.)'
+            y_label = 'y (норм.)'
+            title_suffix = ' (normalized)'
+            phi_vmin, phi_vmax = None, None
+            u_vmin, u_vmax = 0, max(1.0, u_plot.max())
+            v_vmin, v_vmax = -max(1.0, abs(v_plot.min()), abs(v_plot.max())), max(1.0, abs(v_plot.max()))
+        
+        epoch_str = f'_epoch_{epoch}' if epoch is not None else ''
+        
+        # Создаём фигуру с 3 субплотами
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+        
+        # Потенциал φ
+        sc0 = axes[0].scatter(x_plot, y_plot, c=phi_plot, s=1, cmap='viridis', alpha=0.6)
+        fig.colorbar(sc0, ax=axes[0], label=phi_label)
+        axes[0].set_xlabel(x_label)
+        axes[0].set_ylabel(y_label)
+        axes[0].set_title(f'Потенциал φ{title_suffix}')
+        axes[0].set_aspect('equal')
+        axes[0].grid(alpha=0.3)
+        
+        # Скорость u
+        sc1 = axes[1].scatter(x_plot, y_plot, c=u_plot, s=1, cmap='RdBu_r', alpha=0.6,
+                              vmin=u_vmin, vmax=u_vmax)
+        fig.colorbar(sc1, ax=axes[1], label=u_label)
+        axes[1].set_xlabel(x_label)
+        axes[1].set_ylabel(y_label)
+        axes[1].set_title(f'Скорость U = ∂φ/∂x{title_suffix}')
+        axes[1].set_aspect('equal')
+        axes[1].grid(alpha=0.3)
+        
+        # Скорость v
+        sc2 = axes[2].scatter(x_plot, y_plot, c=v_plot, s=1, cmap='RdBu_r', alpha=0.6,
+                              vmin=v_vmin, vmax=v_vmax)
+        fig.colorbar(sc2, ax=axes[2], label=v_label)
+        axes[2].set_xlabel(x_label)
+        axes[2].set_ylabel(y_label)
+        axes[2].set_title(f'Скорость V = ∂φ/∂y{title_suffix}')
+        axes[2].set_aspect('equal')
+        axes[2].grid(alpha=0.3)
+        
+        fig.suptitle(f'Потенциал скорости - {self.config_name}{epoch_str}')
+        
+        # Сохраняем
+        filename = os.path.join(savedir, f'potential_fields{epoch_str}.png')
+        fig.savefig(filename, dpi=150, bbox_inches='tight')
+        logger.info(f"Сохранено: {filename}")
+        plt.close(fig)
+        
+        # Сохраняем данные в .npy
+        npy_data = {
+            'phi': phi_plot,
+            'u': u_plot,
+            'v': v_plot,
+            'x': x_plot,
+            'y': y_plot,
+            'epoch': epoch,
+            'physical': plot_physical
+        }
+        npy_filename = os.path.join(savedir, f'potential_fields{epoch_str}.npy')
+        np.save(npy_filename, npy_data)
+        logger.info(f"Сохранены данные: {npy_filename}")
+
+    def plot_potential_loss_history(self, 
+                                    history: Dict[str, List[float]],
+                                    savedir: str,
+                                    epoch: Optional[Union[int, str]] = None) -> None:
+        """
+        Строит графики сходимости потерь для потенциала скорости.
+        
+        Отображает:
+            - loss_laplace (уравнение Лапласа)
+            - loss_inlet (вход)
+            - loss_wall (стенка)
+            - loss_outlet (выход)
+            - loss_uniform_reg (регуляризация)
+            - total_loss
+
+        Args:
+            history: словарь с историей потерь
+            savedir: директория для сохранения
+            epoch: номер эпохи (для имени файла)
+        """
+        if not history:
+            logger.warning("История потерь пуста.")
+            return
+        
+        os.makedirs(savedir, exist_ok=True)
+        
+        # Определяем компоненты для отображения
+        loss_keys = ['laplace', 'inlet_phi', 'wall_phi', 'outlet_phi', 'symmetry_phi', 'uniform_reg']
+        available_keys = [k for k in loss_keys if k in history and len(history[k]) > 0]
+        
+        if not available_keys:
+            logger.warning("Нет доступных компонент потерь для потенциала.")
+            return
+        
+        # Создаём фигуру
+        n_plots = len(available_keys) + 1  # +1 для total_loss
+        fig, axes = plt.subplots(2, (n_plots + 1) // 2, figsize=(15, 8), constrained_layout=True)
+        if n_plots == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten()
+        
+        epochs = range(1, len(history.get('total_loss', history.get(available_keys[0]))) + 1)
+        
+        # Total Loss
+        if 'total_loss' in history and len(history['total_loss']) > 0:
+            ax = axes[0]
+            ax.plot(epochs, history['total_loss'], 'k-', linewidth=2, label='Total')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Loss')
+            ax.set_title('Полная потеря')
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3)
+            axes_idx = 1
+        else:
+            axes_idx = 0
+        
+        # Отдельные компоненты
+        for i, key in enumerate(available_keys):
+            ax = axes[axes_idx + i]
+            values = history[key]
+            ax.plot(epochs[:len(values)], values, 'b-', linewidth=1.5)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Loss')
+            
+            # Красивое название ключа
+            key_labels = {
+                'laplace': 'Лапласиан ∇²φ',
+                'inlet_phi': 'Вход (inlet)',
+                'wall_phi': 'Стенка (wall)',
+                'outlet_phi': 'Выход (outlet)',
+                'symmetry_phi': 'Симметрия',
+                'uniform_reg': 'Регуляризация'
+            }
+            ax.set_title(key_labels.get(key, key))
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3)
+        
+        # Скрываем неиспользуемые субплоты
+        for i in range(axes_idx + len(available_keys), len(axes)):
+            axes[i].set_visible(False)
+        
+        epoch_str = f'_epoch_{epoch}' if epoch is not None else ''
+        fig.suptitle(f'Сходимость потерь - Потенциал скорости - {self.config_name}{epoch_str}')
+        
+        filename = os.path.join(savedir, f'potential_loss_history{epoch_str}.png')
+        fig.savefig(filename, dpi=150, bbox_inches='tight')
+        logger.info(f"Сохранено: {filename}")
+        plt.close(fig)
+
+    def plot_velocity_magnitude_from_potential(self,
+                                                u_norm: torch.Tensor,
+                                                v_norm: torch.Tensor,
+                                                x_norm: torch.Tensor,
+                                                y_norm: torch.Tensor,
+                                                data_handler,
+                                                savedir: str,
+                                                epoch: Optional[Union[int, str]] = None,
+                                                plot_physical: bool = True,
+                                                config: Optional[Dict] = None) -> None:
+        """
+        Строит модуль скорости |V| = sqrt(u² + v²) из потенциала.
+        
+        Полезно для визуализации обтекания профиля.
+
+        Args:
+            u_norm, v_norm: нормализованные компоненты скорости (Tensor)
+            x_norm, y_norm: нормализованные координаты (Tensor)
+            data_handler: объект DataHandler с метаданными
+            savedir: директория для сохранения
+            epoch: номер эпохи
+            plot_physical: отображать физические или нормализованные величины
+            config: конфигурация
+        """
+        os.makedirs(savedir, exist_ok=True)
+        
+        # Вычисляем модуль скорости
+        speed_norm = torch.sqrt(u_norm**2 + v_norm**2)
+        speed_np = speed_norm.detach().cpu().numpy().flatten()
+        x_np = x_norm.detach().cpu().numpy().flatten()
+        y_np = y_norm.detach().cpu().numpy().flatten()
+        
+        if plot_physical:
+            speed_plot = speed_np * data_handler.U_inf
+            x_plot = x_np * data_handler.chord
+            y_plot = y_np * data_handler.chord
+            speed_label = '|V|, м/с'
+            x_label = 'x, м'
+            y_label = 'y, м'
+            title_suffix = ' (physical)'
+            vmin = 0
+            vmax = max(data_handler.U_inf, speed_plot.max())
+        else:
+            speed_plot = speed_np
+            x_plot = x_np
+            y_plot = y_np
+            speed_label = '|V| (норм.)'
+            x_label = 'x (норм.)'
+            y_label = 'y (норм.)'
+            title_suffix = ' (normalized)'
+            vmin = 0
+            vmax = max(1.0, speed_plot.max())
+        
+        epoch_str = f'_epoch_{epoch}' if epoch is not None else ''
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sc = ax.scatter(x_plot, y_plot, c=speed_plot, s=1, cmap='jet', alpha=0.6,
+                       vmin=vmin, vmax=vmax)
+        fig.colorbar(sc, ax=ax, label=speed_label)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.set_title(f'Модуль скорости |V| = √(u²+v²){title_suffix} - {self.config_name}{epoch_str}')
+        ax.set_aspect('equal')
+        ax.grid(alpha=0.3)
+        
+        filename = os.path.join(savedir, f'velocity_magnitude{epoch_str}.png')
+        fig.savefig(filename, dpi=150, bbox_inches='tight')
+        logger.info(f"Сохранено: {filename}")
+        plt.close(fig)
+
+    def plot_pressure_from_potential(self,
+                                     pressure_norm: torch.Tensor,
+                                     cp_norm: torch.Tensor,
+                                     x_norm: torch.Tensor,
+                                     y_norm: torch.Tensor,
+                                     data_handler,
+                                     savedir: str,
+                                     epoch: Optional[Union[int, str]] = None,
+                                     plot_physical: bool = True,
+                                     config: Optional[Dict] = None) -> None:
+        """
+        Строит и сохраняет поле давления, вычисленное из потенциала по уравнению Бернулли.
+        
+        Отображает:
+            - Абсолютное давление p [Па]
+            - Коэффициент давления Cp = (p - p_inf) / (0.5 * rho * U_inf²)
+
+        Args:
+            pressure_norm: нормализованное давление (Tensor)
+            cp_norm: коэффициент давления Cp (Tensor)
+            x_norm, y_norm: нормализованные координаты (Tensor)
+            data_handler: объект DataHandler с метаданными
+            savedir: директория для сохранения
+            epoch: номер эпохи
+            plot_physical: отображать физические или нормализованные величины
+            config: конфигурация
+        """
+        os.makedirs(savedir, exist_ok=True)
+        
+        # Преобразуем в numpy
+        p_np = pressure_norm.detach().cpu().numpy().flatten()
+        cp_np = cp_norm.detach().cpu().numpy().flatten()
+        x_np = x_norm.detach().cpu().numpy().flatten()
+        y_np = y_norm.detach().cpu().numpy().flatten()
+        
+        if plot_physical:
+            p_plot = p_np
+            x_plot = x_np * data_handler.chord
+            y_plot = y_np * data_handler.chord
+            p_label = 'Давление p, Па'
+            x_label = 'x, м'
+            y_label = 'y, м'
+            title_suffix = ' (physical)'
+            p_vmin, p_vmax = None, None
+        else:
+            # Нормализованное давление: p_norm = (p - p_inf) / (0.5 * rho * U_inf²) = Cp
+            p_plot = cp_np
+            x_plot = x_np
+            y_plot = y_np
+            p_label = 'Коэффициент давления Cp'
+            x_label = 'x (норм.)'
+            y_label = 'y (норм.)'
+            title_suffix = ' (normalized)'
+            p_vmin, p_vmax = None, None
+        
+        epoch_str = f'_epoch_{epoch}' if epoch is not None else ''
+        
+        # Создаём фигуру с 2 субплотами
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
+        
+        # Давление
+        sc0 = axes[0].scatter(x_plot, y_plot, c=p_plot, s=1, cmap='RdBu_r', alpha=0.6,
+                             vmin=p_vmin, vmax=p_vmax)
+        fig.colorbar(sc0, ax=axes[0], label=p_label)
+        axes[0].set_xlabel(x_label)
+        axes[0].set_ylabel(y_label)
+        axes[0].set_title(f'Давление{title_suffix}')
+        axes[0].set_aspect('equal')
+        axes[0].grid(alpha=0.3)
+        
+        # Коэффициент давления Cp
+        sc1 = axes[1].scatter(x_plot, y_plot, c=cp_np, s=1, cmap='RdBu_r', alpha=0.6,
+                             vmin=-2, vmax=1)  # Cp обычно в диапазоне [-2, 1]
+        fig.colorbar(sc1, ax=axes[1], label='Коэффициент давления Cp')
+        axes[1].set_xlabel(x_label)
+        axes[1].set_ylabel(y_label)
+        axes[1].set_title(f'Коэффициент давления Cp{title_suffix}')
+        axes[1].set_aspect('equal')
+        axes[1].grid(alpha=0.3)
+        
+        fig.suptitle(f'Давление из потенциала (Бернулли) - {self.config_name}{epoch_str}')
+        
+        # Сохраняем
+        filename = os.path.join(savedir, f'pressure_from_potential{epoch_str}.png')
+        fig.savefig(filename, dpi=150, bbox_inches='tight')
+        logger.info(f"Сохранено: {filename}")
+        plt.close(fig)
+        
+        # Сохраняем данные в .npy
+        npy_data = {
+            'pressure': p_plot,
+            'cp': cp_np,
+            'x': x_plot if plot_physical else x_np,
+            'y': y_plot if plot_physical else y_np,
+            'epoch': epoch,
+            'physical': plot_physical
+        }
+        npy_filename = os.path.join(savedir, f'pressure_from_potential{epoch_str}.npy')
+        np.save(npy_filename, npy_data)
+        logger.info(f"Сохранены данные: {npy_filename}")
 
     def close(self) -> None:
         """Закрывает все окна matplotlib."""

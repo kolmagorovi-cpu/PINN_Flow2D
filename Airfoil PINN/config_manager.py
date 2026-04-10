@@ -45,12 +45,16 @@ class ConfigManager:
                 'viscosity': False,
                 'density': False,
                 'fluid_file': None,
+                'use_potential': False,  # Флаг для использования потенциала скорости
             },
             'architecture': {
                 'hidden_layers': [50, 50, 50, 50],
                 'activation': 'tanh',
                 'output_dim': 3,
                 'output_bias': [0.1, 0.0, 0.0],
+                # Для потенциала скорости (output_dim=1)
+                'potential_output_dim': 1,
+                'potential_output_bias': [0.0],
                 # Масштабирование координат для функции активации
                 'coordinate_scaling': {
                     'enabled': False,
@@ -62,12 +66,21 @@ class ConfigManager:
             'pde': {
                 'system': 'incompressible_navier_stokes',
                 'flow_type': '2d',
+                # Параметры для потенциала скорости (system: potential)
+                'potential': {
+                    'U_inf': 1.0,            # Скорость на бесконечности [м/с]
+                    'angle_of_attack': 0.0,  # Угол атаки [градусы]
+                    'boundary_layer_thickness': 0.05,  # Доля хорды для маски пограничного слоя
+                    'uniform_reg_weight': 0.01,  # Вес регуляризации однородного потока
+                },
             },
             'boundary_conditions': {
                 'type': 'soft',
             },
             'loss_weights': {
                 'pde_weights': {'cont': 1.0, 'mom_x': 1.0, 'mom_y': 1.0},
+                # Веса для потенциала скорости (уравнение Лапласа)
+                'laplace_weight': 1.0,
                 'bc_weights': {
                     'inlet': 1.0,
                     'outlet': 1.0,
@@ -76,6 +89,11 @@ class ConfigManager:
                     'axis_symmetry': 1.0,
                     'symmetry_grad': 1.0,
                     'axis_symmetry_grad': 1.0,
+                    # Веса BC для потенциала
+                    'inlet_phi': 100.0,
+                    'wall_phi': 100.0,
+                    'outlet_phi': 10.0,
+                    'symmetry_phi': 10.0,
                 },
                 'adaptive_bc': False,
                 'use_sa_weights': False,

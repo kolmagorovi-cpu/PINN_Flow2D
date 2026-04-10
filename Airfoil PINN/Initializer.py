@@ -11,6 +11,9 @@
     - на стенке скорость обнуляется, на границах симметрии обнуляются соответствующие компоненты
     - добавлена возможность выбора начального поля скорости (constant, linear_x, perturbed)
     - добавлена возможность добавления шума к давлению
+    - добавлена поддержка потенциала скорости (pde_system='potential')
+      * инициализация φ = U_inf * x + шум
+      * сохранение поля phi_norm в выходной массив
 
 Визуализация полей выполняется методом scatter, для SDF отображается физическое расстояние (умножением на chord).
 
@@ -35,7 +38,14 @@ import glob
 import multiprocessing as mp
 from functools import partial
 
-from scipy.spatial import cKDTree
+# Проверка доступности scipy
+try:
+    from scipy.spatial import cKDTree
+    SCIPY_AVAILABLE = True
+except ImportError:
+    cKDTree = None
+    SCIPY_AVAILABLE = False
+
 from type_hints import InitializerMetadataDict
 
 # Импортируем наши модули и классы
@@ -66,7 +76,8 @@ point_dtype = np.dtype([
     ('on_boundary', 'bool'),
     ('p_norm', 'f8'),
     ('u_norm', 'f8'),
-    ('v_norm', 'f8')
+    ('v_norm', 'f8'),
+    ('phi_norm', 'f8')  # Потенциал скорости (для режима potential)
 ])
 
 
@@ -371,7 +382,8 @@ class Initializer:
                           perturbation_amplitude: float = 0.01,
                           velocity_perturbation_amplitude: Optional[float] = None,
                           pressure_perturbation_amplitude: float = 0.0,
-                          num_processes: Optional[int] = None) -> np.ndarray:
+                          num_processes: Optional[int] = None,
+                          pde_system: str = 'incompressible_navier_stokes') -> np.ndarray:
         """
         Инициализирует нормализованные поля.
 
@@ -384,6 +396,7 @@ class Initializer:
             pressure_perturbation_amplitude: относительная амплитуда шума для давления
                                              (доля от динамического напора 0.5*rho*U_inf^2)
             num_processes: количество процессов для параллельного вычисления SDF
+            pde_system: тип PDE системы ('incompressible_navier_stokes' или 'potential')
 
         Returns:
             Нормализованный массив точек.
@@ -400,6 +413,7 @@ class Initializer:
         self.pressure_mode = pressure_mode
         self.velocity_initial_mode = velocity_initial_mode
         self.temperature = temperature
+        self.pde_system = pde_system  # Сохраняем тип PDE системы
 
         if velocity_perturbation_amplitude is not None:
             self.velocity_perturbation_amplitude = velocity_perturbation_amplitude
@@ -423,47 +437,73 @@ class Initializer:
         arr_norm['x_norm'] = self.points['x'] / self.chord
         arr_norm['y_norm'] = self.points['y'] / self.chord
 
-        # --- Генерация начального поля скорости ---
-        x = self.points['x']
-        x_min = np.min(x)
-        x_max = np.max(x)
-        u0 = self.conditions.u
-        v0 = self.conditions.v
+        # --- Инициализация для потенциала скорости ---
+        if pde_system == 'potential':
+            # Для потенциала: φ = U_inf * x + небольшой шум
+            x = self.points['x']
+            phi_amp = 0.1 * self.U_inf * self.chord  # 10% от характерного значения потенциала
+            
+            # Базовое поле: φ = U_inf * x
+            phi_phys = self.conditions.u * x  # U_inf_x * x
+            
+            # Добавляем небольшой случайный шум для разнообразия
+            phi_phys += phi_amp * (2 * np.random.random(N) - 1)
+            
+            # Нормализация потенциала: phi_norm = phi / (U_inf * chord)
+            arr_norm['phi_norm'] = phi_phys / (self.U_inf * self.chord)
+            
+            logger.info(f"Инициализация потенциала: φ = U_inf * x + шум (амплитуда={phi_amp:.3e})")
+            
+            # Для потенциала скорости вычисляются как градиенты φ,
+            # но для совместимости заполняем u, v приближёнными значениями
+            u_phys = np.full(N, self.conditions.u)
+            v_phys = np.full(N, self.conditions.v)
+            
+            # Давление для потенциала не используется, но заполняем для совместимости
+            p_phys = np.zeros(N)
+            
+        else:
+            # --- Генерация начального поля скорости для Навье-Стокса ---
+            x = self.points['x']
+            x_min = np.min(x)
+            x_max = np.max(x)
+            u0 = self.conditions.u
+            v0 = self.conditions.v
 
-        if velocity_initial_mode == 'constant':
-            u_phys = np.full(N, u0)
-            v_phys = np.full(N, v0)
-        elif velocity_initial_mode == 'linear_x':
-            if x_max > x_min:
-                slope = -0.5 * u0 / (x_max - x_min)  # убывание на 50% на длине области
-                u_phys = u0 + slope * (x - x_min)
-                v_phys = np.full(N, v0)
-            else:
+            if velocity_initial_mode == 'constant':
                 u_phys = np.full(N, u0)
                 v_phys = np.full(N, v0)
-        elif velocity_initial_mode == 'perturbed':
-            amp = self.velocity_perturbation_amplitude
-            u_phys = np.full(N, u0) + amp * u0 * (2 * np.random.random(N) - 1)
-            v_phys = np.full(N, v0) + amp * v0 * (2 * np.random.random(N) - 1)
-        else:
-            raise ValueError(f"Неизвестный режим инициализации скорости: {velocity_initial_mode}")
-
-        # --- Давление (базовое распределение) ---
-        if pressure_mode == 'constant':
-            p_phys = np.full(N, self.conditions.inlet_pressure)
-        elif pressure_mode == 'linear_x':
-            if x_max > x_min:
-                slope = (self.conditions.outlet_pressure - self.conditions.inlet_pressure) / (x_max - x_min)
-                p_phys = self.conditions.inlet_pressure + slope * (x - x_min)
+            elif velocity_initial_mode == 'linear_x':
+                if x_max > x_min:
+                    slope = -0.5 * u0 / (x_max - x_min)  # убывание на 50% на длине области
+                    u_phys = u0 + slope * (x - x_min)
+                    v_phys = np.full(N, v0)
+                else:
+                    u_phys = np.full(N, u0)
+                    v_phys = np.full(N, v0)
+            elif velocity_initial_mode == 'perturbed':
+                amp = self.velocity_perturbation_amplitude
+                u_phys = np.full(N, u0) + amp * u0 * (2 * np.random.random(N) - 1)
+                v_phys = np.full(N, v0) + amp * v0 * (2 * np.random.random(N) - 1)
             else:
-                p_phys = np.full(N, self.conditions.inlet_pressure)
-        else:
-            raise ValueError(f"Неизвестный режим давления: {pressure_mode}")
+                raise ValueError(f"Неизвестный режим инициализации скорости: {velocity_initial_mode}")
 
-        # Добавление шума к давлению
-        if self.pressure_perturbation_amplitude > 0:
-            q_ref = 0.5 * self.rho * self.U_inf**2
-            p_phys += self.pressure_perturbation_amplitude * q_ref * (2 * np.random.random(N) - 1)
+            # --- Давление (базовое распределение) ---
+            if pressure_mode == 'constant':
+                p_phys = np.full(N, self.conditions.inlet_pressure)
+            elif pressure_mode == 'linear_x':
+                if x_max > x_min:
+                    slope = (self.conditions.outlet_pressure - self.conditions.inlet_pressure) / (x_max - x_min)
+                    p_phys = self.conditions.inlet_pressure + slope * (x - x_min)
+                else:
+                    p_phys = np.full(N, self.conditions.inlet_pressure)
+            else:
+                raise ValueError(f"Неизвестный режим давления: {pressure_mode}")
+
+            # Добавление шума к давлению
+            if self.pressure_perturbation_amplitude > 0:
+                q_ref = 0.5 * self.rho * self.U_inf**2
+                p_phys += self.pressure_perturbation_amplitude * q_ref * (2 * np.random.random(N) - 1)
 
         # Применяем граничные условия к начальному полю скорости
         if 'boundary_type' in self.points.dtype.names:
@@ -581,6 +621,9 @@ class Initializer:
             'sdf_norm_factor': self.chord,
             'inlet_u_norm': inlet_u_norm,
             'inlet_v_norm': inlet_v_norm,
+            # Добавляем информацию о типе PDE для потенциала
+            'pde_system': getattr(self, 'pde_system', 'incompressible_navier_stokes'),
+            'has_potential': hasattr(self, 'pde_system') and self.pde_system == 'potential',
         }
         meta_path = os.path.join(self.output_dir, f"{description}_metadata.npy")
         np.save(meta_path, meta)

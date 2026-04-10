@@ -1,0 +1,148 @@
+# Конфигурация для этапа 1.1: Потенциал скорости (уравнение Лапласа)
+# Поток вокруг профиля с углом атаки
+
+project_name: potential_flow_airfoil
+
+# Входные параметры
+input_params:
+  coordinates: true
+  sdf: true
+  inlet_velocity: false
+  viscosity: false
+  density: false
+  fluid_file: null
+  use_potential: true  # Включаем режим потенциала скорости
+
+# Архитектура нейросети
+architecture:
+  hidden_layers: [50, 50, 50, 50]
+  activation: tanh
+  output_dim: 3  # Не используется (для обратной совместимости)
+  output_bias: [0.1, 0.0, 0.0]
+  # Параметры для потенциала
+  potential_output_dim: 1  # Один выход: потенциал φ
+  potential_output_bias: [0.0]
+  coordinate_scaling:
+    enabled: true
+    scale_factor: 1.0  # Будет вычислено автоматически
+    input_min: -6.0
+    input_max: 6.0
+
+# PDE система
+pde:
+  system: potential  # Используем потенциал скорости вместо Навье-Стокса
+  flow_type: 2d
+  # Параметры потенциала
+  potential:
+    U_inf: 1.0  # Скорость на бесконечности [м/с]
+    angle_of_attack: 0.0  # Угол атаки [градусы]
+    boundary_layer_thickness: 0.05  # Доля хорды для маски пограничного слоя
+    uniform_reg_weight: 0.01  # Вес регуляризации однородного потока
+
+# Граничные условия
+boundary_conditions:
+  type: soft  # Мягкие граничные условия для начальных экспериментов
+
+# Веса функции потерь
+loss_weights:
+  # Вес для уравнения Лапласа
+  laplace_weight: 1.0
+  
+  # Веса для граничных условий потенциала
+  bc_weights:
+    inlet_phi: 100.0  # Вход: заданная скорость
+    wall_phi: 100.0  # Стенка: непротекание
+    outlet_phi: 10.0  # Выход: естественное условие
+    symmetry_phi: 10.0  # Симметрия
+  
+  # Стандартные веса (не используются для потенциала)
+  pde_weights:
+    cont: 1.0
+    mom_x: 1.0
+    mom_y: 1.0
+  adaptive_bc: false
+  use_sa_weights: false
+  sa_apply_to_bc: false
+  integral_condition: false
+  integral_weight: 0.0
+
+# Обучение
+training:
+  two_stage: false
+  stage1_epochs: 100
+  stage2_pde_weight_start: 1.0
+  stage2_pde_weight_end: 100000.0
+  stage2_ramp_epochs: 500
+  lr_schedule: constant
+  lr_cyclic_period: 100
+  lr_cyclic_amplitude: 0.5
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  reset_interval: 0
+  reset_noise: 0.01
+  grad_clip: null
+  rar_enable: false
+  rar_interval: 100
+  rar_num_points: 200
+  switch_to_lbfgs_epoch: 0
+  lbfgs_max_iter: 20
+  lbfgs_history_size: 100
+  batch_size: 1000  # Больший размер батча для потенциала
+  gradient_accumulation_steps: 1
+  epochs: 5000  # Больше эпох для сходимости потенциала
+  early_stopping:
+    enabled: false
+    patience: 100
+    min_delta: 1.0e-06
+    restore_best: true
+
+# Вывод
+output:
+  console_only: true
+  graphical_window:
+    loss: true
+    pde: true
+    bc: false
+  plot_frequency: 10
+
+# Чекпоинты
+checkpoint:
+  interval: 500
+  name_pattern: '{project_name}_{timestamp}'
+  model_name_pattern: '{project_name}_{timestamp}'
+
+# Процесс
+process:
+  load_model_path: null
+  device: auto
+  num_gpus: 1
+  dtype: float32
+  use_amp: false
+  seed: 42
+
+# Данные
+data:
+  points_file: null  # Укажите путь к файлу с точками
+
+# Эталонное решение (для валидации)
+reference:
+  path: null
+
+# Диагностика
+diagnostics:
+  interval: 50
+  plot_residual_map: true
+  plot_profiles: true
+  profile_sections: [0.2, 0.5, 0.8]
+  plot_spectrum: true
+  spectrum_section_x: 0.5
+  plot_2d_spectrum: false
+  spectrum_2d_resolution: 256
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  save_rar_history: true
+
+# Клавиатурный слушатель
+enable_key_listener: true
+checkpoint_dir: Checkpoints

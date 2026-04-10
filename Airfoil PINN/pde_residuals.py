@@ -137,3 +137,144 @@ class PDEResiduals:
         mom_z = (u * v_r + v * v_z + (1.0 / rho) * p_z - nu * laplacian_v) ** 2
 
         return {'cont': cont, 'mom_r': mom_r, 'mom_z': mom_z}
+
+    @staticmethod
+    def compute_residuals_potential(
+        phi: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        grad_fn: Callable = None
+    ) -> dict:
+        """
+        Вычисляет невязки для уравнения Лапласа (потенциал скорости).
+
+        Уравнение:
+            ∇²φ = ∂²φ/∂x² + ∂²φ/∂y² = 0
+
+        Скорости вычисляются как:
+            u = ∂φ/∂x
+            v = ∂φ/∂y
+
+        Args:
+            phi: потенциал скорости (тензор с requires_grad=True)
+            x, y: координаты (тензоры с requires_grad=True)
+            grad_fn: функция градиента (например, safe_grad). 
+                    Если None, используется torch.autograd.grad напрямую.
+
+        Returns:
+            словарь с ключами:
+                'laplace': квадрат невязки уравнения Лапласа (∇²φ)²
+                'u': скорость по x (∂φ/∂x)
+                'v': скорость по y (∂φ/∂y)
+                'phi_xx': ∂²φ/∂x² (для диагностики)
+                'phi_yy': ∂²φ/∂y² (для диагностики)
+        """
+        # Используем torch.autograd.grad напрямую для точного вычисления производных
+        grad_outputs = torch.ones_like(phi)
+        
+        # Первые производные (скорости)
+        phi_x = torch.autograd.grad(
+            phi, x, grad_outputs=grad_outputs, 
+            create_graph=True, retain_graph=True
+        )[0]  # u = ∂φ/∂x
+        
+        phi_y = torch.autograd.grad(
+            phi, y, grad_outputs=grad_outputs, 
+            create_graph=True, retain_graph=True
+        )[0]  # v = ∂φ/∂y
+
+        # Вторые производные для Лапласиана
+        phi_xx = torch.autograd.grad(
+            phi_x, x, grad_outputs=torch.ones_like(phi_x), 
+            create_graph=True, retain_graph=True
+        )[0]
+        
+        phi_yy = torch.autograd.grad(
+            phi_y, y, grad_outputs=torch.ones_like(phi_y), 
+            create_graph=False, retain_graph=False
+        )[0]
+
+        # Уравнение Лапласа: ∇²φ = phi_xx + phi_yy = 0
+        laplace = (phi_xx + phi_yy) ** 2
+
+        return {
+            'laplace': laplace,
+            'u': phi_x,
+            'v': phi_y,
+            'phi_xx': phi_xx,  # Для диагностики
+            'phi_yy': phi_yy   # Для диагностики
+        }
+
+    @staticmethod
+    def compute_pressure_from_potential(
+        phi: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        U_inf: float,
+        p_inf: float,
+        rho: float,
+        create_graph: bool = False
+    ) -> dict:
+        """
+        Вычисляет давление из потенциала скорости по уравнению Бернулли.
+
+        Уравнение Бернулли для несжимаемой жидкости:
+            p = p_inf + 0.5 * rho * (U_inf² - |V|²)
+        где |V|² = u² + v², u = ∂φ/∂x, v = ∂φ/∂y
+
+        Args:
+            phi: потенциал скорости (тензор с requires_grad=True)
+            x, y: координаты (тензоры с requires_grad=True)
+            U_inf: характерная скорость на бесконечности [м/с]
+            p_inf: давление на бесконечности [Па]
+            rho: плотность жидкости [кг/м³]
+            create_graph: если True, создаётся граф для обратного распространения
+                         (используется для обучения, False - для визуализации)
+
+        Returns:
+            словарь с ключами:
+                'pressure': поле давления p [Па]
+                'u': скорость по x [м/с]
+                'v': скорость по y [м/с]
+                'velocity_squared': |V|² = u² + v²
+                'dynamic_pressure': q = 0.5 * rho * |V|²
+                'pressure_coefficient': Cp = (p - p_inf) / (0.5 * rho * U_inf²)
+
+        Note:
+            На этапе 1.1 давление используется только для визуализации.
+            На этапах 1.2–1.3 может войти в функцию потерь.
+        """
+        # Вычисляем скорости через градиенты потенциала
+        grad_outputs = torch.ones_like(phi)
+
+        u = torch.autograd.grad(
+            phi, x, grad_outputs=grad_outputs,
+            create_graph=create_graph, retain_graph=True
+        )[0]
+
+        v = torch.autograd.grad(
+            phi, y, grad_outputs=grad_outputs,
+            create_graph=create_graph, retain_graph=False
+        )[0]
+
+        # Квадрат модуля скорости
+        velocity_squared = u**2 + v**2
+
+        # Давление по уравнению Бернулли
+        # p = p_inf + 0.5 * rho * (U_inf² - |V|²)
+        dynamic_pressure = 0.5 * rho * velocity_squared
+        pressure = p_inf + 0.5 * rho * (U_inf**2 - velocity_squared)
+
+        # Коэффициент давления Cp
+        # Cp = (p - p_inf) / (0.5 * rho * U_inf²) = 1 - |V|²/U_inf²
+        q_inf = 0.5 * rho * U_inf**2
+        pressure_coefficient = (pressure - p_inf) / q_inf
+
+        return {
+            'pressure': pressure,
+            'u': u,
+            'v': v,
+            'velocity_squared': velocity_squared,
+            'dynamic_pressure': dynamic_pressure,
+            'pressure_coefficient': pressure_coefficient
+        }

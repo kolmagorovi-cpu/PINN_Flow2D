@@ -14,6 +14,7 @@
 """
 
 import torch
+import numpy as np
 import logging
 from typing import Dict, List, Optional, Tuple
 
@@ -27,6 +28,9 @@ class LossComputer:
     """
     Вычисляет все компоненты функции потерь для PINN.
     Инкапсулирует логику, связанную с PDE, граничными условиями и интегральными условиями.
+    Поддерживает два режима:
+      - Навье-Стокс (u, v, p)
+      - Потенциал скорости (phi), u = ∂φ/∂x, v = ∂φ/∂y
     """
 
     def __init__(
@@ -60,8 +64,23 @@ class LossComputer:
         self.dtype = dtype
 
         # Параметры из конфигурации
-        self.flow_type = config['pde']['flow_type']
+        self.pde_system = config['pde'].get('system', 'incompressible_navier_stokes')
+        self.flow_type = config['pde'].get('flow_type', '2d')
         self.bc_type = config['boundary_conditions']['type']  # 'soft' или 'hard'
+        
+        # Параметры для потенциала скорости
+        self.use_potential = self.pde_system == 'potential'
+        if self.use_potential:
+            potential_cfg = config['pde'].get('potential', {})
+            self.U_inf = potential_cfg.get('U_inf', 1.0)
+            self.angle_of_attack = potential_cfg.get('angle_of_attack', 0.0)
+            self.boundary_layer_thickness = potential_cfg.get('boundary_layer_thickness', 0.05)
+            self.uniform_reg_weight = potential_cfg.get('uniform_reg_weight', 0.01)
+            # Вычисляем компоненты скорости на бесконечности
+            angle_rad = np.radians(self.angle_of_attack)
+            self.U_inf_x = self.U_inf * np.cos(angle_rad)
+            self.U_inf_y = self.U_inf * np.sin(angle_rad)
+        
         self.pde_components = self._setup_pde_components()
 
         # Веса потерь
@@ -96,7 +115,9 @@ class LossComputer:
 
     def _setup_pde_components(self) -> List[str]:
         """Возвращает список названий компонент PDE в зависимости от типа течения."""
-        if self.flow_type == 'axisymmetric':
+        if self.use_potential:
+            return ['laplace']
+        elif self.flow_type == 'axisymmetric':
             return ['cont', 'mom_r', 'mom_z']
         else:
             return ['cont', 'mom_x', 'mom_y']
@@ -114,16 +135,24 @@ class LossComputer:
     ) -> Dict[str, torch.Tensor]:
         """
         Вычисляет невязки PDE (квадраты) для заданных полей.
+        Для потенциала: принимает phi как u, игнорирует v и p.
 
         Args:
-            u, v, p: поля скорости и давления (тензоры с requires_grad)
+            u: для НС - скорость по x, для потенциала - потенциал φ
+            v: для НС - скорость по y, для потенциала - игнорируется
+            p: для НС - давление, для потенциала - игнорируется
             x, y: координаты (тензоры с requires_grad)
 
         Returns:
             словарь с ключами, соответствующими self.pde_components,
             значениями – тензоры невязок той же формы, что и входные поля.
         """
-        if self.flow_type == 'axisymmetric':
+        if self.use_potential:
+            # u здесь - это потенциал φ
+            return PDEResiduals.compute_residuals_potential(
+                u, x, y, safe_grad
+            )
+        elif self.flow_type == 'axisymmetric':
             return PDEResiduals.compute_residuals_axisymmetric(
                 u, v, p, x, y, self.rho_norm, self.mu_norm, safe_grad, self.eps_axi
             )
@@ -142,17 +171,23 @@ class LossComputer:
         p: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
         x: torch.Tensor,
-        y: torch.Tensor
+        y: torch.Tensor,
+        sdf: Optional[torch.Tensor] = None
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Вычисляет потери на границах для soft boundary conditions.
         Возвращает словарь потерь по каждому типу границы и дополнительную
         потерю от градиентов на симметрии (symmetry_grad, axis_symmetry_grad).
+        
+        Для потенциала скорости используются специальные граничные условия.
 
         Args:
-            u, v, p: поля скорости и давления
+            u: для НС - скорость по x, для потенциала - потенциал φ
+            v: для НС - скорость по y, для потенциала - игнорируется
+            p: для НС - давление, для потенциала - игнорируется
             boundary_types: one-hot тензор типов границ (или None)
             x, y: координаты
+            sdf: нормализованное расстояние до стенки (для регуляризации потенциала)
 
         Returns:
             bc_comp: словарь {имя_границы: тензор потерь (скаляр)}
@@ -161,6 +196,9 @@ class LossComputer:
         if self.bc_type == 'hard' or boundary_types is None:
             # Для hard границ потери не вычисляются
             return {}, torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        if self.use_potential:
+            return self._compute_potential_bc_loss(u, v, p, boundary_types, x, y, sdf)
 
         bc_comp = {name: torch.tensor(0.0, device=self.device, dtype=self.dtype)
                    for name in self.data_handler.boundary_type_names}
@@ -208,6 +246,147 @@ class LossComputer:
                 dv_dr_full = safe_grad(v, x, silent=False)
                 dv_dr = dv_dr_full[mask]
                 extra_grad += self.loss_weights.get('axis_symmetry_grad', 10.0) * torch.mean(dv_dr ** 2)
+
+        return bc_comp, extra_grad
+
+    # ------------------------------------------------------------------
+    # Граничные условия для потенциала скорости
+    # ------------------------------------------------------------------
+    def _compute_potential_bc_loss(
+        self,
+        phi: torch.Tensor,
+        v_unused: torch.Tensor,
+        p_unused: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sdf: Optional[torch.Tensor] = None
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        Вычисляет потери на границах для потенциала скорости.
+        
+        Граничные условия:
+          - inlet: ∂φ/∂x = U_inf_x, ∂φ/∂y = U_inf_y (заданная скорость)
+          - wall: ∂φ/∂n = 0 (непротекание, нормальная производная = 0)
+          - outlet: ∂φ/∂n = 0 (естественное условие)
+          - symmetry: ∂φ/∂n = 0 (симметрия)
+        
+        Дополнительно: регуляризация вдали от стенки (стремление к однородному потоку)
+
+        Args:
+            phi: потенциал скорости φ
+            v_unused, p_unused: игнорируются
+            boundary_types: one-hot тензор типов границ
+            x, y: координаты
+            sdf: нормализованное расстояние до стенки
+
+        Returns:
+            bc_comp: словарь {имя_границы: тензор потерь}
+            extra_grad: дополнительная потеря (регуляризация)
+        """
+        bc_comp = {}
+        extra_grad = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        
+        if boundary_types is None:
+            return bc_comp, extra_grad
+
+        # Вычисляем градиенты потенциала (скорости)
+        phi_x = safe_grad(phi, x)  # u = ∂φ/∂x
+        phi_y = safe_grad(phi, y)  # v = ∂φ/∂y
+
+        for name in self.data_handler.boundary_type_names:
+            idx = self.data_handler.boundary_type_names.index(name)
+            mask = boundary_types[:, idx].view(-1, 1) > 0.5
+            if mask.sum() == 0:
+                continue
+
+            bc_key = f'{name}_phi'
+            
+            if name == 'inlet':
+                # На входе: скорость должна равняться U_inf
+                # (∂φ/∂x - U_inf_x)² + (∂φ/∂y - U_inf_y)²
+                u_in = phi_x[mask]
+                v_in = phi_y[mask]
+                bc_comp[bc_key] = (
+                    torch.mean((u_in - self.U_inf_x) ** 2) +
+                    torch.mean((v_in - self.U_inf_y) ** 2)
+                )
+
+            elif name == 'wall':
+                # На стенке: непротекание, ∂φ/∂n = 0
+                # Нормаль вычисляется через градиент SDF: n = ∇SDF / |∇SDF|
+                # ∂φ/∂n = ∇φ · n = (∂φ/∂x * n_x + ∂φ/∂y * n_y)
+                
+                u_w = phi_x[mask]
+                v_w = phi_y[mask]
+                
+                # Если есть SDF, вычисляем точную нормаль
+                if sdf is not None:
+                    # Градиент SDF даёт нормаль
+                    sdf_x = safe_grad(sdf, x)
+                    sdf_y = safe_grad(sdf, y)
+                    
+                    # Нормализуем: n = (sdf_x, sdf_y) / |(sdf_x, sdf_y)|
+                    grad_norm = torch.sqrt(sdf_x[mask]**2 + sdf_y[mask]**2) + 1e-8
+                    n_x = sdf_x[mask] / grad_norm
+                    n_y = sdf_y[mask] / grad_norm
+                    
+                    # ∂φ/∂n = ∇φ · n
+                    dphi_dn = u_w * n_x + v_w * n_y
+                    bc_comp[bc_key] = torch.mean(dphi_dn ** 2)
+                else:
+                    # Если SDF нет, используем приближение: |∇φ|² = 0
+                    bc_comp[bc_key] = torch.mean(u_w ** 2) + torch.mean(v_w ** 2)
+
+            elif name == 'outlet':
+                # На выходе: естественное условие, ∂φ/∂n = 0
+                # Если есть SDF, используем его для вычисления нормали
+                # Иначе приближённо считаем, что нормаль направлена по x
+                u_out = phi_x[mask]
+                
+                if sdf is not None and self.flow_type != 'axisymmetric':
+                    # Вычисляем нормаль через SDF
+                    sdf_x = safe_grad(sdf, x)
+                    sdf_y = safe_grad(sdf, y)
+                    grad_norm = torch.sqrt(sdf_x[mask]**2 + sdf_y[mask]**2) + 1e-8
+                    n_x = sdf_x[mask] / grad_norm
+                    n_y = sdf_y[mask] / grad_norm
+                    
+                    v_out = phi_y[mask]
+                    dphi_dn = u_out * n_x + v_out * n_y
+                    bc_comp[bc_key] = torch.mean(dphi_dn ** 2)
+                else:
+                    # Приближённо: ∂φ/∂x = 0
+                    bc_comp[bc_key] = torch.mean(u_out ** 2)
+
+            elif name == 'symmetry':
+                # На симметрии: ∂φ/∂n = 0 (нормальная компонента = 0)
+                # Для горизонтальной симметрии: v = ∂φ/∂y = 0
+                v_sym = phi_y[mask]
+                bc_comp[bc_key] = torch.mean(v_sym ** 2)
+                # Дополнительно: du/dy = 0 на линии симметрии
+                du_dy_full = safe_grad(phi_x, y, silent=False)
+                du_dy = du_dy_full[mask]
+                extra_grad += self.loss_weights.get('symmetry_grad', 10.0) * torch.mean(du_dy ** 2)
+
+            elif name == 'axis_symmetry':
+                # На оси симметрии: u = ∂φ/∂x = 0 (радиальная скорость = 0)
+                u_ax = phi_x[mask]
+                bc_comp[bc_key] = torch.mean(u_ax ** 2)
+
+        # Регуляризация: стремление к однородному потоку вдали от стенки
+        # Используется маска по SDF: точки с sdf > boundary_layer_thickness
+        if sdf is not None and self.uniform_reg_weight > 0:
+            # Создаём маску для точек вдали от пограничного слоя
+            bl_mask = sdf.view(-1) > self.boundary_layer_thickness
+            if bl_mask.sum() > 0:
+                u_far = phi_x[bl_mask]
+                v_far = phi_y[bl_mask]
+                uniform_loss = (
+                    torch.mean((u_far - self.U_inf_x) ** 2) +
+                    torch.mean((v_far - self.U_inf_y) ** 2)
+                )
+                extra_grad += self.uniform_reg_weight * uniform_loss
 
         return bc_comp, extra_grad
 

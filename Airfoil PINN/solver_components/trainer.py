@@ -135,7 +135,7 @@ class Trainer:
         idx = idx.to(self.device)
         x = x.to(self.device, dtype=self.dtype).requires_grad_(True)
         y = y.to(self.device, dtype=self.dtype).requires_grad_(True)
-        sdf = sdf.to(self.device, dtype=self.dtype)
+        sdf = sdf.to(self.device, dtype=self.dtype).requires_grad_(True)  # Нужны градиенты для нормалей
 
         if bt.shape[1] > 0:
             bt = bt.to(self.device, dtype=self.dtype)
@@ -154,74 +154,130 @@ class Trainer:
 
         # Прямой проход модели
         out = self.model(input_tensor)
-        u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
-
-        # Применение жёстких граничных условий (если необходимо)
-        if self.loss_computer.bc_type == 'hard':
-            u, v, p = self.loss_computer.apply_hard_constraints(
-                u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
-            )
+        
+        # Обработка выхода модели в зависимости от типа PDE
+        if self.loss_computer.use_potential:
+            # Для потенциала: out[:, 0:1] - это φ
+            # Скорости вычисляются через градиенты потенциала
+            phi = out[:, 0:1]
+            # Вычисляем скорости как градиенты потенциала
+            u = safe_grad(phi, x)  # u = ∂φ/∂x
+            v = safe_grad(phi, y)  # v = ∂φ/∂y
+            # Для совместимости создаём фиктивное давление
+            p = torch.zeros_like(phi)
+            u_raw, v_raw, p_raw = u, v, p
         else:
-            u, v, p = u_raw, v_raw, p_raw
+            u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+
+            # Применение жёстких граничных условий (если необходимо)
+            if self.loss_computer.bc_type == 'hard':
+                u, v, p = self.loss_computer.apply_hard_constraints(
+                    u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                )
+            else:
+                u, v, p = u_raw, v_raw, p_raw
 
         # Вычисление невязок PDE
         res = self.loss_computer.compute_pde_residuals(u, v, p, x, y)
-        cont = res['cont']
-        mom1 = res[self.loss_computer.pde_components[1]]
-        mom2 = res[self.loss_computer.pde_components[2]]
+        
+        if self.loss_computer.use_potential:
+            # Для потенциала только одна компонента - laplace
+            laplace = res['laplace']
+            
+            # Сохраняем невязки для RAR (открепляем от графа)
+            laplace_res = laplace.detach().cpu()
+            total_res = laplace_res.flatten()
 
-        # Сохраняем невязки для RAR (открепляем от графа)
-        cont_res = cont.detach().cpu()
-        mom1_res = mom1.detach().cpu()
-        mom2_res = mom2.detach().cpu()
-        total_res = cont_res + mom1_res + mom2_res
+            # Обновляем скользящее среднее невязки для RAR
+            alpha = 0.9
+            self.point_residual[idx.cpu()] = alpha * self.point_residual[idx.cpu()] + (1 - alpha) * total_res
+            # Обновляем максимальную невязку (для карты)
+            self.max_residual[idx.cpu()] = torch.max(self.max_residual[idx.cpu()], total_res)
 
-        # Обновляем скользящее среднее невязки для RAR
-        alpha = 0.9
-        self.point_residual[idx.cpu()] = alpha * self.point_residual[idx.cpu()] + (1 - alpha) * total_res.flatten()
-        # Обновляем максимальную невязку (для карты)
-        self.max_residual[idx.cpu()] = torch.max(self.max_residual[idx.cpu()], total_res.flatten())
+            # Средние и максимальные значения для отчёта
+            pde_raw = {
+                'laplace': laplace.mean().item(),
+            }
+            pde_max = {
+                'laplace': laplace.max().item(),
+            }
 
-        # Средние и максимальные значения для отчёта
-        pde_raw = {
-            'cont': cont.mean().item(),
-            self.loss_computer.pde_components[1]: mom1.mean().item(),
-            self.loss_computer.pde_components[2]: mom2.mean().item()
-        }
-        pde_max = {
-            'cont': cont.max().item(),
-            self.loss_computer.pde_components[1]: mom1.max().item(),
-            self.loss_computer.pde_components[2]: mom2.max().item()
-        }
-
-        # Взвешивание PDE с учётом SA-весов (если используются)
-        if self.sa_weights is not None:
-            w = self.sa_weights()[idx]
-            if self.loss_computer.sa_apply_to_bc:
-                w_pde = w[:, :3]
-                w_bc = w[:, 3:]
+            # Взвешивание PDE с учётом SA-весов (если используются)
+            if self.sa_weights is not None:
+                w = self.sa_weights()[idx]
+                if self.loss_computer.sa_apply_to_bc:
+                    w_pde = w[:, :1]  # Только одна компонента для потенциала
+                    w_bc = w[:, 1:]
+                else:
+                    w_pde = w
+                    w_bc = None
+                loss_laplace = torch.mean(w_pde[:, 0] * laplace)
             else:
-                w_pde = w
+                loss_laplace = torch.mean(laplace)
                 w_bc = None
-            loss_c = torch.mean(w_pde[:, 0] * cont)
-            loss_1 = torch.mean(w_pde[:, 1] * mom1)
-            loss_2 = torch.mean(w_pde[:, 2] * mom2)
-        else:
-            loss_c = torch.mean(cont)
-            loss_1 = torch.mean(mom1)
-            loss_2 = torch.mean(mom2)
-            w_bc = None
 
-        # PDE потеря с учётом весов из конфигурации
-        pde_loss = pde_mult * (
-            self.loss_computer.loss_weights['cont'] * loss_c +
-            self.loss_computer.loss_weights[self.loss_computer.pde_components[1]] * loss_1 +
-            self.loss_computer.loss_weights[self.loss_computer.pde_components[2]] * loss_2
+            # PDE потеря с учётом весов из конфигурации
+            pde_loss = pde_mult * (
+                self.loss_computer.loss_weights.get('laplace_weight', 1.0) * loss_laplace
+            )
+        else:
+            # Оригинальная логика для Навье-Стокса
+            cont = res['cont']
+            mom1 = res[self.loss_computer.pde_components[1]]
+            mom2 = res[self.loss_computer.pde_components[2]]
+
+            # Сохраняем невязки для RAR (открепляем от графа)
+            cont_res = cont.detach().cpu()
+            mom1_res = mom1.detach().cpu()
+            mom2_res = mom2.detach().cpu()
+            total_res = cont_res + mom1_res + mom2_res
+
+            # Обновляем скользящее среднее невязки для RAR
+            alpha = 0.9
+            self.point_residual[idx.cpu()] = alpha * self.point_residual[idx.cpu()] + (1 - alpha) * total_res.flatten()
+            # Обновляем максимальную невязку (для карты)
+            self.max_residual[idx.cpu()] = torch.max(self.max_residual[idx.cpu()], total_res.flatten())
+
+            # Средние и максимальные значения для отчёта
+            pde_raw = {
+                'cont': cont.mean().item(),
+                self.loss_computer.pde_components[1]: mom1.mean().item(),
+                self.loss_computer.pde_components[2]: mom2.mean().item()
+            }
+            pde_max = {
+                'cont': cont.max().item(),
+                self.loss_computer.pde_components[1]: mom1.max().item(),
+                self.loss_computer.pde_components[2]: mom2.max().item()
+            }
+
+            # Взвешивание PDE с учётом SA-весов (если используются)
+            if self.sa_weights is not None:
+                w = self.sa_weights()[idx]
+                if self.loss_computer.sa_apply_to_bc:
+                    w_pde = w[:, :3]
+                    w_bc = w[:, 3:]
+                else:
+                    w_pde = w
+                    w_bc = None
+                loss_c = torch.mean(w_pde[:, 0] * cont)
+                loss_1 = torch.mean(w_pde[:, 1] * mom1)
+                loss_2 = torch.mean(w_pde[:, 2] * mom2)
+            else:
+                loss_c = torch.mean(cont)
+                loss_1 = torch.mean(mom1)
+                loss_2 = torch.mean(mom2)
+                w_bc = None
+
+            # PDE потеря с учётом весов из конфигурации
+            pde_loss = pde_mult * (
+                self.loss_computer.loss_weights['cont'] * loss_c +
+                self.loss_computer.loss_weights[self.loss_computer.pde_components[1]] * loss_1 +
+                self.loss_computer.loss_weights[self.loss_computer.pde_components[2]] * loss_2
         )
 
         # Граничные условия (только для soft)
         if self.loss_computer.bc_type == 'soft':
-            bc_comp, extra_grad = self.loss_computer.compute_bc_loss(u, v, p, bt, x, y)
+            bc_comp, extra_grad = self.loss_computer.compute_bc_loss(u, v, p, bt, x, y, sdf)
             bc_loss = sum(
                 self.loss_computer.loss_weights.get(name, 0.0) * bc_comp[name]
                 for name in bc_comp
@@ -245,12 +301,34 @@ class Trainer:
 
         # Средняя скорость на стенке (для мониторинга)
         wall_speed = None
-        if self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp['wall'] > 0 and bt is not None:
+        if self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp.get('wall_phi', 0) > 0 and bt is not None:
             wall_idx = self.data_handler.boundary_type_names.index('wall')
             u_wall = u[bt[:, wall_idx] > 0.5]
             v_wall = v[bt[:, wall_idx] > 0.5]
             if len(u_wall) > 0:
                 wall_speed = torch.sqrt(u_wall**2 + v_wall**2).mean().item()
+        elif self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp.get('wall', 0) > 0 and bt is not None:
+            wall_idx = self.data_handler.boundary_type_names.index('wall')
+            u_wall = u[bt[:, wall_idx] > 0.5]
+            v_wall = v[bt[:, wall_idx] > 0.5]
+            if len(u_wall) > 0:
+                wall_speed = torch.sqrt(u_wall**2 + v_wall**2).mean().item()
+
+        # Формируем возвращаемые компоненты потерь
+        if self.loss_computer.use_potential:
+            loss_components = {
+                'laplace': loss_laplace,
+                'bc': bc_loss,
+                'integral': integral_loss
+            }
+        else:
+            loss_components = {
+                'cont': loss_c,
+                'mom1': loss_1,
+                'mom2': loss_2,
+                'bc': bc_loss,
+                'integral': integral_loss
+            }
 
         return {
             'total': total_loss,
@@ -261,13 +339,7 @@ class Trainer:
             'integral_loss': integral_loss.item() if torch.is_tensor(integral_loss) else integral_loss,
             'wall_speed': wall_speed,
             # Возвращаем отдельные тензоры потерь для градиентного анализа
-            'loss_components': {
-                'cont': loss_c,
-                'mom1': loss_1,
-                'mom2': loss_2,
-                'bc': bc_loss,          # теперь всегда тензор
-                'integral': integral_loss
-            },
+            'loss_components': loss_components,
             'u': u.detach(),  # для профилей и спектров
             'v': v.detach(),
             'x': x.detach(),
@@ -287,7 +359,10 @@ class Trainer:
         fwd = self.forward_pass(batch)
 
         # Извлекаем компоненты потерь (уже тензоры)
-        loss_pde = fwd['loss_components']['cont'] + fwd['loss_components']['mom1'] + fwd['loss_components']['mom2']
+        if self.loss_computer.use_potential:
+            loss_pde = fwd['loss_components']['laplace']
+        else:
+            loss_pde = fwd['loss_components']['cont'] + fwd['loss_components']['mom1'] + fwd['loss_components']['mom2']
         loss_bc = fwd['loss_components']['bc']
         # Интегральная потеря не включается в раздельные градиенты
 
@@ -317,13 +392,15 @@ class Trainer:
         """
         Возвращает предсказания модели на всём датасете.
         Учитывает hard constraints, если они используются.
-        Возвращает словарь с ключами 'x', 'y', 'u', 'v', 'p' (физические единицы).
+        Для потенциала: вычисляет скорости через градиенты.
+        Возвращает словарь с ключами 'x', 'y', 'u', 'v', 'p', 'phi' (физические единицы).
         """
         self.model.eval()
         dataloader = self.data_handler.get_dataloader()
         all_u = []
         all_v = []
         all_p = []
+        all_phi = []
         all_x = []
         all_y = []
 
@@ -340,21 +417,43 @@ class Trainer:
 
                 input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
                 out = self.model(input_tensor)
-                u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
-
-                # Применяем hard constraints, если нужно
-                if self.loss_computer.bc_type == 'hard':
-                    mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
-                    mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
-                    mask_p = mask_p.to(self.device, dtype=torch.bool).view(-1, 1)
-                    u_bc = u_bc.to(self.device, dtype=self.dtype).view(-1, 1)
-                    v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
-                    p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
-                    u, v, p = self.loss_computer.apply_hard_constraints(
-                        u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
-                    )
+                
+                if self.loss_computer.use_potential:
+                    # Для потенциала: out[:, 0:1] - это φ
+                    phi = out[:, 0:1]
+                    # Скорости вычисляются через градиенты потенциала
+                    # Для inference используем численные градиенты или safe_grad без retains_grad
+                    from utils import safe_grad
+                    # Требуем градиенты для вычисления скоростей
+                    x_grad = x.clone().requires_grad_(True)
+                    y_grad = y.clone().requires_grad_(True)
+                    
+                    # Пересчитываем выход с градиентами
+                    input_tensor_grad = self.loss_computer.build_input_tensor(x_grad, y_grad, sdf, bt)
+                    out_grad = self.model(input_tensor_grad)
+                    phi_grad = out_grad[:, 0:1]
+                    
+                    u = safe_grad(phi_grad, x_grad)
+                    v = safe_grad(phi_grad, y_grad)
+                    p = torch.zeros_like(phi_grad)
+                    
+                    all_phi.append(phi_grad.cpu().numpy().flatten())
                 else:
-                    u, v, p = u_raw, v_raw, p_raw
+                    u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+
+                    # Применяем hard constraints, если нужно
+                    if self.loss_computer.bc_type == 'hard':
+                        mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
+                        mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
+                        mask_p = mask_p.to(self.device, dtype=torch.bool).view(-1, 1)
+                        u_bc = u_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        u, v, p = self.loss_computer.apply_hard_constraints(
+                            u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                        )
+                    else:
+                        u, v, p = u_raw, v_raw, p_raw
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -368,6 +467,11 @@ class Trainer:
         u_np = np.concatenate(all_u)
         v_np = np.concatenate(all_v)
         p_np = np.concatenate(all_p)
+        
+        if self.loss_computer.use_potential:
+            phi_np = np.concatenate(all_phi)
+        else:
+            phi_np = np.zeros_like(u_np)
 
         # Переводим в физические единицы
         chord = self.data_handler.chord
@@ -380,7 +484,8 @@ class Trainer:
             'y': y_np * chord,
             'u': u_np * U_inf,
             'v': v_np * U_inf,
-            'p': p_np * p_dyn
+            'p': p_np * p_dyn,
+            'phi': phi_np * U_inf * chord  # Потенциал имеет размерность [м²/с]
         }
 
     # ------------------------------------------------------------------

@@ -31,7 +31,7 @@ import numpy as np
 
 from utils import check_memory_usage, set_seed
 from data_handler import DataHandler
-from models import PINNIncompressible, SelfAdaptiveWeights
+from models import PINNIncompressible, PotentialPINN, SelfAdaptiveWeights
 from checkpoint import CheckpointManager
 from key_listener import KeyListener
 from visualizer import Visualizer
@@ -63,6 +63,9 @@ class PINNSolver:
         self.config = config
         self.config_name = config.get('project_name', 'unnamed')
         self.experiment_dir = experiment_dir
+        
+        # Фиксируем timestamp ОДИН раз при инициализации (для имени папки)
+        self._timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
         # Установка seed
         seed = config.get('process', {}).get('seed', 42)
@@ -247,9 +250,23 @@ class PINNSolver:
     def _init_device(self, proc: Dict) -> torch.device:
         dev = proc['device']
         if dev == 'auto':
-            return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            # Принудительный выбор CUDA: если доступен — используем GPU
+            if torch.cuda.is_available():
+                device = torch.device('cuda:0')
+                logger.info(f"Выбрано устройство: {device} ({torch.cuda.get_device_name(0)})")
+                return device
+            else:
+                # CUDA недоступна — выводим критическое предупреждение, но не падаем
+                logger.warning("⚠️ CUDA недоступна! Режим 'auto' переключается на CPU.")
+                logger.warning("Для обучения на GPU установите CUDA и PyTorch с поддержкой CUDA.")
+                return torch.device('cpu')
         elif dev == 'cuda':
-            return torch.device('cuda:0')
+            if not torch.cuda.is_available():
+                logger.error("❌ Выбран режим 'cuda', но CUDA недоступна!")
+                raise RuntimeError("CUDA недоступна. Проверьте установку CUDA и драйверов GPU.")
+            device = torch.device('cuda:0')
+            logger.info(f"Выбрано устройство: {device} ({torch.cuda.get_device_name(0)})")
+            return device
         else:
             return torch.device(dev)
 
@@ -273,15 +290,32 @@ class PINNSolver:
         
         # Получаем параметры масштабирования координат
         coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0})
-
-        return PINNIncompressible(
-            input_dim=actual_input_dim,
-            layers=arch['hidden_layers'],
-            activation=arch.get('activation', 'tanh'),
-            output_dim=arch['output_dim'],
-            output_bias=arch['output_bias'],
-            coordinate_scaling=coord_scaling
-        )
+        
+        # Определяем тип модели в зависимости от PDE системы
+        pde_system = self.config['pde'].get('system', 'incompressible_navier_stokes')
+        
+        if pde_system == 'potential':
+            # Для потенциала используем новый класс PotentialPINN
+            output_bias = arch.get('potential_output_bias', [0.0])[0]
+            return PotentialPINN(
+                input_dim=actual_input_dim,
+                layers=arch['hidden_layers'],
+                activation=arch.get('activation', 'tanh'),
+                output_bias=output_bias,
+                coordinate_scaling=coord_scaling
+            )
+        else:
+            # Для Навье-Стокса используем обычный класс
+            output_dim = arch['output_dim']
+            output_bias = arch['output_bias']
+            return PINNIncompressible(
+                input_dim=actual_input_dim,
+                layers=arch['hidden_layers'],
+                activation=arch.get('activation', 'tanh'),
+                output_dim=output_dim,
+                output_bias=output_bias,
+                coordinate_scaling=coord_scaling
+            )
 
     def _init_optimizer(self, optim_type='adam') -> optim.Optimizer:
         opt_params = self.config.get('optimizer_params', {'lr': 1e-3})
@@ -358,8 +392,8 @@ class PINNSolver:
             return os.path.join(self.experiment_dir, "checkpoints")
         else:
             base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            unique_dir = os.path.join(base_dir, f"{self.config_name}_{timestamp}")
+            exp_name = f"{self.config_name}_{self._timestamp}"
+            unique_dir = os.path.join(base_dir, exp_name)
             return os.path.join(unique_dir, "checkpoints")
 
     def _get_logs_dir(self) -> str:
@@ -367,8 +401,8 @@ class PINNSolver:
             return os.path.join(self.experiment_dir, "logs")
         else:
             base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            unique_dir = os.path.join(base_dir, f"{self.config_name}_{timestamp}")
+            exp_name = f"{self.config_name}_{self._timestamp}"
+            unique_dir = os.path.join(base_dir, exp_name)
             return os.path.join(unique_dir, "logs")
 
     def _get_plots_dir(self) -> str:
@@ -376,8 +410,8 @@ class PINNSolver:
             return os.path.join(self.experiment_dir, "plots")
         else:
             base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            unique_dir = os.path.join(base_dir, f"{self.config_name}_{timestamp}")
+            exp_name = f"{self.config_name}_{self._timestamp}"
+            unique_dir = os.path.join(base_dir, exp_name)
             return os.path.join(unique_dir, "plots")
 
     def _save_checkpoint(self, identifier: Union[int, str]) -> None:
@@ -485,12 +519,14 @@ class PINNSolver:
         """
         Возвращает предсказания модели на всём датасете в нормализованных единицах.
         Возвращает словарь с ключами 'x_norm', 'y_norm', 'u_norm', 'v_norm', 'p_norm'.
+        Для потенциала: u, v вычисляются через градиенты φ.
         """
         self.model.eval()
         dataloader = self.data_handler.get_dataloader()
         all_u = []
         all_v = []
         all_p = []
+        all_phi = []
         all_x = []
         all_y = []
 
@@ -506,22 +542,54 @@ class PINNSolver:
                     bt = None
 
                 input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
-                out = self.model(input_tensor)
-                u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
-
-                # Применяем hard constraints, если нужно
-                if self.loss_computer.bc_type == 'hard':
-                    mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
-                    mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
-                    mask_p = mask_p.to(self.device, dtype=torch.bool).view(-1, 1)
-                    u_bc = u_bc.to(self.device, dtype=self.dtype).view(-1, 1)
-                    v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
-                    p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
-                    u, v, p = self.loss_computer.apply_hard_constraints(
-                        u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
-                    )
+                
+                if self.loss_computer.use_potential:
+                    # Для потенциала: модель возвращает φ
+                    # Скорости вычисляются через градиенты
+                    # Для no_grad режима используем конечные разности
+                    phi = self.model(input_tensor)
+                    
+                    # Численное вычисление градиентов (для inference без autograd)
+                    # Используем малый epsilon для конечных разностей
+                    eps = 1e-6
+                    
+                    # du/dx через конечные разности
+                    x_plus = x + eps
+                    x_minus = x - eps
+                    input_plus = self.loss_computer.build_input_tensor(x_plus, y, sdf, bt)
+                    input_minus = self.loss_computer.build_input_tensor(x_minus, y, sdf, bt)
+                    phi_plus = self.model(input_plus)
+                    phi_minus = self.model(input_minus)
+                    u = (phi_plus - phi_minus) / (2 * eps)
+                    
+                    # dv/dy через конечные разности
+                    y_plus = y + eps
+                    y_minus = y - eps
+                    input_plus = self.loss_computer.build_input_tensor(x, y_plus, sdf, bt)
+                    input_minus = self.loss_computer.build_input_tensor(x, y_minus, sdf, bt)
+                    phi_plus = self.model(input_plus)
+                    phi_minus = self.model(input_minus)
+                    v = (phi_plus - phi_minus) / (2 * eps)
+                    
+                    p = torch.zeros_like(phi)
+                    all_phi.append(phi.cpu().numpy().flatten())
                 else:
-                    u, v, p = u_raw, v_raw, p_raw
+                    out = self.model(input_tensor)
+                    u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+
+                    # Применяем hard constraints, если нужно
+                    if self.loss_computer.bc_type == 'hard':
+                        mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
+                        mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
+                        mask_p = mask_p.to(self.device, dtype=torch.bool).view(-1, 1)
+                        u_bc = u_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        u, v, p = self.loss_computer.apply_hard_constraints(
+                            u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                        )
+                    else:
+                        u, v, p = u_raw, v_raw, p_raw
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -529,13 +597,18 @@ class PINNSolver:
                 all_x.append(x.cpu().numpy().flatten())
                 all_y.append(y.cpu().numpy().flatten())
 
-        return {
+        result = {
             'x_norm': np.concatenate(all_x),
             'y_norm': np.concatenate(all_y),
             'u_norm': np.concatenate(all_u),
             'v_norm': np.concatenate(all_v),
             'p_norm': np.concatenate(all_p)
         }
+        
+        if self.loss_computer.use_potential:
+            result['phi_norm'] = np.concatenate(all_phi)
+        
+        return result
 
     # ------------------------------------------------------------------
     # Основной цикл обучения
