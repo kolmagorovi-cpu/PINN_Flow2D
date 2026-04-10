@@ -134,6 +134,8 @@ class MetricsCollector:
             self.history['pde'][k].append(v)
         if self.loss_computer.bc_type == 'soft':
             for k, v in bc_comp.items():
+                if k not in self.history['bc']:
+                    self.history['bc'][k] = []
                 self.history['bc'][k].append(v)
         self.history['wall_speed'].append(wall_speed)
         if self.history['sa_weights_mean'] is not None:
@@ -262,7 +264,8 @@ class MetricsCollector:
         integral_loss: float,
         pde_max: Dict[str, float],
         epoch_time: float,
-        total_time: float
+        total_time: float,
+        extra_grad: float = 0.0
     ) -> None:
         """
         Выводит подробную таблицу с компонентами потерь за эпоху.
@@ -277,6 +280,7 @@ class MetricsCollector:
             pde_max: словарь максимальных PDE невязок
             epoch_time: время выполнения эпохи (сек)
             total_time: общее время с начала обучения (сек)
+            extra_grad: дополнительная потеря (регуляризация, symmetry_grad и т.д.)
         """
         print("\n" + "=" * 100)
         print(f"Epoch = {epoch:4d}/{total_epochs}    Time = {epoch_time:6.2f} s    Total time = {total_time:8.2f} s")
@@ -289,44 +293,37 @@ class MetricsCollector:
 
         w = self.loss_computer.loss_weights
 
-        # Continuity
-        rate_c = self._compute_rate('pde', 'cont', pde_raw.get('cont', 0))
-        w_c = w.get('cont', 0)
-        w_rms_c = pde_raw.get('cont', 0) * w_c
-        w_max_c = pde_max.get('cont', 0) * w_c
-        print(fmt_line('Continuity', rate_c, pde_raw.get('cont', 0),
-                       pde_max.get('cont', 0), w_c, w_rms_c, w_max_c))
+        # PDE компоненты — выводим все динамически
+        pde_display_names = {
+            'cont': 'Continuity',
+            'mom_x': 'Momentum X' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum R',
+            'mom_y': 'Momentum Y' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum Z',
+            'laplace': 'Laplace (Potential)',
+        }
 
-        # Momentum X/R
-        mom_x_key = self.loss_computer.pde_components[1]
-        rate_mx = self._compute_rate('pde', mom_x_key, pde_raw.get(mom_x_key, 0))
-        w_mx = w.get(mom_x_key, 0)
-        w_rms_mx = pde_raw.get(mom_x_key, 0) * w_mx
-        w_max_mx = pde_max.get(mom_x_key, 0) * w_mx
-        mom_x_name = 'Momentum X' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum R'
-        print(fmt_line(mom_x_name, rate_mx, pde_raw.get(mom_x_key, 0),
-                       pde_max.get(mom_x_key, 0), w_mx, w_rms_mx, w_max_mx))
+        for comp in self.loss_computer.pde_components:
+            disp_name = pde_display_names.get(comp, comp.upper())
+            rate_comp = self._compute_rate('pde', comp, pde_raw.get(comp, 0))
+            w_comp = w.get(comp, 0)
+            rms_val = pde_raw.get(comp, 0)
+            max_val = pde_max.get(comp, 0)
+            w_rms = rms_val * w_comp
+            w_max = max_val * w_comp
+            print(fmt_line(disp_name, rate_comp, rms_val, max_val, w_comp, w_rms, w_max))
 
-        # Momentum Y/Z
-        mom_y_key = self.loss_computer.pde_components[2]
-        rate_my = self._compute_rate('pde', mom_y_key, pde_raw.get(mom_y_key, 0))
-        w_my = w.get(mom_y_key, 0)
-        w_rms_my = pde_raw.get(mom_y_key, 0) * w_my
-        w_max_my = pde_max.get(mom_y_key, 0) * w_my
-        mom_y_name = 'Momentum Y' if self.loss_computer.flow_type != 'axisymmetric' else 'Momentum Z'
-        print(fmt_line(mom_y_name, rate_my, pde_raw.get(mom_y_key, 0),
-                       pde_max.get(mom_y_key, 0), w_my, w_rms_my, w_max_my))
-
-        # Boundary conditions
+        # Boundary conditions — динамически по фактическим ключам
         if self.loss_computer.bc_type == 'soft':
-            for name in self.data_handler.boundary_type_names:
+            # Собираем все BC ключи из bc_comp (могут быть 'inlet' или 'inlet_phi' и т.д.)
+            bc_keys = list(bc_comp.keys())
+            for name in bc_keys:
                 val = bc_comp.get(name, 0)
                 rate_bc = self._compute_rate('bc', name, val)
-                # Для symmetry и axis_symmetry вес может быть другим
-                weight_key = name
-                if name == 'symmetry':
+                # Определяем weight_key: убираем '_phi' если есть
+                base_name = name.replace('_phi', '')
+                weight_key = base_name
+                if base_name == 'symmetry':
                     weight_key = 'symmetry_grad'
-                elif name == 'axis_symmetry':
+                elif base_name == 'axis_symmetry':
                     weight_key = 'axis_symmetry_grad'
                 weight = w.get(weight_key, 0)
                 w_rms_bc = val * weight
@@ -346,6 +343,12 @@ class MetricsCollector:
             w_max_int = integral_loss * w_int
             print(fmt_line('Integral Flow', rate_int, integral_loss, integral_loss,
                            w_int, w_rms_int, w_max_int))
+
+        # Extra grad (регуляризация, symmetry_grad и т.д.)
+        if extra_grad > 0:
+            rate_eg = self._compute_rate('extra_grad', None, extra_grad)
+            # Вес не отображаем, так как он уже включён в extra_grad
+            print(fmt_line('Regularization', rate_eg, extra_grad, extra_grad, 0.0, 0.0, 0.0))
 
         # Totals
         total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0

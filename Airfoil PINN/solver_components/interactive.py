@@ -174,6 +174,15 @@ class InteractiveHandler:
             print(f"  {key}: {value:.2e}")
         if self.loss_computer.integral_condition:
             print(f"  integral_weight: {self.loss_computer.integral_weight:.2e}")
+
+        # Параметры регуляризации для потенциала скорости
+        if self.loss_computer.use_potential:
+            print("\n--- Регуляризация однородного потока (потенциал) ---")
+            print(f"  uniform_reg_weight: {self.loss_computer.uniform_reg_weight:.2e}")
+            print(f"  boundary_layer_thickness: {self.loss_computer.boundary_layer_thickness:.4f}")
+            print(f"  U_inf: {self.loss_computer.U_inf:.2e}")
+            print(f"  angle_of_attack: {self.loss_computer.angle_of_attack:.1f}°")
+
         print("\nВведите новые значения (Enter оставляет текущее). Для выхода без изменений введите 'q'.")
 
         new_weights = {}
@@ -204,6 +213,26 @@ class InteractiveHandler:
                     self.loss_computer.integral_weight = float(val)
                 except ValueError:
                     print("Неверный формат, вес оставлен без изменений.")
+
+        # Обновляем параметры регуляризации для потенциала
+        if self.loss_computer.use_potential:
+            print("\n--- Обновление параметров регуляризации ---")
+            val = input(f"uniform_reg_weight [{self.loss_computer.uniform_reg_weight:.2e}]: ").strip()
+            if val.lower() == 'q':
+                print("Редактирование отменено.")
+                return
+            if val:
+                try:
+                    self.loss_computer.uniform_reg_weight = float(val)
+                except ValueError:
+                    print("Неверный формат, вес оставлен без изменений.")
+
+            val = input(f"boundary_layer_thickness [{self.loss_computer.boundary_layer_thickness:.4f}]: ").strip()
+            if val and val.lower() != 'q':
+                try:
+                    self.loss_computer.boundary_layer_thickness = float(val)
+                except ValueError:
+                    print("Неверный формат, параметр оставлен без изменений.")
 
         print("Веса обновлены.")
         print("=" * 60)

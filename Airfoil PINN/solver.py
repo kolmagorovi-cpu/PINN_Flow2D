@@ -717,7 +717,8 @@ class PINNSolver:
                 # Вывод в консоль
                 avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(epoch)
                 self.metrics.print_epoch_table(
-                    epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time
+                    epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time,
+                    extra_grad=extra_grad
                 )
                 line2 = f"   avg u_inlet = {avg_u_in:.4f} (норм.), avg u_outlet = {avg_u_out:.4f} (норм.)"
                 print(line2)

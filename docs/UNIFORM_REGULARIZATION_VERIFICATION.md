@@ -57,10 +57,19 @@ if self.use_potential:
 
 ```python
 # Регуляризация: стремление к однородному потоку вдали от стенки
-# Используется маска по SDF: точки с sdf > boundary_layer_thickness
+# Применяется ТОЛЬКО к точкам внутри области (не на границах),
+# которые находятся на расстоянии > boundary_layer_thickness от стенки
 if sdf is not None and self.uniform_reg_weight > 0:
-    # Создаём маску для точек вдали от пограничного слоя
-    bl_mask = sdf.view(-1) > self.boundary_layer_thickness
+    # Маска граничных точек: точка считается граничной, если она принадлежит любой границе
+    is_boundary = boundary_types.sum(dim=1) > 0.5  # (batch_size,)
+
+    # Маска для регуляризации:
+    # 1. Точка НЕ на границе (внутри области)
+    # 2. Расстояние до стенки > boundary_layer_thickness
+    interior_mask = ~is_boundary  # Только внутренние точки
+    sdf_mask = sdf.view(-1) > self.boundary_layer_thickness  # Вне пограничного слоя
+    bl_mask = interior_mask & sdf_mask  # Комбинированная маска
+
     if bl_mask.sum() > 0:
         u_far = phi_x[bl_mask]
         v_far = phi_y[bl_mask]
@@ -73,12 +82,16 @@ if sdf is not None and self.uniform_reg_weight > 0:
 
 **Математика:**
 ```
-mask = (sdf > boundary_layer_thickness)
+is_boundary = sum(boundary_types, dim=1) > 0.5
+interior_mask = ~is_boundary
+mask = interior_mask AND (sdf > boundary_layer_thickness)
 loss_uniform = mean((u - U_inf_x)² + (v - U_inf_y)²) для точек где mask=True
 extra_grad += uniform_reg_weight * loss_uniform
 ```
 
-**Статус:** ✅ Реализовано корректно
+**Важно:** Регуляризация применяется только к **внутренним точкам области** (коллокационным точкам), а не к граничным. Это предотвращает дублирование штрафа с BC loss.
+
+**Статус:** ✅ Реализовано корректно (обновлено 10.04.2026)
 
 ---
 
@@ -196,7 +209,10 @@ loss = λ_laplace * mean((∇²φ)²)                              # PDE
      + λ_uniform * mean_{mask}[(u - U_inf_x)² + (v - U_inf_y)²]  # Regularization
 ```
 
-где `mask = (sdf > boundary_layer_thickness)`
+где:
+- `mask = interior_mask AND (sdf > boundary_layer_thickness)`
+- `interior_mask = ~is_boundary` (точки, не принадлежащие никаким границам)
+- Регуляризация применяется **только к внутренним точкам**, чтобы не дублировать BC loss
 
 ---
 
@@ -322,10 +338,13 @@ loss_uniform = history['extra_grad'] / uniform_reg_weight
 | Параметры в конфигурации | ✅ | `config_manager.py` |
 | Вычисление u, v через autograd | ✅ | `loss_computer.py` |
 | Маска по SDF | ✅ | `loss_computer.py:380` |
-| loss_uniform с весом | ✅ | `loss_computer.py:389` |
+| Маска на граничные точки | ✅ | `loss_computer.py:383-391` (обновлено) |
+| loss_uniform с весом | ✅ | `loss_computer.py:399` |
 | Передача U_inf | ✅ | Через `U_inf_x`, `U_inf_y` |
 | SDF в DataLoader | ✅ | `data_handler.py` |
 | Логирование | ✅ | `extra_grad` в метриках |
+| Отображение в таблице потерь | ✅ | `metrics.py:348-351` (добавлено) |
+| Интерактивное редактирование (Ctrl+W) | ✅ | `interactive.py:180-232` (обновлено) |
 | Тест: uniform_reg_weight=0 | ✅ | Условие `> 0` |
 | Угол атаки | ✅ | `U_inf_x`, `U_inf_y` |
 
@@ -335,12 +354,59 @@ loss_uniform = history['extra_grad'] / uniform_reg_weight
 
 ---
 
+## 🎮 Интерактивное редактирование параметров (Ctrl+W)
+
+Начиная с версии от 10.04.2026, при нажатии **Ctrl+W** во время обучения отображаются и могут быть изменены:
+
+### Основные веса потерь
+- Все PDE веса (например, `laplace_weight`)
+- Все BC веса (например, `inlet_phi`, `wall_phi`, `outlet_phi`, `symmetry_phi`)
+- `integral_weight` (если включено интегральное условие)
+
+### Параметры регуляризации однородного потока (только для потенциала)
+- `uniform_reg_weight` - вес регуляризации (по умолчанию 0.01)
+- `boundary_layer_thickness` - толщина пограничного слоя в долях хорды (по умолчанию 0.05)
+- `U_inf` - скорость на бесконечности
+- `angle_of_attack` - угол атаки в градусах
+
+**Пример использования:**
+```
+РЕДАКТИРОВАНИЕ ВЕСОВ ПОТЕРЬ
+============================================================
+Текущие веса (PDE и BC):
+  laplace_weight: 1.00e+00
+  inlet_phi: 1.00e+02
+  wall_phi: 1.00e+02
+  outlet_phi: 1.00e+01
+  symmetry_phi: 1.00e+01
+
+--- Регуляризация однородного потока (потенциал) ---
+  uniform_reg_weight: 1.00e-02
+  boundary_layer_thickness: 0.0500
+  U_inf: 1.00e+00
+  angle_of_attack: 0.0°
+
+Введите новые значения (Enter оставляет текущее). Для выхода без изменений введите 'q'.
+...
+
+--- Обновление параметров регуляризации ---
+uniform_reg_weight [1.00e-02]: 0.05
+boundary_layer_thickness [0.0500]: 0.03
+
+Веса обновлены.
+============================================================
+```
+
+---
+
 ## 📚 Ссылки
 
 - `config_manager.py` - конфигурация потенциала
-- `loss_computer.py` - вычисление потерь (строки 376-391)
+- `loss_computer.py` - вычисление потерь (строки 376-401)
 - `trainer.py` - цикл обучения и логирование
 - `data_handler.py` - загрузка данных с SDF
+- `interactive.py` - интерактивное редактирование весов (Ctrl+W)
+- `metrics.py` - отображение таблицы потерь с Regularization
 
 ---
 

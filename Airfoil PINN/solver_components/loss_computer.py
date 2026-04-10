@@ -291,8 +291,9 @@ class LossComputer:
             return bc_comp, extra_grad
 
         # Вычисляем градиенты потенциала (скорости)
-        phi_x = safe_grad(phi, x)  # u = ∂φ/∂x
-        phi_y = safe_grad(phi, y)  # v = ∂φ/∂y
+        # retain_graph=True для всех вызовов — граф нужен для total_loss.backward()
+        phi_x = safe_grad(phi, x, retain_graph=True)  # u = ∂φ/∂x
+        phi_y = safe_grad(phi, y, retain_graph=True)  # v = ∂φ/∂y
 
         for name in self.data_handler.boundary_type_names:
             idx = self.data_handler.boundary_type_names.index(name)
@@ -322,10 +323,10 @@ class LossComputer:
                 
                 # Если есть SDF, вычисляем точную нормаль
                 if sdf is not None:
-                    # Градиент SDF даёт нормаль
-                    sdf_x = safe_grad(sdf, x)
-                    sdf_y = safe_grad(sdf, y)
-                    
+                    # Градиент SDF даёт нормаль (sdf — данные, градиент ожидаемо None)
+                    sdf_x = safe_grad(sdf, x, retain_graph=True, silent=True)
+                    sdf_y = safe_grad(sdf, y, retain_graph=True, silent=True)
+
                     # Нормализуем: n = (sdf_x, sdf_y) / |(sdf_x, sdf_y)|
                     grad_norm = torch.sqrt(sdf_x[mask]**2 + sdf_y[mask]**2) + 1e-8
                     n_x = sdf_x[mask] / grad_norm
@@ -345,9 +346,9 @@ class LossComputer:
                 u_out = phi_x[mask]
                 
                 if sdf is not None and self.flow_type != 'axisymmetric':
-                    # Вычисляем нормаль через SDF
-                    sdf_x = safe_grad(sdf, x)
-                    sdf_y = safe_grad(sdf, y)
+                    # Вычисляем нормаль через SDF (sdf — данные, градиент ожидаемо None)
+                    sdf_x = safe_grad(sdf, x, retain_graph=True, silent=True)
+                    sdf_y = safe_grad(sdf, y, retain_graph=True, silent=True)
                     grad_norm = torch.sqrt(sdf_x[mask]**2 + sdf_y[mask]**2) + 1e-8
                     n_x = sdf_x[mask] / grad_norm
                     n_y = sdf_y[mask] / grad_norm
@@ -365,7 +366,7 @@ class LossComputer:
                 v_sym = phi_y[mask]
                 bc_comp[bc_key] = torch.mean(v_sym ** 2)
                 # Дополнительно: du/dy = 0 на линии симметрии
-                du_dy_full = safe_grad(phi_x, y, silent=False)
+                du_dy_full = safe_grad(phi_x, y, retain_graph=True, silent=False)
                 du_dy = du_dy_full[mask]
                 extra_grad += self.loss_weights.get('symmetry_grad', 10.0) * torch.mean(du_dy ** 2)
 
@@ -375,10 +376,19 @@ class LossComputer:
                 bc_comp[bc_key] = torch.mean(u_ax ** 2)
 
         # Регуляризация: стремление к однородному потоку вдали от стенки
-        # Используется маска по SDF: точки с sdf > boundary_layer_thickness
+        # Применяется ТОЛЬКО к точкам внутри области (не на границах),
+        # которые находятся на расстоянии > boundary_layer_thickness от стенки
         if sdf is not None and self.uniform_reg_weight > 0:
-            # Создаём маску для точек вдали от пограничного слоя
-            bl_mask = sdf.view(-1) > self.boundary_layer_thickness
+            # Маска граничных точек: точка считается граничной, если она принадлежит любой границе
+            is_boundary = boundary_types.sum(dim=1) > 0.5  # (batch_size,)
+
+            # Маска для регуляризации:
+            # 1. Точка НЕ на границе (внутри области)
+            # 2. Расстояние до стенки > boundary_layer_thickness
+            interior_mask = ~is_boundary  # Только внутренние точки
+            sdf_mask = sdf.view(-1) > self.boundary_layer_thickness  # Вне пограничного слоя
+            bl_mask = interior_mask & sdf_mask  # Комбинированная маска
+
             if bl_mask.sum() > 0:
                 u_far = phi_x[bl_mask]
                 v_far = phi_y[bl_mask]
