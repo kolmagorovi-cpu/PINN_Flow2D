@@ -639,24 +639,54 @@ def weights_menu(cfg: ConfigManager) -> None:
         clear_screen()
         print_submenu_header("Настройка весов сети")
         lw = cfg.config['loss_weights']
+        pde_system = cfg.config['pde'].get('system', 'incompressible_navier_stokes')
+        
         print("1. Ручная настройка весов функции потерь")
         print(f"2. Адаптивные веса для BC (текущ: {lw['adaptive_bc']})")
         print(f"3. SA-PINN (текущ: {lw['use_sa_weights']})")
         print(f"4. SA-PINN для BC (текущ: {lw['sa_apply_to_bc']})")
         print(f"5. Интегральная потеря (текущ: {lw['integral_condition']}, вес: {lw['integral_weight']})")
-        print("6. Вывод текущих настроек")
-        print("0. Назад")
+        
+        # Для потенциала - дополнительные опции
+        if pde_system == 'potential':
+            print(f"6. Вес уравнения Лапласа (текущ: {lw.get('laplace_weight', 1.0)})")
+            print(f"7. Вес регуляризации однородного потока (текущ: {lw.get('uniform_reg_weight', 0.01)})")
+            print(f"8. Толщина пограничного слоя для маски (текущ: {cfg.config['pde'].get('potential', {}).get('boundary_layer_thickness', 0.05)})")
+            print("9. Вывод текущих настроек")
+            print("0. Назад")
+        else:
+            print("6. Вывод текущих настроек")
+            print("0. Назад")
+        
         ch = input("Выберите: ").strip()
 
         if ch == '1':
-            for k in lw['pde_weights']:
-                val = input(f"Вес PDE {k} [{lw['pde_weights'][k]}]: ").strip()
+            # Для потенциала показываем только laplace_weight
+            if pde_system == 'potential':
+                val = input(f"Вес уравнения Лапласа (laplace_weight) [{lw.get('laplace_weight', 1.0)}]: ").strip()
                 if val:
-                    lw['pde_weights'][k] = float(val)
-            for k in lw['bc_weights']:
-                val = input(f"Вес BC {k} [{lw['bc_weights'][k]}]: ").strip()
-                if val:
-                    lw['bc_weights'][k] = float(val)
+                    lw['laplace_weight'] = float(val)
+                
+                print("\nВеса граничных условий для потенциала (_phi):")
+                for k in lw['bc_weights']:
+                    if k.endswith('_phi'):
+                        val = input(f"  {k} [{lw['bc_weights'][k]}]: ").strip()
+                        if val:
+                            lw['bc_weights'][k] = float(val)
+                
+                print("\nОстальные веса (не используются для потенциала):")
+                print("  pde_weights: cont, mom_x, mom_y - НЕ ИСПОЛЬЗУЮТСЯ")
+                print("  bc_weights без _phi - НЕ ИСПОЛЬЗУЮТСЯ")
+            else:
+                # Стандартная логика для Навье-Стокса
+                for k in lw['pde_weights']:
+                    val = input(f"Вес PDE {k} [{lw['pde_weights'][k]}]: ").strip()
+                    if val:
+                        lw['pde_weights'][k] = float(val)
+                for k in lw['bc_weights']:
+                    val = input(f"Вес BC {k} [{lw['bc_weights'][k]}]: ").strip()
+                    if val:
+                        lw['bc_weights'][k] = float(val)
         elif ch == '2':
             lw['adaptive_bc'] = not lw['adaptive_bc']
         elif ch == '3':
@@ -670,14 +700,56 @@ def weights_menu(cfg: ConfigManager) -> None:
                 if w:
                     lw['integral_weight'] = float(w)
         elif ch == '6':
-            print("\n--- ТЕКУЩИЕ ВЕСА ---")
-            print("PDE weights:", lw['pde_weights'])
-            print("BC weights:", lw['bc_weights'])
-            print(f"adaptive_bc: {lw['adaptive_bc']}")
-            print(f"use_sa_weights: {lw['use_sa_weights']}")
-            print(f"sa_apply_to_bc: {lw['sa_apply_to_bc']}")
-            print(f"integral_condition: {lw['integral_condition']}, weight: {lw['integral_weight']}")
-            input("Нажмите Enter...")
+            if pde_system == 'potential':
+                # Настройка веса Лапласа
+                val = input(f"Вес уравнения Лапласа (laplace_weight) [{lw.get('laplace_weight', 1.0)}]: ").strip()
+                if val:
+                    lw['laplace_weight'] = float(val)
+            else:
+                # Вывод текущих весов
+                print("\n--- ТЕКУЩИЕ ВЕСА ---")
+                print("PDE weights:", lw['pde_weights'])
+                print("BC weights:", lw['bc_weights'])
+                print(f"adaptive_bc: {lw['adaptive_bc']}")
+                print(f"use_sa_weights: {lw['use_sa_weights']}")
+                print(f"sa_apply_to_bc: {lw['sa_apply_to_bc']}")
+                print(f"integral_condition: {lw['integral_condition']}, weight: {lw['integral_weight']}")
+                input("Нажмите Enter...")
+        elif ch == '7':
+            if pde_system == 'potential':
+                # Настройка веса регуляризации
+                val = input(f"Вес регуляризации (uniform_reg_weight) [{lw.get('uniform_reg_weight', 0.01)}]: ").strip()
+                if val:
+                    lw['uniform_reg_weight'] = float(val)
+            else:
+                print_submenu_footer()
+                break
+        elif ch == '8':
+            if pde_system == 'potential':
+                # Настройка толщины пограничного слоя
+                pot_cfg = cfg.config['pde'].get('potential', {})
+                val = input(f"Толщина пограничного слоя (boundary_layer_thickness) [{pot_cfg.get('boundary_layer_thickness', 0.05)}]: ").strip()
+                if val:
+                    cfg.config['pde']['potential']['boundary_layer_thickness'] = float(val)
+            else:
+                print_submenu_footer()
+                break
+        elif ch == '9':
+            if pde_system == 'potential':
+                # Вывод текущих весов для потенциала
+                print("\n--- ТЕКУЩИЕ ВЕСА (ПОТЕНЦИАЛ) ---")
+                print(f"laplace_weight: {lw.get('laplace_weight', 1.0)}")
+                print(f"uniform_reg_weight: {lw.get('uniform_reg_weight', 0.01)}")
+                pot_cfg = cfg.config['pde'].get('potential', {})
+                print(f"boundary_layer_thickness: {pot_cfg.get('boundary_layer_thickness', 0.05)}")
+                print("\nBC weights (только _phi используются):")
+                for k, v in lw['bc_weights'].items():
+                    marker = " ✓" if k.endswith('_phi') else ""
+                    print(f"  {k}: {v}{marker}")
+                input("\nНажмите Enter...")
+            else:
+                print_submenu_footer()
+                break
         elif ch == '0':
             print_submenu_footer()
             break
