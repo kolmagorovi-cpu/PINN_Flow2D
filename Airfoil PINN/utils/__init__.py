@@ -10,6 +10,7 @@ from .ui_utils import (
     confirm_action,
     input_with_default,
     clear_screen,
+    print_header,
 )
 from .io_utils import (
     save_json,
@@ -25,6 +26,7 @@ __all__ = [
     'confirm_action',
     'input_with_default',
     'clear_screen',
+    'print_header',
     # I/O
     'save_json',
     'load_json',

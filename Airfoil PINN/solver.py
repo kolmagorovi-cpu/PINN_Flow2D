@@ -64,6 +64,9 @@ class PINNSolver:
         self.config_name = config.get('project_name', 'unnamed')
         self.experiment_dir = experiment_dir
 
+        # Timestamp фиксируется один раз — используется во всех _get_*_dir()
+        self._timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
         # Установка seed
         seed = config.get('process', {}).get('seed', 42)
         set_seed(seed)
@@ -138,9 +141,8 @@ class PINNSolver:
         else:
             self.scaler = None
 
-        # Загрузка из чекпоинта (если указано)
+        # Стартовая эпоха — будет перезаписана при загрузке чекпоинта
         self.start_epoch = 0
-        self._load_checkpoint_if_needed()
 
         # Диагностическая конфигурация
         self.diagnostics_config = config.get('diagnostics', {})
@@ -181,6 +183,9 @@ class PINNSolver:
             config_name=self.config_name,
             reference_data=self.reference_data
         )
+
+        # Загрузка чекпоинта — после MetricsCollector, т.к. восстанавливает history
+        self._load_checkpoint_if_needed()
 
         # Визуализация
         out_cfg = config['output']
@@ -353,35 +358,28 @@ class PINNSolver:
         except Exception as e:
             logger.error(f"Ошибка загрузки чекпоинта: {e}")
 
+    def _get_run_dir(self) -> str:
+        """Возвращает корневую директорию текущего запуска (единый timestamp)."""
+        base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
+        return os.path.join(base_dir, f"{self.config_name}_{self._timestamp}")
+
     def _get_checkpoint_dir(self) -> str:
         if self.experiment_dir:
             return os.path.join(self.experiment_dir, "checkpoints")
-        else:
-            base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            unique_dir = os.path.join(base_dir, f"{self.config_name}_{timestamp}")
-            return os.path.join(unique_dir, "checkpoints")
+        return os.path.join(self._get_run_dir(), "checkpoints")
 
     def _get_logs_dir(self) -> str:
         if self.experiment_dir:
             return os.path.join(self.experiment_dir, "logs")
-        else:
-            base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            unique_dir = os.path.join(base_dir, f"{self.config_name}_{timestamp}")
-            return os.path.join(unique_dir, "logs")
+        return os.path.join(self._get_run_dir(), "logs")
 
     def _get_plots_dir(self) -> str:
         if self.experiment_dir:
             return os.path.join(self.experiment_dir, "plots")
-        else:
-            base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            unique_dir = os.path.join(base_dir, f"{self.config_name}_{timestamp}")
-            return os.path.join(unique_dir, "plots")
+        return os.path.join(self._get_run_dir(), "plots")
 
     def _save_checkpoint(self, identifier: Union[int, str]) -> None:
-        filename = f"pinn_{identifier}.pt" if isinstance(identifier, int) else f"pinn_{identifier}.pt"
+        filename = f"pinn_{identifier}.pt"
         self.checkpoint_manager.save(
             filename=filename,
             model=self.model,
@@ -548,6 +546,7 @@ class PINNSolver:
         sys.stdout.flush()
 
         self.start_time = time.time()
+        epoch = self.start_epoch  # на случай Ctrl+C до старта цикла
 
         try:
             for epoch in range(self.start_epoch + 1, epochs + 1):
@@ -586,11 +585,9 @@ class PINNSolver:
                     extra_diag['grad_norm_bc'] = grad_metrics['bc_norm']
                     extra_diag['grad_cosine'] = grad_metrics['cosine']
 
-                # Вычисляем avg_u_in, avg_u_out, mass_balance_error (уже в metrics)
+                # Средние скорости на inlet/outlet для мониторинга баланса масс
                 avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(epoch)
-                Qin = avg_u_in
-                Qout = avg_u_out
-                mass_error = abs(Qin - Qout) / (abs(Qin) + 1e-12) if Qin != 0 else 0.0
+                mass_error = abs(avg_u_in - avg_u_out) / (abs(avg_u_in) + 1e-12)
                 extra_diag['avg_u_in'] = avg_u_in
                 extra_diag['avg_u_out'] = avg_u_out
                 extra_diag['mass_balance_error'] = mass_error
@@ -641,8 +638,7 @@ class PINNSolver:
                         self.scheduler.step()
                     # Другие типы планировщиков (например, StepLR) должны быть обработаны аналогично
 
-                # Вывод в консоль
-                avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(epoch)
+                # Вывод в консоль (avg_u_in/out уже вычислены выше)
                 self.metrics.print_epoch_table(
                     epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time
                 )

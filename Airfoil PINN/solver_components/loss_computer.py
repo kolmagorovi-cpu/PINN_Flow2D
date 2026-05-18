@@ -189,24 +189,15 @@ class LossComputer:
                 bc_comp[name] += torch.mean(v_w ** 2)
 
             elif name == 'symmetry':
-                v_sym = v[mask]
-                bc_comp[name] += torch.mean(v_sym ** 2)
-                # Дополнительное условие: du/dy = 0 на линии симметрии
-                # Исправление: вычисляем градиент по исходному тензору y, затем выбираем точки симметрии
-                u_sym = u[mask]
-                # Градиент вычисляется по исходному тензору y (который имеет requires_grad=True)
-                du_dy_full = safe_grad(u, y, silent=False)
-                du_dy = du_dy_full[mask]
+                bc_comp[name] += torch.mean(v[mask] ** 2)
+                # du/dy = 0 на линии симметрии: градиент по полному тензору, затем маска
+                du_dy = safe_grad(u, y, silent=False)[mask]
                 extra_grad += self.loss_weights.get('symmetry_grad', 10.0) * torch.mean(du_dy ** 2)
 
             elif name == 'axis_symmetry':
-                u_ax = u[mask]
-                bc_comp[name] += torch.mean(u_ax ** 2)
-                # Дополнительное условие: dv/dr = 0 на оси
-                # Исправление: вычисляем градиент по исходному тензору x, затем выбираем точки оси
-                v_ax = v[mask]
-                dv_dr_full = safe_grad(v, x, silent=False)
-                dv_dr = dv_dr_full[mask]
+                bc_comp[name] += torch.mean(u[mask] ** 2)
+                # dv/dr = 0 на оси: градиент по полному тензору, затем маска
+                dv_dr = safe_grad(v, x, silent=False)[mask]
                 extra_grad += self.loss_weights.get('axis_symmetry_grad', 10.0) * torch.mean(dv_dr ** 2)
 
         return bc_comp, extra_grad
