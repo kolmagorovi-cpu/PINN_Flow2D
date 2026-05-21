@@ -2039,6 +2039,29 @@ def S2DR() -> None:
         print("\n💾 Сохранение...")
         sampler.save_points()
 
+        mesh_input = input("\nПостроить FVM-сетку (mesh2d)? (y/N): ").strip().lower()
+        if mesh_input in ('y', 'yes'):
+            print("\n🔧 Построение FVM-сетки (CDT)...")
+            try:
+                from mesh2d import Mesh2D
+            except ImportError:
+                print("\n❌ Модуль mesh2d.py не найден — убедитесь, что файл находится в директории проекта")
+                logger.error("ImportError: mesh2d не найден")
+            else:
+                try:
+                    mesh = Mesh2D.from_sampler(sampler)
+                    mesh.build()
+                    mesh_path = os.path.join(config.output_dir, "mesh2d.npz")
+                    mesh.save(mesh_path)
+                    s = mesh.summary()
+                    print(f"✅ Сетка сохранена: {mesh_path}")
+                    print(f"   Узлов: {s['num_nodes']}  |  Треугольников: {s['num_triangles']}")
+                    print(f"   Внутренних граней: {s['num_internal_faces']}  |  Граничных граней: {s['num_boundary_faces']}")
+                    print(f"   CV min/max/mean: {s['cv_volume_min']:.3e} / {s['cv_volume_max']:.3e} / {s['cv_volume_mean']:.3e} м²")
+                except Exception as e:
+                    print(f"\n❌ Ошибка построения сетки: {e}")
+                    logger.error("Ошибка mesh2d.build()", exc_info=True)
+
         print("\n" + "=" * 60 + "\n✅ МОДУЛЬ S2DR УСПЕШНО ВЫПОЛНЕН\n" + "=" * 60)
 
     except KeyboardInterrupt:

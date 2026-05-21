@@ -21,13 +21,89 @@ Example:
 import os
 import numpy as np
 import torch
+from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 import logging
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 
 from type_hints import PointDtypeDict
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MeshData:
+    """
+    FVM-сетка, загруженная из mesh2d.npz.
+
+    Все массивы хранятся в numpy; метод to_torch() конвертирует
+    нужные поля в тензоры для вычислений в loss_computer.
+
+    Attributes:
+        coords:           (N, 2)  физические координаты узлов [м]
+        triangles:        (T, 3)  индексы вершин треугольников
+        cv_volumes:       (N,)    объёмы КО [м²]
+        int_face_node_i:  (F,)    узел i внутренней грани
+        int_face_node_j:  (F,)    узел j внутренней грани
+        int_face_area:    (F, 2)  векторы площадей S_ij (outward от i)
+        bnd_face_node:    (Fb,)   узлы граничных граней
+        bnd_face_neighbor:(Fb,)   смежные граничные узлы
+        bnd_face_type:    (Fb,)   строки типов ГУ ('wall', 'inlet', ...)
+        bnd_face_area:    (Fb, 2) векторы площадей граничных граней (outward)
+        node_type:        (N,)    'interior' или 'boundary'
+        node_bnd_type:    (N,)    строки типов ГУ узлов
+    """
+    coords: np.ndarray
+    triangles: np.ndarray
+    cv_volumes: np.ndarray
+    int_face_node_i: np.ndarray
+    int_face_node_j: np.ndarray
+    int_face_area: np.ndarray
+    bnd_face_node: np.ndarray
+    bnd_face_neighbor: np.ndarray
+    bnd_face_type: np.ndarray
+    bnd_face_area: np.ndarray
+    node_type: np.ndarray
+    node_bnd_type: np.ndarray
+
+    @property
+    def n_nodes(self) -> int:
+        return len(self.coords)
+
+    @property
+    def n_triangles(self) -> int:
+        return len(self.triangles)
+
+    @property
+    def n_int_faces(self) -> int:
+        return len(self.int_face_node_i)
+
+    @property
+    def n_bnd_faces(self) -> int:
+        return len(self.bnd_face_node)
+
+    def to_torch(
+        self,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Конвертирует числовые поля сетки в torch-тензоры.
+
+        Возвращает словарь ключей, готовых для использования в loss_computer:
+            coords, cv_volumes, int_face_node_i, int_face_node_j,
+            int_face_area, bnd_face_node, bnd_face_neighbor, bnd_face_area
+        """
+        return {
+            'coords': torch.tensor(self.coords, dtype=dtype, device=device),
+            'cv_volumes': torch.tensor(self.cv_volumes, dtype=dtype, device=device),
+            'int_face_node_i': torch.tensor(self.int_face_node_i, dtype=torch.long, device=device),
+            'int_face_node_j': torch.tensor(self.int_face_node_j, dtype=torch.long, device=device),
+            'int_face_area': torch.tensor(self.int_face_area, dtype=dtype, device=device),
+            'bnd_face_node': torch.tensor(self.bnd_face_node, dtype=torch.long, device=device),
+            'bnd_face_neighbor': torch.tensor(self.bnd_face_neighbor, dtype=torch.long, device=device),
+            'bnd_face_area': torch.tensor(self.bnd_face_area, dtype=dtype, device=device),
+        }
 
 
 class PINNDataset(Dataset):
@@ -243,8 +319,15 @@ class DataHandler:
         shuffle: Перемешивать ли данные
         dataset: Объект датасета
         dataloader: DataLoader для итерации по батчам
+        mesh_data: FVM-сетка (MeshData) или None, если не загружена
     """
-    def __init__(self, points_file: str, batch_size: int, shuffle: bool = True) -> None:
+    def __init__(
+        self,
+        points_file: str,
+        batch_size: int,
+        shuffle: bool = True,
+        mesh_file: Optional[str] = None,
+    ) -> None:
         """
         Инициализирует обработчик данных.
 
@@ -252,15 +335,22 @@ class DataHandler:
             points_file: Путь к файлу с точками коллокации
             batch_size: Размер батча для обучения
             shuffle: Перемешивать ли данные
+            mesh_file: Путь к файлу FVM-сетки (.npz от mesh2d).
+                       Если None — сетка не загружается.
         """
         self.points_file = points_file
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.mesh_data: Optional[MeshData] = None
+
         self.dataset = PINNDataset(points_file)
         self.load_metadata()
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
         self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
+
+        if mesh_file is not None:
+            self.load_mesh(mesh_file)
 
     def load_metadata(self) -> None:
         """
@@ -288,6 +378,42 @@ class DataHandler:
         self.y_max = self.dataset.y.max().item()
         logger.info(f"Метаданные: chord={self.chord:.4f} м, U_inf={self.U_inf:.4f} м/с, Re={self.Re:.2e}")
         logger.info(f"Вход: u_norm={self.inlet_u_norm:.3f}, v_norm={self.inlet_v_norm:.3f}")
+
+    def load_mesh(self, mesh_file: str) -> None:
+        """
+        Загружает FVM-сетку из файла .npz (созданного mesh2d.Mesh2D.save()).
+
+        Результат доступен через self.mesh_data (объект MeshData).
+        Повторный вызов перезаписывает ранее загруженную сетку.
+
+        Args:
+            mesh_file: Путь к .npz файлу сетки
+
+        Raises:
+            FileNotFoundError: Если файл не найден
+        """
+        if not os.path.exists(mesh_file):
+            raise FileNotFoundError(f"Файл сетки не найден: {mesh_file}")
+        with np.load(mesh_file, allow_pickle=True) as data:
+            self.mesh_data = MeshData(
+                coords=np.array(data['coords']),
+                triangles=np.array(data['triangles']),
+                cv_volumes=np.array(data['cv_volumes']),
+                int_face_node_i=np.array(data['int_face_node_i']),
+                int_face_node_j=np.array(data['int_face_node_j']),
+                int_face_area=np.array(data['int_face_area']),
+                bnd_face_node=np.array(data['bnd_face_node']),
+                bnd_face_neighbor=np.array(data['bnd_face_neighbor']),
+                bnd_face_type=np.array(data['bnd_face_type']).astype(str),
+                bnd_face_area=np.array(data['bnd_face_area']),
+                node_type=np.array(data['node_type']).astype(str),
+                node_bnd_type=np.array(data['node_bnd_type']).astype(str),
+            )
+        logger.info(
+            "FVM-сетка загружена: %d узлов, %d треуг., %d вн. граней, %d гран. граней",
+            self.mesh_data.n_nodes, self.mesh_data.n_triangles,
+            self.mesh_data.n_int_faces, self.mesh_data.n_bnd_faces,
+        )
 
     def get_dataloader(self) -> DataLoader:
         """
