@@ -78,9 +78,9 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Data")
 DEFAULT_PLOT_DPI = 300
 
-# Фиксированные пути к YAML-библиотекам геометрии
-FOIL_GEOMS_PATH = r"C:\Users\BelchikovDA\projects\dev\proj\pinn-solver\PINN_Flow2D\Airfoil PINN\Geometry\foil_geoms.yaml"
-JUNCTION_GEOMS_PATH = r"C:\Users\BelchikovDA\projects\dev\proj\pinn-solver\PINN_Flow2D\Airfoil PINN\Geometry\junction_geoms.yaml"
+# Пути к YAML-библиотекам геометрии (относительно директории проекта)
+FOIL_GEOMS_PATH = os.path.join(PROJECT_ROOT, "Geometry", "foil_geoms.yaml")
+JUNCTION_GEOMS_PATH = os.path.join(PROJECT_ROOT, "Geometry", "junction_geoms.yaml")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -313,11 +313,14 @@ class AirfoilGeometry:
         # 3. Влево до левой границы
         domain_points.append([-length, height])
 
-        # 4. Вниз до нижней границы (уровень носка)
-        domain_points.append([-length, y_min])
+        # 4. Вниз до линии симметрии y=0 (ось/граница симметрии)
+        domain_points.append([-length, 0.0])
 
-        # 5. Вправо до носка профиля (замыкаем контур)
-        domain_points.append([x_min, y_min])
+        # 5. Вправо до носка профиля (на линии симметрии)
+        domain_points.append([x_min, 0.0])
+
+        # 6. Явное замыкание контура на первую точку
+        domain_points.append(domain_points[0])
 
         return np.array(domain_points)
 
@@ -1032,8 +1035,13 @@ class Geometry2D:
             
             if self.config.verbose:
                 logger.info(f"📂 Загрузка профиля из файла: {file_path}")
-            
-            return self._airfoil_geom.load_airfoil(file_path)
+
+            result = self._airfoil_geom.load_airfoil(file_path)
+            if result:
+                self.geometry_coords = self._airfoil_geom.foil_coords
+                self.is_closed = self._airfoil_geom.is_closed
+                self.chord = self._airfoil_geom.chord
+            return result
         
         elif source_type == 'inline':
             # Загрузка из foil_geoms.yaml по имени

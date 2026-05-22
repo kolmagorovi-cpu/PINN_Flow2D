@@ -35,7 +35,11 @@ import glob
 import multiprocessing as mp
 from functools import partial
 
-from scipy.spatial import cKDTree
+try:
+    from scipy.spatial import cKDTree
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 from type_hints import InitializerMetadataDict
 
 # Импортируем наши модули и классы
@@ -443,8 +447,9 @@ class Initializer:
                 v_phys = np.full(N, v0)
         elif velocity_initial_mode == 'perturbed':
             amp = self.velocity_perturbation_amplitude
-            u_phys = np.full(N, u0) + amp * u0 * (2 * np.random.random(N) - 1)
-            v_phys = np.full(N, v0) + amp * v0 * (2 * np.random.random(N) - 1)
+            U_mag = self.U_inf  # модуль скорости — не зависит от направления
+            u_phys = np.full(N, u0) + amp * U_mag * (2 * np.random.random(N) - 1)
+            v_phys = np.full(N, v0) + amp * U_mag * (2 * np.random.random(N) - 1)
         else:
             raise ValueError(f"Неизвестный режим инициализации скорости: {velocity_initial_mode}")
 

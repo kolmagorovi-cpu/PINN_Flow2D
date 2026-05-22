@@ -67,7 +67,7 @@ class ConfigManager:
                 'type': 'soft',
             },
             'loss_weights': {
-                'pde_weights': {'cont': 1.0, 'mom_x': 1.0, 'mom_y': 1.0},
+                'pde_weights': {'cont': 1.0, 'mom_x': 1.0, 'mom_y': 1.0, 'mom_r': 1.0, 'mom_z': 1.0},
                 'bc_weights': {
                     'inlet': 1.0,
                     'outlet': 1.0,

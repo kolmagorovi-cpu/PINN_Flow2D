@@ -83,7 +83,8 @@ class PINNSolver:
         self.data_handler = DataHandler(
             points_file=config['data']['points_file'],
             batch_size=config['training']['batch_size'],
-            shuffle=True
+            shuffle=True,
+            mesh_file=config['data'].get('mesh_file')
         )
 
         # Константы PDE (нормированные)
@@ -118,6 +119,22 @@ class PINNSolver:
             device=self.device,
             dtype=self.dtype
         )
+
+        # FVM-невязки (если задана сетка)
+        if self.data_handler.mesh_data is not None:
+            try:
+                from fvm_residuals import FVMResiduals
+                fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
+                inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
+                inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
+                fvm.set_inlet_velocity(
+                    torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
+                )
+                fvm.to(self.device)
+                self.loss_computer.fvm = fvm
+                logger.info(f"FVMResiduals подключён: {fvm.N} узлов")
+            except Exception as e:
+                logger.warning(f"Не удалось инициализировать FVMResiduals: {e}")
 
         # SA-веса (если используются)
         self.sa_weights = None
@@ -467,7 +484,7 @@ class PINNSolver:
             # Берём один батч из даталоадера
             sample_batch = next(iter(self.data_handler.get_dataloader()))
             grad_metrics = self.trainer.compute_grad_norms_separately(sample_batch)
-            if hasattr(self.metrics.history, 'grad_norm_pde') and len(self.metrics.history['grad_norm_pde']) > 0:
+            if 'grad_norm_pde' in self.metrics.history and len(self.metrics.history['grad_norm_pde']) > 0:
                 self.visualizer.plot_gradient_norms_separate(
                     self.metrics.history['grad_norm_pde'],
                     self.metrics.history['grad_norm_bc'],
@@ -527,6 +544,7 @@ class PINNSolver:
                 all_x.append(x.cpu().numpy().flatten())
                 all_y.append(y.cpu().numpy().flatten())
 
+        self.model.train()
         return {
             'x_norm': np.concatenate(all_x),
             'y_norm': np.concatenate(all_y),
@@ -576,7 +594,7 @@ class PINNSolver:
                         self.trainer.train_epoch_adam(pde_mult)
 
                 # Сбор дополнительных метрик для диагностики (если нужно)
-                extra_diag = {}
+                extra_diag = {'fvm_loss': self.trainer._last_fvm_loss}
                 if self.compute_grad_cosine and not self.using_lbfgs and epoch % self.diagnostics_interval == 0:
                     # Берём один батч
                     sample_batch = next(iter(self.data_handler.get_dataloader()))
@@ -700,6 +718,7 @@ class PINNSolver:
         self.scaler = None
         self.trainer.optimizer = self.optimizer
         self.trainer.using_lbfgs = True
+        self.trainer.use_amp = False
         self.trainer.scaler = None
 
     def _recreate_optimizer(self):

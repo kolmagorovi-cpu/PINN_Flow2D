@@ -15,10 +15,13 @@
 
 import torch
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from utils import safe_grad
 from pde_residuals import PDEResiduals
+
+if TYPE_CHECKING:
+    from fvm_residuals import FVMResiduals
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,15 @@ class LossComputer:
         # Целевое значение интеграла (по умолчанию 0 - баланс масс)
         self.integral_target = lw.get('integral_target', 0.0)
 
+        # FVM-потеря (закон сохранения массы на неструктурированной сетке)
+        fvm_cfg = lw.get('fvm', {})
+        self.fvm_weight: float = (
+            float(fvm_cfg) if isinstance(fvm_cfg, (int, float))
+            else float(fvm_cfg.get('weight', 0.0))
+        )
+        # Заполняется из PINNSolver при наличии mesh_file в конфиге
+        self.fvm: Optional["FVMResiduals"] = None
+
         # Границы области для интегрального условия
         self.x_min = x_min
         self.x_max = x_max
@@ -93,6 +105,25 @@ class LossComputer:
         # Для axisymmetric требуется eps и множитель 2π
         self.eps_axi = 1e-12
         self.two_pi = 2.0 * torch.pi
+
+    # ------------------------------------------------------------------
+    # FVM-потеря (закон сохранения массы)
+    # ------------------------------------------------------------------
+    def compute_fvm_loss(self, u_fvm: torch.Tensor) -> torch.Tensor:
+        """
+        Вычисляет взвешенную FVM-потерю закона сохранения массы.
+
+        Args:
+            u_fvm: тензор (N, 2) — нормированная скорость [u, v] во всех
+                   N узлах сетки (порядок совпадает с точками коллокации)
+
+        Returns:
+            Скалярный тензор fvm_weight * mean(R_i²),
+            или ноль если fvm не подключён / вес равен нулю.
+        """
+        if self.fvm is None or self.fvm_weight == 0.0:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        return self.fvm_weight * self.fvm.mass_loss(u_fvm)
 
     def _setup_pde_components(self) -> List[str]:
         """Возвращает список названий компонент PDE в зависимости от типа течения."""

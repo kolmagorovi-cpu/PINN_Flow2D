@@ -462,14 +462,15 @@ class Visualizer:
                                     boundary_types, boundary_type_names)
 
         # Определяем, какие величины отображать
+        _cfg = config or {}
         if plot_physical:
             u_plot = u_norm * data_handler.U_inf
             v_plot = v_norm * data_handler.U_inf
             p_dyn = data_handler.rho * data_handler.U_inf ** 2
             p_plot = p_norm * p_dyn
             # Обратное масштабирование координат (если использовалось масштабирование)
-            scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
-            if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
+            scale_factor = _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
+            if _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
                 x_plot = (x_norm / scale_factor) * data_handler.chord
                 y_plot = (y_norm / scale_factor) * data_handler.chord
             else:
@@ -481,19 +482,21 @@ class Visualizer:
             x_label = 'x, м'
             y_label = 'y, м'
             title_suffix = ' (physical)'
-            # Для физических величин шкала от 0 до максимума (но не меньше U_inf)
-            u_max = max(data_handler.U_inf, u_plot.max().item())
-            v_max = max(data_handler.U_inf, v_plot.max().item())
-            u_vmin, u_vmax = 0, u_max
-            v_vmin, v_vmax = 0, v_max
-            p_vmin, p_vmax = None, None
+            # u: динамически от реального минимума до максимума (с учётом U_inf как нижней планки)
+            u_vmin = min(0.0, u_plot.min().item())
+            u_vmax = max(data_handler.U_inf, u_plot.max().item())
+            # v: симметричная шкала вокруг нуля (v может быть отрицательной)
+            v_abs = max(abs(v_plot.min().item()), abs(v_plot.max().item()), data_handler.U_inf * 0.01)
+            v_vmin, v_vmax = -v_abs, v_abs
+            # p: динамически
+            p_vmin, p_vmax = p_plot.min().item(), p_plot.max().item()
         else:
             u_plot = u_norm
             v_plot = v_norm
             p_plot = p_norm
             # Обратное масштабирование координат (если использовалось масштабирование)
-            scale_factor = config.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
-            if config.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
+            scale_factor = _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
+            if _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
                 x_plot = x_norm / scale_factor
                 y_plot = y_norm / scale_factor
             else:
@@ -505,12 +508,14 @@ class Visualizer:
             x_label = 'x (норм.)'
             y_label = 'y (норм.)'
             title_suffix = ' (normalized)'
-            # Для нормализованной скорости шкала от 0 до максимума, но не меньше 1
-            u_max = max(1.0, u_plot.max().item())
-            v_max = max(1.0, v_plot.max().item())
-            u_vmin, u_vmax = 0, u_max
-            v_vmin, v_vmax = 0, v_max
-            p_vmin, p_vmax = None, None
+            # u: динамически от реального минимума (с учётом нижней планки 0)
+            u_vmin = min(0.0, u_plot.min().item())
+            u_vmax = max(1.0, u_plot.max().item())
+            # v: симметричная шкала вокруг нуля
+            v_abs = max(abs(v_plot.min().item()), abs(v_plot.max().item()), 0.01)
+            v_vmin, v_vmax = -v_abs, v_abs
+            # p: динамически
+            p_vmin, p_vmax = p_plot.min().item(), p_plot.max().item()
 
         x_np = x_plot.cpu().numpy().flatten()
         y_np = y_plot.cpu().numpy().flatten()
@@ -658,9 +663,9 @@ class Visualizer:
         plt.close()
 
         # Радиальное усреднение
-        kx_flat = kx[:, None] * np.ones(ny)[None, :]
-        ky_flat = ky[None, :] * np.ones(nx)[:, None]
-        k_radial = np.sqrt(kx_flat**2 + ky_flat**2).flatten()
+        # amplitude имеет форму (ny, nx) — meshgrid(xi, yi) строки по y, столбцы по x
+        KX, KY = np.meshgrid(kx, ky)          # оба (ny, nx), совпадают с amplitude
+        k_radial = np.sqrt(KX**2 + KY**2).flatten()
         amp_flat = amplitude.flatten()
 
         # Сортируем по радиальному волновому числу и усредняем по бинам

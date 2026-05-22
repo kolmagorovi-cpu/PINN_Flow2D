@@ -115,6 +115,11 @@ class Trainer:
         # Флаг изменения SA-весов (для сигнала solver'у о необходимости пересоздания оптимизатора)
         self.sa_weights_changed = False
 
+        # FVM-потеря: отдельный шаг оптимизации раз в fvm_interval эпох
+        self.fvm_interval = config.get('fvm_interval', 1)
+        self._fvm_epoch_counter = 0
+        self._last_fvm_loss = 0.0
+
         # Параметры диагностики
         self.diag_config = diagnostics_config or {}
         self.diag_interval = self.diag_config.get('interval', 50)
@@ -222,20 +227,22 @@ class Trainer:
         # Граничные условия (только для soft)
         if self.loss_computer.bc_type == 'soft':
             bc_comp, extra_grad = self.loss_computer.compute_bc_loss(u, v, p, bt, x, y)
-            bc_loss = sum(
-                self.loss_computer.loss_weights.get(name, 0.0) * bc_comp[name]
-                for name in bc_comp
-            ) + extra_grad
+            # Если SA-веса применяются к BC, используем только их; иначе — фиксированные веса
+            if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
+                bc_loss = sum(
+                    torch.mean(w_bc[:, i] * bc_comp[name])
+                    for i, name in enumerate(self.data_handler.boundary_type_names)
+                    if name in bc_comp and bc_comp[name] > 0
+                ) + extra_grad
+            else:
+                bc_loss = sum(
+                    self.loss_computer.loss_weights.get(name, 0.0) * bc_comp[name]
+                    for name in bc_comp
+                ) + extra_grad
         else:
             bc_comp = {}
             # Создаём нулевой тензор, который требует градиент (чтобы избежать ошибок в диагностике)
             bc_loss = torch.zeros(1, device=self.device, dtype=self.dtype, requires_grad=True).squeeze()
-
-        # Если используются SA-веса и они применяются к BC, добавляем взвешивание
-        if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None and self.loss_computer.bc_type == 'soft':
-            for i, name in enumerate(self.data_handler.boundary_type_names):
-                if name in bc_comp and bc_comp[name] > 0:
-                    bc_loss += torch.mean(w_bc[:, i] * bc_comp[name])
 
         # Интегральная потеря
         integral_loss = self.loss_computer.compute_integral_loss(u, v, bt, x, y) * self.loss_computer.integral_weight
@@ -461,15 +468,17 @@ class Trainer:
             return 0.0
         indices = np.where(near_wall)[0]
         self.model.eval()
-        with torch.no_grad():
-            x_pts = dataset.x[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
-            y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
-            sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
-            bt_pts = dataset.boundary_types[indices].to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
-            input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
-            out = self.model(input_tensor)
-            u_vals = out[:, 0:1]
-        # Вычисляем градиент du/dy через autograd
+        x_pts = dataset.x[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
+        y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).unsqueeze(1).requires_grad_(True)
+        sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
+        bt_pts = dataset.boundary_types[indices].to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
+        input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
+        out = self.model(input_tensor)
+        u_vals = out[:, 0:1]
+        # Обнуляем накопленные градиенты перед вычислением du/dy
+        self.model.zero_grad()
+        if y_pts.grad is not None:
+            y_pts.grad.zero_()
         u_vals.sum().backward(retain_graph=True)
         grad_u_y = y_pts.grad
         if grad_u_y is not None:
@@ -530,6 +539,63 @@ class Trainer:
             logger.warning("RAR: SA-веса расширены. Требуется пересоздание оптимизатора в solver.")
 
         logger.info(f"RAR: добавлено {top_k} точек. Теперь всего точек: {self.data_handler.n_points}")
+
+    # ------------------------------------------------------------------
+    # FVM-шаг (полный датасет, отдельный от батч-цикла)
+    # ------------------------------------------------------------------
+    def _run_fvm_step(self) -> float:
+        """
+        Отдельный шаг оптимизации с FVM-потерей на полном датасете.
+
+        Выполняется после основного батч-цикла PDE/BC. Координаты x, y
+        не требуют requires_grad — нейросеть предсказывает u, v без
+        дифференцирования по пространству.
+
+        Returns:
+            Значение FVM-потери после шага (float)
+        """
+        if self.loss_computer.fvm is None or self.loss_computer.fvm_weight == 0.0:
+            return 0.0
+
+        dataset = self.data_handler.dataset
+        n_dataset = dataset.x.shape[0]
+
+        # Проверка согласованности размеров: датасет мог вырасти после RAR
+        if n_dataset != self.loss_computer.fvm.N:
+            logger.warning(
+                "FVM step пропущен: датасет (%d точек) и сетка (%d узлов) "
+                "не совпадают (вероятно, выполнялся RAR). "
+                "Пересоздайте FVMResiduals после обновления сетки.",
+                n_dataset, self.loss_computer.fvm.N,
+            )
+            return 0.0
+
+        self.model.train()
+        self.optimizer.zero_grad()
+
+        x_all   = dataset.x.to(self.device, dtype=self.dtype)
+        y_all   = dataset.y.to(self.device, dtype=self.dtype)
+        sdf_all = dataset.sdf.to(self.device, dtype=self.dtype)
+        bt_all  = (dataset.boundary_types.to(self.device, dtype=self.dtype)
+                   if dataset.boundary_types is not None else None)
+
+        input_all = self.loss_computer.build_input_tensor(x_all, y_all, sdf_all, bt_all)
+        out_all   = self.model(input_all)          # (N, output_dim)
+        u_fvm     = out_all[:, :2]                  # (N, 2) — u и v
+
+        fvm_loss = self.loss_computer.compute_fvm_loss(u_fvm)
+
+        fvm_loss.backward()
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+            if self.sa_weights is not None:
+                torch.nn.utils.clip_grad_norm_(self.sa_weights.parameters(), self.grad_clip)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        val = fvm_loss.item()
+        logger.debug("FVM step: loss=%.4e", val)
+        return val
 
     # ------------------------------------------------------------------
     # Шаг обучения (Adam)
@@ -696,6 +762,16 @@ class Trainer:
 
         # Вычисление rate (отношение к предыдущему значению) – для отчёта
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
+
+        # FVM-шаг (отдельный backward на полном датасете, раз в fvm_interval эпох)
+        self._fvm_epoch_counter += 1
+        if (self.loss_computer.fvm is not None
+                and self.loss_computer.fvm_weight > 0.0
+                and self._fvm_epoch_counter % self.fvm_interval == 0):
+            self._last_fvm_loss = self._run_fvm_step()
+            avg_loss += self._last_fvm_loss
+        else:
+            self._last_fvm_loss = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, avg_grad_norm
 

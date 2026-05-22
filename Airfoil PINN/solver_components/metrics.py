@@ -448,10 +448,18 @@ class MetricsCollector:
         Returns:
             словарь с метриками
         """
-        # Последние значения из истории
-        final_pde_loss = sum(self.history['pde'][c][-1] for c in self.loss_computer.pde_components) if self.history['pde'] else 0.0
-        final_bc_loss = sum(self.history['bc'].values())[-1] if self.history['bc'] else 0.0
-        final_integral_loss = self.history['integral_loss'][-1] if self.history['integral_loss'] else 0.0
+        # Последние значения из истории (с защитой от пустых списков)
+        pde_hist = self.history.get('pde', {})
+        if pde_hist and all(len(pde_hist.get(c, [])) > 0 for c in self.loss_computer.pde_components):
+            final_pde_loss = sum(pde_hist[c][-1] for c in self.loss_computer.pde_components)
+        else:
+            final_pde_loss = 0.0
+
+        bc_hist = self.history.get('bc', {})
+        final_bc_loss = sum(v[-1] for v in bc_hist.values() if v and len(v) > 0) if bc_hist else 0.0
+
+        int_hist = self.history.get('integral_loss')
+        final_integral_loss = int_hist[-1] if int_hist and len(int_hist) > 0 else 0.0
 
         # Средние скорости на границах (нормированные)
         avg_u_in_norm, avg_u_out_norm = self._cached_u_in_norm, self._cached_u_out_norm

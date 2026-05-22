@@ -86,21 +86,6 @@ class BoundaryConditions:
                 logger.warning("При симметрии угол атаки принудительно установлен в 0.")
                 self.inlet_angle = 0.0
 
-    def to_dict(self) -> BoundaryConditionsDict:
-        """Преобразует граничные условия в словарь."""
-        return BoundaryConditionsDict(
-            fluid_name=self.fluid_name,
-            inlet_pressure=self.inlet_pressure,
-            outlet_pressure=self.outlet_pressure,
-            inlet_velocity_mode=self.inlet_velocity_mode,  # type: ignore
-            inlet_u=self.inlet_u,
-            inlet_v=self.inlet_v,
-            inlet_speed=self.inlet_speed,
-            inlet_angle=self.inlet_angle,
-            symmetry_type=self.symmetry_type,
-            description=self.description
-        )
-
     @property
     def u(self) -> float:
         """
