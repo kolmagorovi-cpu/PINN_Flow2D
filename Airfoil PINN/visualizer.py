@@ -76,14 +76,23 @@ class Visualizer:
         if not self.enabled:
             return
         try:
-            # Окно для PDE (4 графика: cont, mom_x, mom_y, total_loss)
+            # Окно для PDE (4 графика: cont, mom_x/r, mom_y/z, total_loss)
             self.fig_pde, self.axes_pde = plt.subplots(1, 4, figsize=(20, 4), constrained_layout=True)
-            pde_items = [
-                ('cont', 'Continuity'),
-                ('mom_x', 'Momentum X'),
-                ('mom_y', 'Momentum Y'),
-                ('total', 'Total Loss')
-            ]
+            flow_type = (self.config or {}).get('pde', {}).get('flow_type', '2d')
+            if flow_type == 'axisymmetric':
+                pde_items = [
+                    ('cont', 'Continuity'),
+                    ('mom_r', 'Momentum R'),
+                    ('mom_z', 'Momentum Z'),
+                    ('total', 'Total Loss')
+                ]
+            else:
+                pde_items = [
+                    ('cont', 'Continuity'),
+                    ('mom_x', 'Momentum X'),
+                    ('mom_y', 'Momentum Y'),
+                    ('total', 'Total Loss')
+                ]
             self.lines_pde = {}
             for ax, (key, title) in zip(self.axes_pde, pde_items):
                 line, = ax.plot([], [])
@@ -187,26 +196,32 @@ class Visualizer:
 
             # Обновление диагностических графиков
             if plt.fignum_exists(self.fig_diag.number):
-                # Градиенты
+                # Градиенты (заполняются реже, чем history['loss'] — используем длину серии)
                 if 'grad_norms' in self.lines_diag:
                     line1, line2, line3 = self.lines_diag['grad_norms']
                     if 'grad_norm_pde' in history and len(history['grad_norm_pde']) > 0:
-                        line1.set_data(epochs_range, history['grad_norm_pde'])
+                        s = history['grad_norm_pde']
+                        line1.set_data(list(range(len(s))), s)
                     if 'grad_norm_bc' in history and len(history['grad_norm_bc']) > 0:
-                        line2.set_data(epochs_range, history['grad_norm_bc'])
+                        s = history['grad_norm_bc']
+                        line2.set_data(list(range(len(s))), s)
                     if 'grad_cosine' in history and len(history['grad_cosine']) > 0:
-                        line3.set_data(epochs_range, history['grad_cosine'])
-                # Средние скорости
+                        s = history['grad_cosine']
+                        line3.set_data(list(range(len(s))), s)
+                # Средние скорости (заполняются реже — используем длину серии)
                 if 'avg_vel' in self.lines_diag:
                     line1, line2 = self.lines_diag['avg_vel']
                     if 'avg_u_in' in history and len(history['avg_u_in']) > 0:
-                        line1.set_data(epochs_range, history['avg_u_in'])
+                        s = history['avg_u_in']
+                        line1.set_data(list(range(len(s))), s)
                     if 'avg_u_out' in history and len(history['avg_u_out']) > 0:
-                        line2.set_data(epochs_range, history['avg_u_out'])
-                # Ошибка баланса масс
+                        s = history['avg_u_out']
+                        line2.set_data(list(range(len(s))), s)
+                # Ошибка баланса масс (заполняется реже — используем длину серии)
                 if 'mass_balance' in self.lines_diag and 'mass_balance_error' in history and len(history['mass_balance_error']) > 0:
                     line = self.lines_diag['mass_balance']
-                    line.set_data(epochs_range, history['mass_balance_error'])
+                    s = history['mass_balance_error']
+                    line.set_data(list(range(len(s))), s)
 
                 for ax in self.axes_diag:
                     ax.relim()
@@ -783,7 +798,8 @@ class Visualizer:
     def plot_final_fields(self, model: nn.Module, data_handler,
                           device: torch.device, savedir: str,
                           epoch: Optional[Union[int, str]] = None,
-                          plot_physical: bool = False) -> None:
+                          plot_physical: bool = False,
+                          loss_computer=None) -> None:
         """
         Устаревший метод – сохранён для совместимости.
         Рекомендуется использовать plot_final_fields_from_tensors.
@@ -797,7 +813,9 @@ class Visualizer:
         bt = dataset.boundary_types.to(device) if dataset.boundary_types is not None else None
 
         with torch.no_grad():
-            if bt is not None:
+            if loss_computer is not None:
+                input_tensor = loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
+            elif bt is not None:
                 input_tensor = torch.cat([x_norm, y_norm, sdf_norm, bt], dim=1)
             else:
                 input_tensor = torch.cat([x_norm, y_norm, sdf_norm], dim=1)

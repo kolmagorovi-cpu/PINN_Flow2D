@@ -196,7 +196,7 @@ class PINNDataset(Dataset):
                 if bt_str == 'inlet':
                     self.mask_u_fixed[i] = True
                     self.mask_v_fixed[i] = True
-                    # Значения будут позже загружены из метаданных
+                    # u_bc/v_bc для inlet остаются 0 до вызова set_inlet_values() из DataHandler
 
                 elif bt_str == 'outlet':
                     self.mask_p_fixed[i] = True
@@ -217,6 +217,12 @@ class PINNDataset(Dataset):
 
         self.n_points = len(self.x)
         logger.info(f"Типы границ в данных: {self.boundary_type_names}")
+        if 'inlet' in self.boundary_type_names:
+            logger.warning(
+                "inlet-точки загружены: маски mask_u_fixed/mask_v_fixed выставлены, "
+                "но u_bc/v_bc = 0 до вызова DataHandler.set_inlet_values(). "
+                "Убедитесь, что DataHandler вызывает set_inlet_values() после загрузки метаданных."
+            )
 
     def set_inlet_values(self, u_norm: float, v_norm: float) -> None:
         """

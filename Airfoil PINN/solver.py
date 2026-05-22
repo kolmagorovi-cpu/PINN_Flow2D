@@ -431,11 +431,11 @@ class PINNSolver:
             u_pred_norm = pred_norm['u_norm']  # одномерный массив numpy
             profiles = {}
             for x_sec in self.profile_sections:
-                x_norm = x_sec / self.data_handler.chord
+                x_norm = x_sec  # profile_sections — уже нормированные доли хорды (0..1)
                 # Передаём предсказанные значения u_norm в interpolate_profile
                 y_grid, u_interp_norm = self.data_handler.interpolate_profile(
                     x_norm,
-                    u_vals=torch.from_numpy(u_pred_norm).float(),  # конвертируем обратно в тензор
+                    u_vals=torch.from_numpy(u_pred_norm).to(dtype=self.dtype),
                     num_points=200,
                     y_max_ratio=self.profile_y_max_ratio
                 )
@@ -658,7 +658,8 @@ class PINNSolver:
 
                 # Вывод в консоль (avg_u_in/out уже вычислены выше)
                 self.metrics.print_epoch_table(
-                    epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time
+                    epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time,
+                    fvm_loss=self.trainer._last_fvm_loss
                 )
                 line2 = f"   avg u_inlet = {avg_u_in:.4f} (норм.), avg u_outlet = {avg_u_out:.4f} (норм.)"
                 print(line2)
@@ -730,7 +731,6 @@ class PINNSolver:
             pg['lr'] = current_lr
         self.scheduler = self._init_scheduler()
         self.trainer.optimizer = self.optimizer
-        self.trainer.scheduler = self.scheduler
         logger.info("Оптимизатор пересоздан.")
 
     def _finalize(self):

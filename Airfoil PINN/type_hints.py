@@ -22,7 +22,7 @@ from typing_extensions import NotRequired
 
 
 # =============================================================================
-# ГЕОМЕТРИЯ (Geometry2D.py, Geometry.py, junction_geom.py)
+# ГЕОМЕТРИЯ (Geometry2D.py, Geometry.py)
 # =============================================================================
 
 class GeometryConfigDict(TypedDict):
@@ -99,48 +99,6 @@ class AirfoilParamsDict(TypedDict, total=False):
     domain_params: AirfoilDomainParamsDict
     auto_domain: bool
     normalize: bool
-
-
-class JunctionParamsDict(TypedDict, total=False):
-    """
-    Параметры тройника (junction).
-
-    Attributes:
-        name: Название тройника
-        source_type: Тип источника ('config' или 'file')
-        chanel_width: Ширина каналов [м]
-        down_length: Длина входного канала (нижний) [м]
-        side_length: Длина бокового канала (правый) [м]
-        top_length: Длина выходного канала (верхний) [м]
-        top2side_angl: Угол между верхним и боковым каналами [°]
-        side2down_angl: Угол между боковым и нижним каналами [°]
-        auto_domain: Автоматическое построение контура
-        origin_at_junction: Начало координат в точке схождения каналов
-    """
-    name: str
-    source_type: Literal['config', 'file']
-    chanel_width: float
-    down_length: float
-    side_length: float
-    top_length: float
-    top2side_angl: float
-    side2down_angl: float
-    auto_domain: bool
-    origin_at_junction: bool
-
-
-class JunctionMetadataDict(TypedDict):
-    """
-    Метаданные геометрии тройника.
-
-    Attributes:
-        geom_type: Тип геометрии ('junction')
-        junction_params: Параметры тройника
-        num_domain_points: Количество точек области
-    """
-    geom_type: str
-    junction_params: Dict[str, Any]
-    num_domain_points: int
 
 
 class DomainParamsDict(TypedDict, total=False):
@@ -609,8 +567,6 @@ __all__ = [
     'GeomConfigFileParamsDict',
     'AirfoilDomainParamsDict',
     'AirfoilParamsDict',
-    'JunctionParamsDict',
-    'JunctionMetadataDict',
     'DomainParamsDict',
     'ClosedDomainParamsDict',
     'GeometryMetadataDict',

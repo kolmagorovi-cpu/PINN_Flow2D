@@ -201,7 +201,10 @@ class Initializer:
             files = glob.glob(os.path.join(self.sampler_dir, "*.npy"))
             if not files:
                 raise FileNotFoundError(f"Нет .npy файлов в {self.sampler_dir}")
-            main_files = [f for f in files if not f.endswith('_interior.npy') and not f.endswith('_boundary.npy')]
+            main_files = [f for f in files
+                          if not f.endswith('_interior.npy')
+                          and not f.endswith('_boundary.npy')
+                          and not f.endswith('_metadata.npy')]
             filename = main_files[0] if main_files else files[0]
             print(f"Использую файл точек: {os.path.basename(filename)}")
         data = np.load(filename, allow_pickle=True)
@@ -268,19 +271,24 @@ class Initializer:
 
     def _load_chord_from_metadata(self) -> float:
         """Определяет хорду из метаданных геометрии или оценивает по разбросу x."""
-        meta_path = os.path.join(GEOMETRY_DIR, "airfoil_metadata.npy")
-        if os.path.exists(meta_path):
+        meta_files = glob.glob(os.path.join(GEOMETRY_DIR, "*_metadata.npy"))
+        if meta_files:
+            meta_path = max(meta_files, key=os.path.getmtime)
             try:
                 meta = np.load(meta_path, allow_pickle=True).item()
                 chord = meta.get('chord', None)
                 if chord is not None:
+                    logger.info(f"Хорда загружена из {os.path.basename(meta_path)}: {chord:.4f} м")
                     return float(chord)
                 else:
-                    logger.warning("Метаданные не содержат 'chord', оцениваю по разбросу x.")
+                    logger.warning(f"Метаданные {os.path.basename(meta_path)} не содержат 'chord', оцениваю по разбросу x.")
             except Exception as e:
-                logger.warning(f"Ошибка загрузки метаданных: {e}")
+                logger.warning(f"Ошибка загрузки метаданных из {os.path.basename(meta_path)}: {e}")
         x_range = self.points['x'].max() - self.points['x'].min()
-        logger.warning(f"Хорда не найдена в метаданных, используется приближение по разбросу x: {x_range:.4f} м")
+        logger.warning(
+            f"Файлы метаданных не найдены или не содержат хорду. "
+            f"Используется приближение по разбросу x точек (включает домен, не только хорду): {x_range:.4f} м"
+        )
         return float(x_range)
 
     def select_fluid(self) -> str:
@@ -524,9 +532,7 @@ class Initializer:
                 logger.info("Однопоточный режим.")
                 sdf_phys = np.zeros(N)
                 if SCIPY_AVAILABLE and self.wall_tree is not None:
-                    for i in range(N):
-                        dist, _ = self.wall_tree.query(np.array([xs[i], ys[i]]), k=1)
-                        sdf_phys[i] = dist
+                    sdf_phys, _ = self.wall_tree.query(np.column_stack([xs, ys]), k=1)
                 else:
                     # Полный перебор
                     for i in range(N):

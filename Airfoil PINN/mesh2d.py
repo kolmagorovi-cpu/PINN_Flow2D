@@ -129,7 +129,6 @@ class _PointAdapter:
     on_airfoil: bool
     on_boundary: bool
     segment_id: int
-    channel_id: str = ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -548,7 +547,6 @@ class Mesh2D:
     ) -> "Mesh2D":
         """Загружает точки из .npy structured array."""
         arr = np.load(path, allow_pickle=True)
-        has_channel = "channel_id" in arr.dtype.names
         points = [
             _PointAdapter(
                 id=int(row["id"]),
@@ -558,7 +556,6 @@ class Mesh2D:
                 on_airfoil=bool(row["on_airfoil"]),
                 on_boundary=bool(row["on_boundary"]),
                 segment_id=int(row["segment_id"]),
-                channel_id=str(row["channel_id"]) if has_channel else "",
             )
             for row in arr
         ]

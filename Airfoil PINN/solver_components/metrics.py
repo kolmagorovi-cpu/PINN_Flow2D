@@ -79,6 +79,7 @@ class MetricsCollector:
             'grad_norm': [],
             'total_bc': [] if loss_computer.bc_type == 'soft' else None,
             'total_pde': [],
+            'fvm_loss': [],
             # Новые поля для диагностики
             'grad_norm_pde': [],
             'grad_norm_bc': [],
@@ -155,6 +156,8 @@ class MetricsCollector:
 
         # Добавляем дополнительные метрики, если они есть
         if extra_diag:
+            if 'fvm_loss' in extra_diag:
+                self.history['fvm_loss'].append(extra_diag['fvm_loss'])
             if 'grad_norm_pde' in extra_diag:
                 self.history['grad_norm_pde'].append(extra_diag['grad_norm_pde'])
             if 'grad_norm_bc' in extra_diag:
@@ -262,7 +265,8 @@ class MetricsCollector:
         integral_loss: float,
         pde_max: Dict[str, float],
         epoch_time: float,
-        total_time: float
+        total_time: float,
+        fvm_loss: float = 0.0
     ) -> None:
         """
         Выводит подробную таблицу с компонентами потерь за эпоху.
@@ -322,13 +326,7 @@ class MetricsCollector:
             for name in self.data_handler.boundary_type_names:
                 val = bc_comp.get(name, 0)
                 rate_bc = self._compute_rate('bc', name, val)
-                # Для symmetry и axis_symmetry вес может быть другим
-                weight_key = name
-                if name == 'symmetry':
-                    weight_key = 'symmetry_grad'
-                elif name == 'axis_symmetry':
-                    weight_key = 'axis_symmetry_grad'
-                weight = w.get(weight_key, 0)
+                weight = w.get(name, 0)
                 w_rms_bc = val * weight
                 w_max_bc = val * weight
                 disp_name = name.replace('_', ' ').title()
@@ -346,6 +344,11 @@ class MetricsCollector:
             w_max_int = integral_loss * w_int
             print(fmt_line('Integral Flow', rate_int, integral_loss, integral_loss,
                            w_int, w_rms_int, w_max_int))
+
+        # FVM loss (если ненулевая)
+        if fvm_loss > 0.0:
+            fvm_w = getattr(self.loss_computer, 'fvm_weight', 0.0)
+            print(fmt_line('FVM Loss', 1.0, fvm_loss, fvm_loss, fvm_w, fvm_loss * fvm_w, fvm_loss * fvm_w))
 
         # Totals
         total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0
@@ -478,6 +481,9 @@ class MetricsCollector:
         # Финальная норма градиентов
         final_grad_norm = self.history['grad_norm'][-1] if self.history['grad_norm'] else 0.0
 
+        fvm_hist = self.history.get('fvm_loss', [])
+        final_fvm_loss = fvm_hist[-1] if fvm_hist else 0.0
+
         metrics = {
             'experiment': self.config_name,
             'final_u_out_phys': avg_u_out_phys,
@@ -488,6 +494,7 @@ class MetricsCollector:
             'final_pde_loss': final_pde_loss,
             'final_bc_loss': final_bc_loss,
             'final_integral_loss': final_integral_loss,
+            'final_fvm_loss': final_fvm_loss,
             'best_epoch': best_epoch,
             'best_loss': best_loss,
             'final_gradient_norm': final_grad_norm,

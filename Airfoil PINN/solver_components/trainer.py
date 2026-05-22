@@ -232,7 +232,7 @@ class Trainer:
                 bc_loss = sum(
                     torch.mean(w_bc[:, i] * bc_comp[name])
                     for i, name in enumerate(self.data_handler.boundary_type_names)
-                    if name in bc_comp and bc_comp[name] > 0
+                    if name in bc_comp and self.loss_computer.loss_weights.get(name, 0.0) > 0
                 ) + extra_grad
             else:
                 bc_loss = sum(
@@ -468,9 +468,9 @@ class Trainer:
             return 0.0
         indices = np.where(near_wall)[0]
         self.model.eval()
-        x_pts = dataset.x[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
-        y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).unsqueeze(1).requires_grad_(True)
-        sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype).unsqueeze(1)
+        x_pts = dataset.x[indices].to(self.device, dtype=self.dtype)
+        y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).requires_grad_(True)
+        sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype)
         bt_pts = dataset.boundary_types[indices].to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
         input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
         out = self.model(input_tensor)
@@ -571,7 +571,7 @@ class Trainer:
             return 0.0
 
         self.model.train()
-        self.optimizer.zero_grad()
+        # Градиенты уже обнулены последним батчем (accum_step всегда True для последнего батча)
 
         x_all   = dataset.x.to(self.device, dtype=self.dtype)
         y_all   = dataset.y.to(self.device, dtype=self.dtype)
@@ -855,6 +855,16 @@ class Trainer:
         avg_loss = loss.item() if torch.is_tensor(loss) else loss
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
         avg_extra_grad = 0.0  # не вычисляется для L-BFGS
+
+        # FVM-шаг (аналогично Adam; счётчик общий для обоих режимов)
+        self._fvm_epoch_counter += 1
+        if (self.loss_computer.fvm is not None
+                and self.loss_computer.fvm_weight > 0.0
+                and self._fvm_epoch_counter % self.fvm_interval == 0):
+            self._last_fvm_loss = self._run_fvm_step()
+            avg_loss += self._last_fvm_loss
+        else:
+            self._last_fvm_loss = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, 0.0
 

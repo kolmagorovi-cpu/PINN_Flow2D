@@ -30,7 +30,7 @@ Example:
 """
 
 import numpy as np
-from shapely.geometry import Polygon, Point, LineString
+from shapely.geometry import Polygon, LineString
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from multiprocessing import Process, Queue, freeze_support
@@ -50,8 +50,6 @@ from scipy.spatial import cKDTree
 from type_hints import (
     CollocationPointDict,
     SamplerConfigDict,
-    JunctionParamsDict,
-    JunctionMetadataDict,
 )
 
 # Попытка импорта tqdm для прогресс-бара
@@ -101,7 +99,6 @@ class CollocationPoint:
         on_airfoil: Находится ли точка на профиле
         on_boundary: Находится ли точка на границе
         segment_id: ID сегмента границы
-        channel_id: Идентификатор канала (для тройника)
     """
     id: int
     x: float
@@ -110,7 +107,6 @@ class CollocationPoint:
     on_airfoil: bool = False
     on_boundary: bool = False
     segment_id: int = -1
-    channel_id: str = ""  # NEW: идентификатор канала для тройника
 
     def to_dict(self) -> CollocationPointDict:
         """
@@ -126,8 +122,7 @@ class CollocationPoint:
             boundary_type=self.boundary_type.value,
             on_airfoil=self.on_airfoil,
             on_boundary=self.on_boundary,
-            segment_id=self.segment_id,
-            channel_id=self.channel_id
+            segment_id=self.segment_id
         )
 
     def to_tuple(self) -> Tuple[float, float]:
@@ -163,10 +158,8 @@ class SamplerConfig:
         sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all')
         adaptive_alpha: Степень сгущения (для адаптивных методов)
         adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
-        geom_type: Тип геометрии ('airfoil' или 'junction')
+        geom_type: Тип геометрии (только 'airfoil')
         geom_name: Имя конфигурации (например, 'VMFL010')
-        junction_params: Загруженные параметры тройника
-        has_internal_body: False для тройника
     """
     num_processes: int = 4
     step_size: float = 0.01
@@ -185,12 +178,10 @@ class SamplerConfig:
     sampling_method: str = "regular"
     adaptive_alpha: float = 1.0
     adaptive_epsilon_factor: float = 0.01
-    
-    # Параметры геометрии (загружаются из geom_config.yaml)
-    geom_type: str = "airfoil"  # "airfoil" или "junction"
-    geom_name: str = None  # Имя конфигурации (например, 'VMFL010')
-    junction_params: Dict = None  # Загруженные параметры тройника
-    has_internal_body: bool = True  # False для тройника
+
+    # Тип геометрии (только 'airfoil')
+    geom_type: str = "airfoil"
+    geom_name: str = None
 
     def __post_init__(self) -> None:
         """
@@ -399,8 +390,6 @@ class CollocationPoints:
         foil_coords: Координаты профиля
         domain_coords: Координаты области
         foil_is_closed: Флаг замкнутости профиля
-        junction_params: Параметры тройника (для геометрии junction)
-        channel_width: Ширина канала тройника
     """
 
     def __init__(self, config: SamplerConfig) -> None:
@@ -420,11 +409,8 @@ class CollocationPoints:
         self.foil_coords: Optional[np.ndarray] = None
         self.domain_coords: Optional[np.ndarray] = None
         self.foil_is_closed = False
-        
-        # Для тройника
-        self.junction_params: Optional[Dict] = None
-        self.channel_width: Optional[float] = None
-        
+        self.output_base: Optional[str] = None
+
         # Загрузка конфигурации геометрии
         self.load_geometry_config()
 
@@ -475,91 +461,9 @@ class CollocationPoints:
             logger.info(f"   geom_type: {self.config.geom_type}")
             logger.info(f"   geom_name: {self.config.geom_name or 'default'}")
 
-            # Для тройника — загрузка дополнительных параметров
-            if self.config.geom_type == 'junction':
-                self._load_junction_params()
-
         except Exception as e:
             logger.warning(f"⚠️ Не удалось загрузить geom_config.yaml: {e}")
             logger.info("   Используется конфигурация по умолчанию (airfoil)")
-
-    def _load_junction_params(self) -> None:
-        """Загрузка параметров тройника из junction_geoms.yaml"""
-        # Используем фиксированный абсолютный путь
-        junctions_path = r"C:\Users\BelchikovDA\projects\dev\proj\pinn-solver\PINN_Flow2D\Airfoil PINN\Geometry\junction_geoms.yaml"
-
-        if not os.path.exists(junctions_path):
-            logger.error(f"❌ junction_geoms.yaml не найден: {junctions_path}")
-            return
-
-        try:
-            with open(junctions_path, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f)
-
-            # Поиск конфигурации по имени
-            junctions = {j['name']: j for j in data.get('junctions', [])}
-
-            if self.config.geom_name in junctions:
-                self.config.junction_params = junctions[self.config.geom_name]
-                self.junction_params = junctions[self.config.geom_name]
-                self.channel_width = self.junction_params.get('chanel_width')
-                self.config.has_internal_body = False
-                logger.info(f"✅ Параметры тройника загружены: {self.config.geom_name}")
-                logger.info(f"   Ширина канала: {self.channel_width}")
-            else:
-                # Если конфигурация не найдена, пробуем загрузить из файла метаданных
-                logger.warning(f"⚠️ Конфигурация '{self.config.geom_name}' не найдена в {junctions_path}")
-                self._load_junction_metadata_file()
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки junction_geoms.yaml: {e}")
-            self._load_junction_metadata_file()
-
-    def _load_junction_metadata_file(self) -> None:
-        """Загрузка параметров тройника из файла метаданных .npy"""
-        meta_files = []
-        if self.config.geom_name:
-            meta_files.append(f"junction_{self.config.geom_name}_metadata.npy")
-        meta_files.extend(["junction_metadata.npy", "junction_metadata.txt"])
-
-        meta_path = None
-        # Поиск в директории геометрии
-        for name in meta_files:
-            path = os.path.join(self.config.geometry_dir, name)
-            if os.path.exists(path):
-                meta_path = path
-                break
-
-        # Поиск в Geometry/Data
-        if meta_path is None:
-            alt_dir = os.path.join(PROJECT_ROOT, "Geometry", "Data")
-            for name in meta_files:
-                path = os.path.join(alt_dir, name)
-                if os.path.exists(path):
-                    meta_path = path
-                    break
-
-        if meta_path is None:
-            logger.warning("⚠️ Файл метаданных тройника не найден")
-            return
-
-        try:
-            ext = os.path.splitext(meta_path)[1].lower()
-            if ext == '.npy':
-                params = np.load(meta_path, allow_pickle=True).item()
-            else:
-                params = np.loadtxt(meta_path, delimiter=',', skiprows=1)
-                params = {str(i): v for i, v in enumerate(params)}
-
-            self.config.junction_params = params
-            self.junction_params = params
-            self.channel_width = params.get('chanel_width', params.get('channel_width'))
-            self.config.has_internal_body = False
-            logger.info(f"✅ Параметры тройника загружены из метаданных")
-            if self.channel_width:
-                logger.info(f"   Ширина канала: {self.channel_width}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки метаданных: {e}")
 
     def find_geometry_files(self) -> Dict[str, Optional[str]]:
         """
@@ -569,34 +473,7 @@ class CollocationPoints:
             Словарь с путями к файлам {'foil': path, 'domain': path, 'metadata': path}
         """
         result = {'foil': None, 'domain': None, 'metadata': None}
-        
-        # Для тройника
-        if self.config.geom_type == 'junction':
-            domain_names = ["junction_domain.npy", "junction_domain.txt"]
-            if self.config.geom_name:
-                domain_names.insert(0, f"junction_{self.config.geom_name}_domain.npy")
-                domain_names.insert(1, f"junction_{self.config.geom_name}_domain.txt")
-            
-            for name in domain_names:
-                path = os.path.join(self.config.geometry_dir, name)
-                if os.path.exists(path):
-                    result['domain'] = path
-                    print(f"   ✅ Найдена область: {name}")
-                    break
-            
-            # Если не найдено в geometry_dir, ищем в Geometry/Data
-            if result['domain'] is None:
-                alt_dir = os.path.join(PROJECT_ROOT, "Geometry", "Data")
-                for name in domain_names:
-                    path = os.path.join(alt_dir, name)
-                    if os.path.exists(path):
-                        result['domain'] = path
-                        print(f"   ✅ Найдена область (альтернатива): {name}")
-                        break
-            
-            return result
-        
-        # Для профиля (airfoil)
+
         foil_names = ["airfoil_foil.npy", "airfoil_foil.txt"]
         domain_names = ["airfoil_domain.npy", "airfoil_domain.txt"]
         meta_names = ["airfoil_metadata.npy"]
@@ -632,12 +509,7 @@ class CollocationPoints:
             FileNotFoundError: Если файл области не найден
         """
         print("\n📂 Поиск файлов геометрии...")
-        
-        # Для тройника
-        if self.config.geom_type == 'junction':
-            return self._load_junction_geometry()
-        
-        # Для профиля (airfoil)
+
         files = self.find_geometry_files()
         if files['domain'] is None:
             raise FileNotFoundError(f"Файл области не найден в {self.config.geometry_dir}")
@@ -668,33 +540,6 @@ class CollocationPoints:
 
         self.output_base = os.path.join(self.config.output_dir, "collocation_points")
         return domain, foil
-
-    def _load_junction_geometry(self) -> Tuple[np.ndarray, None]:
-        """Загрузка геометрии тройника"""
-        print("\n📂 Загрузка геометрии тройника...")
-        
-        files = self.find_geometry_files()
-        if files['domain'] is None:
-            raise FileNotFoundError(
-                f"Файл области тройника не найден. Ожидался: junction_domain.npy/.txt"
-            )
-
-        print(f"\n📂 Загрузка области: {os.path.basename(files['domain'])}")
-        domain = self._load_coords(files['domain'])
-        
-        # Замыкаем контур области, если необходимо
-        if not np.allclose(domain[0], domain[-1], atol=1e-6):
-            logger.warning("⚠️ Контур области не замкнут! Замыкаю.")
-            domain = np.vstack([domain, domain[0]])
-        self.domain_coords = domain
-
-        # Для тройника профиль отсутствует
-        self.foil_coords = None
-        self.foil_is_closed = False
-
-        self.output_base = os.path.join(self.config.output_dir, "collocation_points")
-        logger.info("✅ Геометрия тройника загружена")
-        return domain, None
 
     def _load_coords(self, filepath: str) -> np.ndarray:
         """
@@ -734,10 +579,6 @@ class CollocationPoints:
         Returns:
             Список точек на внешней границе
         """
-        # Для тройника используем специальный метод
-        if self.config.geom_type == 'junction':
-            return self._sample_boundary_junction(contour, step)
-        
         line = LineString(contour)
         length = line.length
         # Удаляем замыкающую точку для расчёта длины
@@ -768,269 +609,6 @@ class CollocationPoints:
         for bt, cnt in type_counts.items():
             logger.info(f"   {bt.value}: {cnt}")
         return points
-
-    def _sample_boundary_junction(self, contour: np.ndarray, step: float) -> List[CollocationPoint]:
-        """
-        Генерация точек на границах тройника на основе топологии контура.
-
-        Используется нормализованное расстояние вдоль контура для определения
-        сегмента и типа граничного условия.
-
-        Args:
-            contour: массив координат контура области
-            step: шаг дискретизации
-
-        Returns:
-            список точек коллокации на границе
-        """
-        # Создаём ЗАМКНУТУЮ линию из контура для генерации точек на всех гранях
-        # включая замыкающую грань 7→0 (левая стенка)
-        if np.allclose(contour[0], contour[-1], atol=1e-6):
-            line = LineString(contour)  # Контур уже замкнут
-        else:
-            # Замыкаем контур, добавляя первую точку в конец
-            closed_contour = np.vstack([contour, contour[0]])
-            line = LineString(closed_contour)
-
-        length = line.length
-        num_points = int(length / step) + 1
-
-        points = []
-        segment_counter = 0
-        last_channel_id = None
-
-        for i in range(num_points):
-            distance = i * step
-            if distance <= length:
-                pt = line.interpolate(distance)
-                x, y = pt.x, pt.y
-
-                # Нормализованное расстояние [0, 1] для замкнутого контура
-                norm_dist = distance / length
-
-                # Классификация на основе топологии с координатами
-                btype, channel_id = self._classify_by_topology(norm_dist, contour, (x, y))
-
-                # Определяем segment_id (последовательно для каждого канала)
-                if channel_id != last_channel_id:
-                    segment_counter += 1
-                    last_channel_id = channel_id
-
-                points.append(CollocationPoint(
-                    id=self._get_next_id(),
-                    x=x, y=y,
-                    boundary_type=btype,
-                    on_airfoil=False,
-                    on_boundary=True,
-                    segment_id=segment_counter,
-                    channel_id=channel_id
-                ))
-
-        # Статистика по сегментам
-        segment_stats = {}
-        for p in points:
-            key = f"{p.boundary_type.value}:{p.channel_id}"
-            segment_stats[key] = segment_stats.get(key, 0) + 1
-
-        logger.info(f"✅ Границы тройника: {len(points)} точек")
-        logger.info("   Распределение по сегментам:")
-        for seg, cnt in sorted(segment_stats.items()):
-            logger.info(f"     {seg}: {cnt}")
-
-        return points
-
-    def _get_segment_boundaries_meters(self, contour: np.ndarray) -> List[Tuple[float, float, BoundaryType, str]]:
-        """
-        Вычисление границ сегментов в метрах для прямоугольного T-тройника.
-
-        Контур имеет 8 вершин и 8 граней:
-
-        №  | Вершина/Грань      | Тип       | channel_id
-        ---|-------------------|-----------|------------------
-        0  | Вершина 0         | WALL      | wall_corner_0 (inlet левый угол)
-        1  | Грань 0→1         | INLET     | inlet (низ)
-        2  | Вершина 1         | WALL      | wall_corner_1 (inlet правый угол)
-        3  | Грань 1→2         | WALL      | wall_bottom_right
-        4  | Вершина 2         | WALL      | wall_corner_2
-        5  | Грань 2→3         | WALL      | wall_right
-        6  | Вершина 3         | WALL      | wall_corner_3
-        7  | Грань 3→4         | OUTLET    | outlet_side (боковой выход)
-        8  | Вершина 4         | WALL      | wall_corner_4
-        9  | Грань 4→5         | WALL      | wall_side_top
-        10 | Вершина 5         | WALL      | wall_corner_5
-        11 | Грань 5→6         | WALL      | wall_right_top
-        12 | Вершина 6         | WALL      | wall_corner_6
-        13 | Грань 6→7         | OUTLET    | outlet_top (верхний выход)
-        14 | Вершина 7         | WALL      | wall_corner_7 (левый верхний угол)
-        15 | Грань 7→0         | WALL      | wall_left (левая стенка)
-
-        Args:
-            contour: массив координат контура (9 точек с замыканием)
-
-        Returns:
-            Список кортежей (start_m, end_m, btype, channel_id) в метрах
-        """
-        # Создаём линию для вычисления расстояний
-        if np.allclose(contour[0], contour[-1], atol=1e-6):
-            line = LineString(contour[:-1])
-        else:
-            line = LineString(contour)
-
-        total_length = line.length
-
-        # Вычисляем расстояния до каждой вершины
-        vertices = contour[:-1] if np.allclose(contour[0], contour[-1]) else contour
-        vertex_distances = [line.project(Point(v)) for v in vertices]
-
-        # Вычисляем длину замыкающей грани (7→0)
-        # Это расстояние от последней вершины до первой по прямой
-        closing_edge_length = np.sqrt((vertices[0][0] - vertices[-1][0])**2 +
-                                      (vertices[0][1] - vertices[-1][1])**2)
-        
-        # Полная длина замкнутого контура (включая замыкающую грань)
-        full_contour_length = total_length + closing_edge_length
-
-        num_vertices = len(vertices)
-
-        # Формируем сегменты: вершины чередуются с гранями
-        segments = []
-
-        # Для 8 вершин (7 уникальных + замыкающая)
-        # Топология T-тройника:
-        # 0→1: INLET (низ), 1→2→3: WALL (право до outlet), 3→4: OUTLET (боковой выход)
-        # 4→5: WALL (верх бокового ответвления), 5→6: WALL (право верхнего ответвления)
-        # 6→7: OUTLET (верхний выход), 7→0: WALL (левая стенка)
-        if num_vertices == 8:
-            segment_definitions = [
-                # Вершины (WALL)
-                (0, 0, BoundaryType.WALL, "wall_corner_0"),
-                (1, 1, BoundaryType.WALL, "wall_corner_1"),
-                (2, 2, BoundaryType.WALL, "wall_corner_2"),
-                (3, 3, BoundaryType.WALL, "wall_corner_3"),
-                (4, 4, BoundaryType.WALL, "wall_corner_4"),
-                (5, 5, BoundaryType.WALL, "wall_corner_5"),
-                (6, 6, BoundaryType.WALL, "wall_corner_6"),
-                (7, 7, BoundaryType.WALL, "wall_corner_7"),  # левый верхний угол
-                # Грани между вершинами
-                (0, 1, BoundaryType.INLET, "inlet"),              # низ: inlet
-                (1, 2, BoundaryType.WALL, "wall_bottom_right"),   # право до бокового outlet
-                (2, 3, BoundaryType.WALL, "wall_right"),          # право до бокового outlet
-                (3, 4, BoundaryType.OUTLET, "outlet_side"),       # боковой выход (вертикаль x=max)
-                (4, 5, BoundaryType.WALL, "wall_side_top"),       # верх бокового ответвления
-                (5, 6, BoundaryType.WALL, "wall_right_top"),      # право верхнего ответвления
-                (6, 7, BoundaryType.OUTLET, "outlet_top"),        # верхний выход (горизонталь y=max)
-                (7, 0, BoundaryType.WALL, "wall_left"),           # левая стенка (вертикаль x=min)
-            ]
-        else:
-            logger.warning(f"⚠️ Нестандартное число вершин: {num_vertices}, используется простая классификация")
-            # Fallback для нестандартного контура
-            for i in range(num_vertices):
-                segments.append((vertex_distances[i], vertex_distances[i], BoundaryType.WALL, f"wall_corner_{i}"))
-                next_i = (i + 1) % num_vertices
-                end_dist = vertex_distances[next_i] if next_i > i else total_length
-                segments.append((vertex_distances[i], end_dist, BoundaryType.WALL, f"wall_segment_{i}"))
-            return segments
-
-        for start_idx, end_idx, btype, channel_id in segment_definitions:
-            if start_idx == end_idx:
-                # Вершина — точное расстояние
-                dist = vertex_distances[start_idx]
-                segments.append((dist, dist, btype, channel_id))
-            else:
-                # Грань — диапазон расстояний
-                start_dist = vertex_distances[start_idx]
-                # Для замыкающей грани (7→0) end_dist = full_contour_length
-                if end_idx == 0 and start_idx == 7:
-                    # Замыкающая грань: последняя вершина → первая
-                    # Используем full_contour_length (включая длину замыкающей грани)
-                    end_dist = full_contour_length
-                    logger.debug(f"Замыкающая грань 7→0: start={start_dist:.3f}, end={end_dist:.3f}, length={closing_edge_length:.3f}")
-                elif end_idx < len(vertex_distances):
-                    end_dist = vertex_distances[end_idx]
-                else:
-                    end_dist = full_contour_length
-                segments.append((start_dist, end_dist, btype, channel_id))
-
-        return segments
-
-    def _classify_by_topology(self, norm_dist: float, contour: np.ndarray,
-                              point_coords: Tuple[float, float] = None) -> Tuple[BoundaryType, str]:
-        """
-        Классификация точки на основе её положения на контуре тройника.
-
-        Логика классификации:
-        - Вершины контура → всегда WALL
-        - Сегменты между вершинами → согласно типу (INLET/OUTLET/WALL)
-        - Замыкающая грань 7→0 (левая стенка) → WALL (определяется по координатам)
-
-        Args:
-            norm_dist: нормализованное расстояние вдоль контура [0, 1]
-            contour: массив координат контура
-            point_coords: кортеж (x, y) координат точки (опционально)
-
-        Returns:
-            кортеж (boundary_type, channel_id)
-        """
-        # Вычисляем полную длину контура (без замыкающей грани)
-        if np.allclose(contour[0], contour[-1], atol=1e-6):
-            line = LineString(contour[:-1])
-        else:
-            line = LineString(contour)
-        total_length = line.length
-        
-        # Вычисляем длину замыкающей грани (7→0)
-        vertices = contour[:-1] if np.allclose(contour[0], contour[-1]) else contour
-        closing_edge_length = np.sqrt((vertices[0][0] - vertices[-1][0])**2 +
-                                      (vertices[0][1] - vertices[-1][1])**2)
-        
-        # Полная длина замкнутого контура
-        full_contour_length = total_length + closing_edge_length
-
-        # Преобразуем нормализованное расстояние в физическое (метры)
-        # Используем full_contour_length для правильного масштабирования
-        distance = norm_dist * full_contour_length
-
-        # Получаем сегменты в метрах
-        segments_meters = self._get_segment_boundaries_meters(contour)
-
-        # Проверка на попадание в сегмент (включая вершины)
-        for start, end, btype, channel_id in segments_meters:
-            if start == end:
-                # Вершина - точное совпадение
-                if abs(distance - start) < 1e-10:
-                    return btype, channel_id
-            else:
-                # Сегмент - попадание в диапазон
-                if start <= distance <= end:
-                    return btype, channel_id
-
-        # Специальная обработка для замыкающей грани 7→0 (левая стенка)
-        # Проверяем по координатам: если x = x_min и точка не на inlet (y != y_min)
-        if point_coords:
-            x, y = point_coords
-            x_min = np.min(contour[:, 0])
-            y_min = np.min(contour[:, 1])
-            # Увеличенный допуск для надёжной классификации (10% от характерного размера)
-            char_size = max(np.max(contour[:, 0]) - x_min, np.max(contour[:, 1]) - y_min)
-            tol = char_size * 0.1
-
-            # Левая стенка: x ≈ x_min и y > y_min (не inlet)
-            # Важно: классифицируем как wall_left ВСЕ точки на x = x_min, кроме вершины 0
-            if abs(x - x_min) < tol and y > y_min + tol:
-                return BoundaryType.WALL, "wall_left"
-
-            # Дополнительная проверка: если точка на левой границе и близко к y_min,
-            # но это не вершина 0 (которая уже обработана как wall_corner_0)
-            if abs(x - x_min) < tol and abs(y - y_min) < tol:
-                # Это может быть вершина 0 или точка рядом с ней на левой стенке
-                # Проверяем: если distance очень близко к 0 или full_contour_length, это вершина 0
-                if abs(distance) < 1e-6 or abs(distance - full_contour_length) < 1e-6:
-                    return BoundaryType.WALL, "wall_corner_0"
-                else:
-                    return BoundaryType.WALL, "wall_left"
-
-        # Fallback для точки замыкания — это точки на грани 7→0 (левая стенка)
-        return BoundaryType.WALL, "wall_left"
 
     def _classify_external_boundary(
         self,
@@ -1087,31 +665,26 @@ class CollocationPoints:
         Returns:
             Список точек на профиле с типом WALL
         """
-        # Для тройника профиль отсутствует
-        if self.config.geom_type == 'junction':
-            logger.info("ℹ️ Профиль отсутствует (геометрия тройника)")
-            return []
-        
         line = LineString(foil)
         length = line.length
         if self.foil_is_closed:
             line = LineString(foil[:-1])
             length = line.length
 
-        num_points = int(length / step) + 1
+        num_steps = int(length / step)
+        distances = [i * step for i in range(num_steps + 1)]
+        if distances[-1] < length:
+            distances.append(length)  # гарантируем конечную точку профиля
         points = []
-        for i in range(num_points):
-            distance = i * step
-            if distance <= length:
-                pt = line.interpolate(distance)
-                points.append(CollocationPoint(
-                    id=self._get_next_id(),
-                    x=pt.x, y=pt.y,
-                    boundary_type=BoundaryType.WALL,
-                    on_airfoil=True,
-                    on_boundary=True,
-                    channel_id="airfoil"
-                ))
+        for distance in distances:
+            pt = line.interpolate(distance)
+            points.append(CollocationPoint(
+                id=self._get_next_id(),
+                x=pt.x, y=pt.y,
+                boundary_type=BoundaryType.WALL,
+                on_airfoil=True,
+                on_boundary=True,
+            ))
         logger.info(f"✅ Профиль (WALL): {len(points)} точек")
         return points
 
@@ -1139,10 +712,6 @@ class CollocationPoints:
         Returns:
             Список точек на нижней границе
         """
-        # Для тройника не применяется
-        if self.config.geom_type == 'junction':
-            return []
-        
         if x_min_foil <= x_min_dom:
             return []
         bottom_length = x_min_foil - x_min_dom
@@ -1699,8 +1268,15 @@ class CollocationPoints:
         poly_domain = Polygon(domain)
         if not poly_domain.is_valid:
             poly_domain = poly_domain.buffer(0)
-        area = poly_domain.area
-        num_interior = int(area / step_m ** 2 * self.config.interior_point_density)
+        foil_area = 0.0
+        if foil is not None and len(foil) >= 3:
+            poly_foil = Polygon(foil)
+            if not poly_foil.is_valid:
+                poly_foil = poly_foil.buffer(0)
+            if poly_foil.is_valid:
+                foil_area = poly_foil.area
+        effective_area = poly_domain.area - foil_area
+        num_interior = int(effective_area / step_m ** 2 * self.config.interior_point_density)
 
         # 1. Точки на внешнем контуре
         logger.info("\n📌 Внешний контур:")
@@ -1831,10 +1407,6 @@ class CollocationPoints:
                         label=f'{bt.value} ({len(coords["x"])})',
                         zorder=3 if bt == BoundaryType.INTERIOR else 4)
 
-        # Для тройника добавляем аннотации границ
-        if self.config.geom_type == 'junction':
-            self._annotate_junction_boundaries(plt.gca())
-
         plt.legend(loc='upper right', fontsize=10, ncol=2)
         plt.axis('equal')
         plt.grid(True, alpha=0.3)
@@ -1852,34 +1424,6 @@ class CollocationPoints:
         else:
             plt.close()
 
-    def _annotate_junction_boundaries(self, ax) -> None:
-        """
-        Аннотации границ тройника на графике.
-
-        Добавляет текстовые метки для INLET, OUTLET и WALL границ.
-        """
-        if self.domain_coords is None:
-            return
-
-        y_min = np.min(self.domain_coords[:, 1])
-        y_max = np.max(self.domain_coords[:, 1])
-        x_min = np.min(self.domain_coords[:, 0])
-        x_max = np.max(self.domain_coords[:, 0])
-
-        # Центры границ для аннотаций
-        ax.text((x_min + x_max) / 2, y_min - 0.05, "INLET",
-                color='blue', fontsize=10, ha='center', va='top',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
-        ax.text((x_min + x_max) / 2, y_max + 0.05, "OUTLET (top)",
-                color='cyan', fontsize=10, ha='center', va='bottom',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
-        ax.text(x_max + 0.05, (y_min + y_max) / 2, "OUTLET (side)",
-                color='cyan', fontsize=10, ha='left', va='center',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
-        ax.text(x_min - 0.05, (y_min + y_max) / 2, "WALL",
-                color='red', fontsize=10, ha='right', va='center',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
-
     def save_points(self) -> None:
         """
         Сохранение точек коллокации и метаданных.
@@ -1887,29 +1431,32 @@ class CollocationPoints:
         Сохраняет все точки, внутренние точки, граничные точки и метаданные
         в форматах npy или csv в зависимости от конфигурации.
         """
+        if self.output_base is None:
+            raise RuntimeError(
+                "output_base не задан — сначала вызовите load_geometries()"
+            )
         base = self.output_base
         if self.config.save_format == 'npy':
-            # Расширенная структура данных с channel_id
             dtype = [('id', 'i4'), ('x', 'f8'), ('y', 'f8'),
                      ('boundary_type', 'U20'), ('on_airfoil', 'bool'),
-                     ('on_boundary', 'bool'), ('segment_id', 'i4'),
-                     ('channel_id', 'U30')]
+                     ('on_boundary', 'bool'), ('segment_id', 'i4')]
             arr = np.array([(p.id, p.x, p.y, p.boundary_type.value,
-                             p.on_airfoil, p.on_boundary, p.segment_id,
-                             p.channel_id)
+                             p.on_airfoil, p.on_boundary, p.segment_id)
                             for p in self.points], dtype=dtype)
             np.save(f"{base}.npy", arr)
+            interior_coords = [(p.x, p.y) for p in self.points_interior]
             np.save(f"{base}_interior.npy",
-                    np.array([(p.x, p.y) for p in self.points_interior]))
+                    np.array(interior_coords) if interior_coords else np.empty((0, 2)))
+            boundary_coords = [(p.x, p.y) for p in self.points_boundary]
             np.save(f"{base}_boundary.npy",
-                    np.array([(p.x, p.y) for p in self.points_boundary]))
+                    np.array(boundary_coords) if boundary_coords else np.empty((0, 2)))
             logger.info(f"✅ Сохранено: {base}.npy")
         elif self.config.save_format == 'csv':
             with open(f"{base}.csv", 'w') as f:
-                f.write("id,x,y,boundary_type,on_airfoil,on_boundary,segment_id,channel_id\n")
+                f.write("id,x,y,boundary_type,on_airfoil,on_boundary,segment_id\n")
                 for p in self.points:
                     f.write(f"{p.id},{p.x},{p.y},{p.boundary_type.value},"
-                            f"{p.on_airfoil},{p.on_boundary},{p.segment_id},{p.channel_id}\n")
+                            f"{p.on_airfoil},{p.on_boundary},{p.segment_id}\n")
             logger.info(f"✅ Сохранено: {base}.csv")
         np.save(f"{base}_metadata.npy", self.metadata)
         logger.info(f"✅ Метаданные сохранены")
