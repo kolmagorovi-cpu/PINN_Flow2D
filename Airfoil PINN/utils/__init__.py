@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Пакет утилит для проекта Airfoil PINN.
+
+Экспортирует:
+  - UI-утилиты (ui_utils): меню, ввод, очистка экрана
+  - I/O-утилиты (io_utils): работа с файлами JSON
+  - Вспомогательные функции (auxiliary_utils): seed, память, градиент
 """
 
 from .ui_utils import (
@@ -18,6 +23,11 @@ from .io_utils import (
     sanitize_filename,
     ensure_directory,
 )
+from .auxiliary_utils import (
+    set_seed,
+    check_memory_usage,
+    safe_grad,
+)
 
 __all__ = [
     # UI
@@ -32,4 +42,8 @@ __all__ = [
     'load_json',
     'sanitize_filename',
     'ensure_directory',
+    # Вспомогательные
+    'set_seed',
+    'check_memory_usage',
+    'safe_grad',
 ]

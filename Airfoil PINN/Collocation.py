@@ -135,6 +135,9 @@ class CollocationPoint:
         return (self.x, self.y)
 
 
+_VALID_BOUNDARY_TYPES = ('inlet', 'outlet', 'symmetry', 'axis_symmetry', 'wall')
+
+
 @dataclass
 class SamplerConfig:
     """
@@ -153,8 +156,10 @@ class SamplerConfig:
         output_dir: Директория для выходных файлов
         boundary_point_density: Плотность точек на границах
         interior_point_density: Плотность внутренних точек
-        symmetry_type: Тип симметрии нижней границы
-        top_boundary_type: Тип верхней границы ('inlet' или 'outlet')
+        left_boundary_type: Тип левой границы (x=x_min); одно из: inlet, outlet, symmetry, axis_symmetry, wall
+        right_boundary_type: Тип правой границы (x=x_max)
+        top_boundary_type: Тип верхней границы (y=y_max)
+        bottom_boundary_type: Тип нижней границы (y=y_min)
         sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all')
         adaptive_alpha: Степень сгущения (для адаптивных методов)
         adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
@@ -173,8 +178,10 @@ class SamplerConfig:
     output_dir: str = DEFAULT_OUTPUT_DIR
     boundary_point_density: float = 1.0
     interior_point_density: float = 1.0
-    symmetry_type: str = "symmetry"
+    left_boundary_type: str = "inlet"
+    right_boundary_type: str = "outlet"
     top_boundary_type: str = "outlet"
+    bottom_boundary_type: str = "symmetry"
     sampling_method: str = "regular"
     adaptive_alpha: float = 1.0
     adaptive_epsilon_factor: float = 0.01
@@ -187,15 +194,23 @@ class SamplerConfig:
         """
         Инициализация после создания dataclass.
 
-        Создаёт директории и проверяет корректность top_boundary_type.
+        Создаёт директории и проверяет корректность типов границ.
 
         Raises:
-            ValueError: Если top_boundary_type не 'inlet' или 'outlet'
+            ValueError: Если любой из типов границ не входит в допустимые значения
         """
         os.makedirs(self.geometry_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
-        if self.top_boundary_type not in ('inlet', 'outlet'):
-            raise ValueError("top_boundary_type должно быть 'inlet' или 'outlet'")
+        for field_name, value in [
+            ('left_boundary_type', self.left_boundary_type),
+            ('right_boundary_type', self.right_boundary_type),
+            ('top_boundary_type', self.top_boundary_type),
+            ('bottom_boundary_type', self.bottom_boundary_type),
+        ]:
+            if value not in _VALID_BOUNDARY_TYPES:
+                raise ValueError(
+                    f"{field_name}='{value}' не входит в допустимые значения: {_VALID_BOUNDARY_TYPES}"
+                )
 
     def to_dict(self) -> SamplerConfigDict:
         """
@@ -217,8 +232,10 @@ class SamplerConfig:
             output_dir=self.output_dir,
             boundary_point_density=self.boundary_point_density,
             interior_point_density=self.interior_point_density,
-            symmetry_type=self.symmetry_type,
-            top_boundary_type=self.top_boundary_type,  # type: ignore
+            left_boundary_type=self.left_boundary_type,
+            right_boundary_type=self.right_boundary_type,
+            top_boundary_type=self.top_boundary_type,
+            bottom_boundary_type=self.bottom_boundary_type,
             sampling_method=self.sampling_method,  # type: ignore
             adaptive_alpha=self.adaptive_alpha,
             adaptive_epsilon_factor=self.adaptive_epsilon_factor
@@ -633,23 +650,22 @@ class CollocationPoints:
         x_min, x_max = bounds['x_min'], bounds['x_max']
         y_min, y_max = bounds['y_min'], bounds['y_max']
 
-        # Проверяем границы в порядке приоритета
+        # Проверяем принадлежность к одной из 4 сторон прямоугольника
+        # Тип каждой стороны задаётся пользователем в SamplerConfig
         if abs(x - x_min) < tol:
-            return BoundaryType.INLET
-        
+            return BoundaryType(self.config.left_boundary_type)
+
         if abs(x - x_max) < tol:
-            return BoundaryType.OUTLET
-        
+            return BoundaryType(self.config.right_boundary_type)
+
         if abs(y - y_max) < tol:
             return BoundaryType(self.config.top_boundary_type)
-        
+
         if abs(y - y_min) < tol:
-            if self.foil_is_closed:
-                return BoundaryType.INLET
-            else:
-                return BoundaryType(self.config.symmetry_type)
-        
-        return BoundaryType.OUTLET
+            return BoundaryType(self.config.bottom_boundary_type)
+
+        # Точка не лежит ни на одной из сторон — внутренняя
+        return BoundaryType.INTERIOR
 
     # ------------------------------------------------------------------
     # Генерация точек на профиле (WALL)
@@ -719,9 +735,7 @@ class CollocationPoints:
         # Всегда равномерно, независимо от sampling_method
         xs = np.linspace(x_min_dom, x_min_foil, num_points)
 
-        btype = BoundaryType.SYMMETRY if not self.foil_is_closed else BoundaryType.INLET
-        if self.config.symmetry_type == 'axis_symmetry' and not self.foil_is_closed:
-            btype = BoundaryType.AXIS_SYMMETRY
+        btype = BoundaryType(self.config.bottom_boundary_type)
 
         points = []
         for x in xs:
@@ -1257,7 +1271,8 @@ class CollocationPoints:
         if 'adaptive' in self.config.sampling_method:
             logger.info(f"   alpha = {self.config.adaptive_alpha}")
             logger.info(f"   epsilon_factor = {self.config.adaptive_epsilon_factor}")
-        logger.info(f"🔼 Верхняя граница: {self.config.top_boundary_type}")
+        logger.info(f"🔲 Типы границ: ←{self.config.left_boundary_type} →{self.config.right_boundary_type} "
+                    f"↑{self.config.top_boundary_type} ↓{self.config.bottom_boundary_type}")
 
         x_min_dom, y_min_dom = np.min(domain, axis=0)
         x_max_dom, y_max_dom = np.max(domain, axis=0)
@@ -1335,8 +1350,10 @@ class CollocationPoints:
             'step_m': step_m,
             'bounds': bounds,
             'foil_closed': self.foil_is_closed,
-            'symmetry_type': self.config.symmetry_type,
+            'left_boundary_type': self.config.left_boundary_type,
+            'right_boundary_type': self.config.right_boundary_type,
             'top_boundary_type': self.config.top_boundary_type,
+            'bottom_boundary_type': self.config.bottom_boundary_type,
             'sampling_method': self.config.sampling_method,
             'adaptive_alpha': self.config.adaptive_alpha,
             'adaptive_epsilon_factor': self.config.adaptive_epsilon_factor
@@ -1501,16 +1518,31 @@ def S2DR() -> None:
         if step <= 0:
             raise ValueError("Шаг должен быть >0")
 
-        print("\nТип симметрии нижней границы:")
-        print("   1 - symmetry\n   2 - axis_symmetry")
-        sym_choice = input("Выберите (1/2): ").strip()
-        symmetry_type = 'symmetry' if sym_choice == '1' else 'axis_symmetry'
+        _BOUNDARY_MENU = (
+            "   1 - inlet         (вход потока)\n"
+            "   2 - outlet        (выход потока)\n"
+            "   3 - symmetry      (плоская симметрия)\n"
+            "   4 - axis_symmetry (осевая симметрия)\n"
+            "   5 - wall          (твёрдая стенка)"
+        )
+        _BOUNDARY_MAP = {'1': 'inlet', '2': 'outlet', '3': 'symmetry',
+                         '4': 'axis_symmetry', '5': 'wall'}
 
-        print("\nТип верхней границы:")
-        print("   1 - outlet (обычно для выхода потока)")
-        print("   2 - inlet  (если поток входит сверху)")
-        top_choice = input("Выберите (1/2): ").strip()
-        top_boundary_type = 'outlet' if top_choice == '1' else 'inlet'
+        print("\nТип ЛЕВОЙ границы (x = x_min):")
+        print(_BOUNDARY_MENU)
+        left_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'inlet')
+
+        print("\nТип ПРАВОЙ границы (x = x_max):")
+        print(_BOUNDARY_MENU)
+        right_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'outlet')
+
+        print("\nТип ВЕРХНЕЙ границы (y = y_max):")
+        print(_BOUNDARY_MENU)
+        top_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'outlet')
+
+        print("\nТип НИЖНЕЙ границы (y = y_min):")
+        print(_BOUNDARY_MENU)
+        bottom_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'symmetry')
 
         print("\nМетод генерации внутренних точек:")
         print("   1 - регулярный (равномерная сетка)")
@@ -1555,8 +1587,10 @@ def S2DR() -> None:
             use_multiprocessing=use_mp and num_proc > 1,
             plot_results=plot_res,
             save_format='npy',
-            symmetry_type=symmetry_type,
+            left_boundary_type=left_boundary_type,
+            right_boundary_type=right_boundary_type,
             top_boundary_type=top_boundary_type,
+            bottom_boundary_type=bottom_boundary_type,
             sampling_method=sampling_method,
             adaptive_alpha=adaptive_alpha,
             adaptive_epsilon_factor=adaptive_epsilon_factor

@@ -619,8 +619,8 @@ class PINNSolver:
                 epoch_time = time.time() - start_time
                 total_time = time.time() - self.start_time
 
-                # Адаптивные веса BC
-                if epoch % 50 == 0 and self.loss_computer.loss_weights.get('adaptive_bc', False):
+                # Адаптивные веса BC (активируется через config['loss_weights']['adaptive_bc'])
+                if epoch % 50 == 0 and self.loss_computer.adaptive_bc:
                     self.trainer.update_adaptive_weights(self.loss_computer.loss_weights)
 
                 # RAR

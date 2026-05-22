@@ -89,8 +89,8 @@ class Trainer:
         self.use_amp = tr.get('use_amp', False)
 
         # Адаптивная балансировка весов BC (только для soft граничных условий)
-        lw = self.loss_computer.loss_weights
-        self.adaptive_weights = lw.get('adaptive_bc', False) and self.loss_computer.bc_type == 'soft'
+        # Флаг adaptive_bc читается из LossComputer, который берёт его из config['loss_weights']
+        self.adaptive_weights = self.loss_computer.adaptive_bc and self.loss_computer.bc_type == 'soft'
         self.adapt_frequency = 50
         self.adapt_window = 10
         self.loss_ma = {}
@@ -252,7 +252,7 @@ class Trainer:
 
         # Средняя скорость на стенке (для мониторинга)
         wall_speed = None
-        if self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp['wall'] > 0 and bt is not None:
+        if self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp['wall'].item() > 0 and bt is not None:
             wall_idx = self.data_handler.boundary_type_names.index('wall')
             u_wall = u[bt[:, wall_idx] > 0.5]
             v_wall = v[bt[:, wall_idx] > 0.5]
@@ -380,7 +380,7 @@ class Trainer:
         chord = self.data_handler.chord
         U_inf = self.data_handler.U_inf
         rho = self.data_handler.rho
-        p_dyn = rho * U_inf**2
+        p_dyn = 0.5 * rho * U_inf**2
 
         return {
             'x': x_np * chord,

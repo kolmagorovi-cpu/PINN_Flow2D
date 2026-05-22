@@ -418,7 +418,7 @@ class Visualizer:
         # Сохраняем также отдельно физические величины (для удобства)
         u_phys = u_np * data_handler.U_inf
         v_phys = v_np * data_handler.U_inf
-        p_dyn = data_handler.rho * data_handler.U_inf ** 2
+        p_dyn = 0.5 * data_handler.rho * data_handler.U_inf ** 2
         p_phys = p_np * p_dyn
         x_phys = x_np * data_handler.chord
         y_phys = y_np * data_handler.chord
@@ -481,7 +481,7 @@ class Visualizer:
         if plot_physical:
             u_plot = u_norm * data_handler.U_inf
             v_plot = v_norm * data_handler.U_inf
-            p_dyn = data_handler.rho * data_handler.U_inf ** 2
+            p_dyn = 0.5 * data_handler.rho * data_handler.U_inf ** 2
             p_plot = p_norm * p_dyn
             # Обратное масштабирование координат (если использовалось масштабирование)
             scale_factor = _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)

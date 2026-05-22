@@ -493,7 +493,7 @@ class Initializer:
         # Нормализация
         arr_norm['u_norm'] = u_phys / self.U_inf
         arr_norm['v_norm'] = v_phys / self.U_inf
-        arr_norm['p_norm'] = (p_phys - self.p_ref) / (self.rho * self.U_inf**2)
+        arr_norm['p_norm'] = (p_phys - self.p_ref) / (0.5 * self.rho * self.U_inf**2)
 
         # --- Вычисление SDF (с поддержкой многопроцессорности) ---
         if len(self.wall_points) == 0:

@@ -188,8 +188,10 @@ class SamplerConfigDict(TypedDict, total=False):
         output_dir: Директория для выходных файлов
         boundary_point_density: Плотность точек на границах
         interior_point_density: Плотность внутренних точек
-        symmetry_type: Тип симметрии нижней границы
-        top_boundary_type: Тип верхней границы ('inlet' или 'outlet')
+        left_boundary_type: Тип левой границы (x=x_min)
+        right_boundary_type: Тип правой границы (x=x_max)
+        top_boundary_type: Тип верхней границы (y=y_max)
+        bottom_boundary_type: Тип нижней границы (y=y_min)
         sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all')
         adaptive_alpha: Степень сгущения (для адаптивных методов)
         adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
@@ -206,8 +208,10 @@ class SamplerConfigDict(TypedDict, total=False):
     output_dir: str
     boundary_point_density: float
     interior_point_density: float
-    symmetry_type: str
-    top_boundary_type: Literal['inlet', 'outlet']
+    left_boundary_type: str
+    right_boundary_type: str
+    top_boundary_type: str
+    bottom_boundary_type: str
     sampling_method: Literal['regular', 'irregular', 'adaptive_foil', 'adaptive_all']
     adaptive_alpha: float
     adaptive_epsilon_factor: float

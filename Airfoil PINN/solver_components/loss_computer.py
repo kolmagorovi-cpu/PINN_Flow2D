@@ -77,6 +77,9 @@ class LossComputer:
         self.use_sa_weights = lw['use_sa_weights']
         self.sa_apply_to_bc = lw['sa_apply_to_bc']
 
+        # Адаптивная балансировка весов BC (опциональная функция, задаётся пользователем)
+        self.adaptive_bc: bool = bool(lw.get('adaptive_bc', False))
+
         # Интегральное условие
         self.integral_condition = lw['integral_condition']
         self.integral_weight = lw['integral_weight']
@@ -84,11 +87,12 @@ class LossComputer:
         self.integral_target = lw.get('integral_target', 0.0)
 
         # FVM-потеря (закон сохранения массы на неструктурированной сетке)
+        # fvm может быть числом (0.5), строкой ("0.5"), bool или dict {'weight': 0.5}
         fvm_cfg = lw.get('fvm', {})
-        self.fvm_weight: float = (
-            float(fvm_cfg) if isinstance(fvm_cfg, (int, float))
-            else float(fvm_cfg.get('weight', 0.0))
-        )
+        if isinstance(fvm_cfg, dict):
+            self.fvm_weight: float = float(fvm_cfg.get('weight', 0.0))
+        else:
+            self.fvm_weight: float = float(fvm_cfg)
         # Заполняется из PINNSolver при наличии mesh_file в конфиге
         self.fvm: Optional["FVMResiduals"] = None
 
@@ -197,8 +201,7 @@ class LossComputer:
                    for name in self.data_handler.boundary_type_names}
         extra_grad = torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
-        for name in self.data_handler.boundary_type_names:
-            idx = self.data_handler.boundary_type_names.index(name)
+        for idx, name in enumerate(self.data_handler.boundary_type_names):
             mask = boundary_types[:, idx].view(-1, 1) > 0.5
             if mask.sum() == 0:
                 continue
