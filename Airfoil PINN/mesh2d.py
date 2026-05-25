@@ -313,77 +313,102 @@ def _insert_constrained_edge(
                 start_tid = tid
                 break
 
+    # ── Fallback 2: глобальный поиск O(T) для «зазорных» рёбер ────────────────
+    # Веерный поиск проваливается для граничных вершин, у которых d направлен
+    # вдоль границы (хвостовая кромка, почти коллинеарные точки). В этом случае
+    # ни один сектор веера не содержит d. Глобальный fallback воспроизводит
+    # поведение старого O(M·T) алгоритма для редких аварийных случаев.
+    _direct_crossed: Optional[Set[int]] = None
     if start_tid is None:
-        logger.warning(
-            "_insert_constrained_edge: не найден стартовый треугольник для (%d,%d)", s, t
-        )
-        return next_id
+        _fc: Set[int] = set()
+        for _tid, (_a, _b, _c) in tris.items():
+            if s in (_a, _b, _c) or t in (_a, _b, _c):
+                continue
+            for _u, _v in ((_a, _b), (_b, _c), (_c, _a)):
+                if _segs_cross_strict(ps, pt, coords[_u], coords[_v]):
+                    _fc.add(_tid)
+                    break
+        if _fc:
+            _direct_crossed = _fc
+        else:
+            # Ребро лежит полностью в зазоре (внутри профиля / за пределами
+            # домена): пересекаемых треугольников нет. Flood-fill справится
+            # через Shapely; предупреждение не нужно.
+            logger.debug(
+                "_insert_constrained_edge: ребро (%d,%d) в зазоре веера, "
+                "пересечений нет — пропуск.", s, t,
+            )
+            return next_id
 
-    # ── Фаза 1б: Выход из start_tid — start_tid НЕ входит в crossed_ids ──────
-    # start_tid содержит вершину s. Удалять его нельзя: это создаёт замещающие
-    # треугольники (s,p,t)/(s,q,t), покрывающие весь коридор, с вершинами p,q
-    # у которых _param<0 («позади» s). При граничном exit-ребре corridor
-    # обрывается, giant-треугольники перекрывают существующие, некоторые узлы
-    # остаются без треугольников → V_i=0 → зажим 1e-30 → R_i≈10³⁰.
-    # Используем start_tid только чтобы найти first_exit_edge коридора.
-    a, b, c = tris[start_tid]
-    first_exit_edge: Optional[Tuple[int, int]] = None
-    for u, v in ((a, b), (b, c), (c, a)):
-        key = (min(u, v), max(u, v))
-        d1 = _cross2d(ps, pt, coords[u])
-        d2 = _cross2d(ps, pt, coords[v])
-        if d1 * d2 < 0:
-            first_exit_edge = key
-            break
-
-    if first_exit_edge is None:
-        return next_id  # t внутри start_tid или ребро (s,t) уже корректно
-
-    first_nbrs = edge_map.get(first_exit_edge, set()) - {start_tid}
-    if not first_nbrs:
-        return next_id  # exit-ребро граничное, соседнего треугольника нет
-
-    # ── Фаза 2: Обход коридора ───────────────────────────────────────────────
-    # Шагаем по смежным треугольникам вдоль сегмента (s,t).
-    # Тест строгого пересечения (ps,pt) с ребром (u,v):
-    #   d1 = cross2d(ps,pt, coords[u]),  d2 = cross2d(ps,pt, coords[v])
-    #   d1·d2 < 0  ↔  u и v лежат по разные стороны прямой s→t.
-    crossed_ids: Set[int] = set()
-    current_tid = next(iter(first_nbrs))
-    entry_edge: Optional[Tuple[int, int]] = first_exit_edge
-    max_steps = len(tris) + 10
-
-    for _ in range(max_steps):
-        a, b, c = tris[current_tid]
-
-        if t in (a, b, c):
-            break   # достигли треугольника, содержащего вершину t
-
-        crossed_ids.add(current_tid)
-
-        exit_edge: Optional[Tuple[int, int]] = None
+    crossed_ids: Set[int]
+    if _direct_crossed is not None:
+        # Глобальный fallback: все пересечённые треугольники уже собраны.
+        crossed_ids = _direct_crossed
+    else:
+        # ── Фаза 1б: Выход из start_tid — start_tid НЕ входит в crossed_ids ──
+        # start_tid содержит вершину s. Удалять его нельзя: это создаёт замещающие
+        # треугольники (s,p,t)/(s,q,t) с вершинами p,q у которых _param<0
+        # («позади» s). При граничном exit-ребре corridor обрывается, giant-
+        # треугольники перекрывают существующие → V_i=0 → зажим 1e-30 → R_i≈10³⁰.
+        # Используем start_tid только чтобы найти first_exit_edge коридора.
+        a, b, c = tris[start_tid]
+        first_exit_edge: Optional[Tuple[int, int]] = None
         for u, v in ((a, b), (b, c), (c, a)):
             key = (min(u, v), max(u, v))
-            if key == entry_edge:
-                continue  # ребро входа не рассматриваем
             d1 = _cross2d(ps, pt, coords[u])
             d2 = _cross2d(ps, pt, coords[v])
             if d1 * d2 < 0:
-                exit_edge = key
+                first_exit_edge = key
                 break
 
-        if exit_edge is None:
-            break   # t находится внутри текущего треугольника
+        if first_exit_edge is None:
+            return next_id  # t внутри start_tid или ребро (s,t) уже корректно
 
-        neighbors = edge_map.get(exit_edge, set()) - {current_tid}
-        if not neighbors:
-            break   # граничное ребро — нет смежного треугольника
+        first_nbrs = edge_map.get(first_exit_edge, set()) - {start_tid}
+        if not first_nbrs:
+            return next_id  # exit-ребро граничное, соседнего треугольника нет
 
-        entry_edge = exit_edge
-        current_tid = next(iter(neighbors))
+        # ── Фаза 2: Обход коридора ───────────────────────────────────────────
+        # Шагаем по смежным треугольникам вдоль сегмента (s,t).
+        # Тест строгого пересечения (ps,pt) с ребром (u,v):
+        #   d1 = cross2d(ps,pt, coords[u]),  d2 = cross2d(ps,pt, coords[v])
+        #   d1·d2 < 0  ↔  u и v лежат по разные стороны прямой s→t.
+        crossed_ids = set()
+        current_tid = next(iter(first_nbrs))
+        entry_edge: Optional[Tuple[int, int]] = first_exit_edge
+        max_steps = len(tris) + 10
 
-    if not crossed_ids:
-        return next_id   # коридор пуст — ребро уже присутствует
+        for _ in range(max_steps):
+            a, b, c = tris[current_tid]
+
+            if t in (a, b, c):
+                break   # достигли треугольника, содержащего вершину t
+
+            crossed_ids.add(current_tid)
+
+            exit_edge: Optional[Tuple[int, int]] = None
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (min(u, v), max(u, v))
+                if key == entry_edge:
+                    continue  # ребро входа не рассматриваем
+                d1 = _cross2d(ps, pt, coords[u])
+                d2 = _cross2d(ps, pt, coords[v])
+                if d1 * d2 < 0:
+                    exit_edge = key
+                    break
+
+            if exit_edge is None:
+                break   # t находится внутри текущего треугольника
+
+            neighbors = edge_map.get(exit_edge, set()) - {current_tid}
+            if not neighbors:
+                break   # граничное ребро — нет смежного треугольника
+
+            entry_edge = exit_edge
+            current_tid = next(iter(neighbors))
+
+        if not crossed_ids:
+            return next_id   # коридор пуст — ребро уже присутствует
 
     # ── Фаза 3: Сбор вершин полостей ────────────────────────────────────────
     upper: List[int] = []   # слева от s→t
