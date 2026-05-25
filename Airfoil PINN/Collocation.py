@@ -1553,8 +1553,9 @@ def _select_geometry_data() -> Optional[str]:
             if idx == 0:
                 return None
             if 1 <= idx <= len(candidates):
-                base, _ = candidates[idx - 1]
+                base, domain_path = candidates[idx - 1]
                 print(f"\n  Выбрана геометрия: {base}")
+                _show_geometry_preview(base, domain_path, geom_dir)
                 return base
             print(f"  Введите число от 0 до {len(candidates)}")
         except ValueError:
@@ -1562,6 +1563,39 @@ def _select_geometry_data() -> Optional[str]:
         except KeyboardInterrupt:
             print()
             return None
+
+
+def _show_geometry_preview(base: str, domain_path: str, geom_dir: str) -> None:
+    """Загружает и показывает основные параметры выбранной геометрии."""
+    print("\n" + "-" * 60)
+    print("  ПАРАМЕТРЫ ГЕОМЕТРИИ".center(60))
+    print("-" * 60)
+    try:
+        domain = np.load(domain_path) if domain_path.endswith('.npy') else np.loadtxt(domain_path)
+        x_min, y_min = domain[:, 0].min(), domain[:, 1].min()
+        x_max, y_max = domain[:, 0].max(), domain[:, 1].max()
+        print(f"  Область : {len(domain)} точек")
+        print(f"  X: [{x_min:.4f}, {x_max:.4f}] м  →  {x_max - x_min:.4f} м")
+        print(f"  Y: [{y_min:.4f}, {y_max:.4f}] м  →  {y_max - y_min:.4f} м")
+    except Exception as e:
+        print(f"  Не удалось прочитать область: {e}")
+        print("-" * 60)
+        return
+
+    for ext in ('.npy', '.txt'):
+        foil_path = os.path.join(geom_dir, f"{base}_foil{ext}")
+        if os.path.exists(foil_path):
+            try:
+                foil = np.load(foil_path) if ext == '.npy' else np.loadtxt(foil_path)
+                chord = foil[:, 0].max() - foil[:, 0].min()
+                is_closed = np.allclose(foil[0], foil[-1], atol=1e-6)
+                print(f"  Профиль : {len(foil)} точек  |  хорда {chord:.4f} м"
+                      f"  |  {'замкнутый' if is_closed else 'незамкнутый'}")
+            except Exception:
+                pass
+            break
+
+    print("-" * 60)
 
 
 def S2DR() -> None:

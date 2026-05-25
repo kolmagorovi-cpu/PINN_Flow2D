@@ -774,55 +774,55 @@ def load_geometry_from_config(config_path: str = None, verbose: bool = True) -> 
     return geom
 
 
+FOILS_DIR = os.path.join(PROJECT_ROOT, 'Geometry', 'Foils')
+
+
 def _select_geometry_file() -> Optional[str]:
     """
-    Меню выбора файла геометрии из папки Geometry/.
+    Меню выбора файла профиля из папки Geometry/Foils/.
 
-    Сканирует Geometry/ рекурсивно на файлы .txt, .csv, .dat
+    Сканирует Geometry/Foils/ на файлы .txt и .csv с координатами профиля
     и предлагает пользователю выбрать нужный по номеру.
 
     Returns:
         Полный путь к выбранному файлу или None при отмене.
     """
-    geom_dir = os.path.join(PROJECT_ROOT, 'Geometry')
-    allowed_ext = {'.txt', '.csv', '.dat'}
+    allowed_ext = {'.txt', '.csv'}
+    os.makedirs(FOILS_DIR, exist_ok=True)
 
     files: List[Tuple[str, str]] = []
-    for dirpath, _, filenames in os.walk(geom_dir):
-        for fname in sorted(filenames):
-            if os.path.splitext(fname)[1].lower() in allowed_ext:
-                full_path = os.path.join(dirpath, fname)
-                rel_path = os.path.relpath(full_path, PROJECT_ROOT)
-                files.append((rel_path, full_path))
+    for fname in sorted(os.listdir(FOILS_DIR)):
+        if os.path.splitext(fname)[1].lower() in allowed_ext:
+            full_path = os.path.join(FOILS_DIR, fname)
+            files.append((fname, full_path))
 
     print("\n" + "=" * 60)
-    print("  ВЫБОР ФАЙЛА ГЕОМЕТРИИ".center(60))
+    print("  ВЫБОР ФАЙЛА ПРОФИЛЯ".center(60))
     print("=" * 60)
 
     if not files:
-        print(f"\n  Файлы геометрии (.txt, .csv, .dat) не найдены.")
-        print(f"  Поместите файл в папку: {geom_dir}")
-        print("\n" + "=" * 60)
+        print(f"\n  Файлы координат (.txt, .csv) не найдены.")
+        print(f"  Поместите файл в папку: {FOILS_DIR}")
+        print("=" * 60)
         return None
 
-    print(f"  Папка: Geometry/    Найдено файлов: {len(files)}")
+    print(f"  Папка: Geometry/Foils/    Найдено файлов: {len(files)}")
     print("-" * 60)
-    for i, (rel_path, _) in enumerate(files, 1):
-        size_kb = os.path.getsize(_) / 1024
-        print(f"  [{i:2d}]  {rel_path:<40}  {size_kb:6.1f} кБ")
+    for i, (fname, full_path) in enumerate(files, 1):
+        size_kb = os.path.getsize(full_path) / 1024
+        print(f"  [{i:2d}]  {fname:<40}  {size_kb:6.1f} кБ")
     print("-" * 60)
     print("  [ 0]  Отмена")
     print("=" * 60)
 
     while True:
         try:
-            raw = input("\n  Номер файла: ").strip()
-            idx = int(raw)
+            idx = int(input("\n  Номер файла: ").strip())
             if idx == 0:
                 return None
             if 1 <= idx <= len(files):
-                rel_path, full_path = files[idx - 1]
-                print(f"\n  Выбран: {rel_path}")
+                fname, full_path = files[idx - 1]
+                print(f"\n  Выбран: {fname}")
                 return full_path
             print(f"  Введите число от 0 до {len(files)}")
         except ValueError:
