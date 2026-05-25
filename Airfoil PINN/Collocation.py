@@ -484,35 +484,46 @@ class CollocationPoints:
 
     def find_geometry_files(self) -> Dict[str, Optional[str]]:
         """
-        Поиск файлов геометрии в директории.
+        Поиск файлов геометрии по geom_name из конфига.
+
+        Ищет {geom_name}_domain.npy (или .txt) и сопутствующие файлы профиля
+        и метаданных. Меню выбора вызывается раньше — в S2DR().
 
         Returns:
             Словарь с путями к файлам {'foil': path, 'domain': path, 'metadata': path}
         """
         result = {'foil': None, 'domain': None, 'metadata': None}
+        geom_dir = self.config.geometry_dir
+        geom_name = getattr(self.config, 'geom_name', None)
 
-        foil_names = ["airfoil_foil.npy", "airfoil_foil.txt"]
-        domain_names = ["airfoil_domain.npy", "airfoil_domain.txt"]
-        meta_names = ["airfoil_metadata.npy"]
+        if not os.path.isdir(geom_dir) or not geom_name:
+            return result
 
-        for name in foil_names:
-            path = os.path.join(self.config.geometry_dir, name)
-            if os.path.exists(path):
-                result['foil'] = path
-                print(f"   ✅ Найден профиль: {name}")
-                break
-        for name in domain_names:
-            path = os.path.join(self.config.geometry_dir, name)
+        # Ищем domain-файл
+        for ext in ('_domain.npy', '_domain.txt'):
+            path = os.path.join(geom_dir, f"{geom_name}{ext}")
             if os.path.exists(path):
                 result['domain'] = path
-                print(f"   ✅ Найдена область: {name}")
+                print(f"   ✅ Найдена область: {os.path.basename(path)}")
                 break
-        for name in meta_names:
-            path = os.path.join(self.config.geometry_dir, name)
+
+        if result['domain'] is None:
+            return result
+
+        # Профиль
+        for ext in ('.npy', '.txt'):
+            path = os.path.join(geom_dir, f"{geom_name}_foil{ext}")
             if os.path.exists(path):
-                result['metadata'] = path
-                print(f"   ✅ Найдены метаданные: {name}")
+                result['foil'] = path
+                print(f"   ✅ Найден профиль:  {os.path.basename(path)}")
                 break
+
+        # Метаданные
+        meta = os.path.join(geom_dir, f"{geom_name}_metadata.npy")
+        if os.path.exists(meta):
+            result['metadata'] = meta
+            print(f"   ✅ Найдены метаданные: {os.path.basename(meta)}")
+
         return result
 
     def load_geometries(self) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -1491,6 +1502,68 @@ class CollocationPoints:
         return [p for p in self.points if p.boundary_type == btype]
 
 
+def _select_geometry_data() -> Optional[str]:
+    """
+    Меню выбора расчётной области из папки Geometry/Data/.
+
+    Сканирует директорию на файлы *_domain.npy / *_domain.txt и предлагает
+    пользователю выбрать нужный по номеру.
+
+    Returns:
+        Базовое имя геометрии (например 'plate') или None при отмене.
+    """
+    geom_dir = DEFAULT_GEOMETRY_DIR
+
+    candidates: List[Tuple[str, str]] = []
+    if os.path.isdir(geom_dir):
+        for fname in sorted(os.listdir(geom_dir)):
+            if fname.endswith('_domain.npy') or fname.endswith('_domain.txt'):
+                base = fname.replace('_domain.npy', '').replace('_domain.txt', '')
+                candidates.append((base, os.path.join(geom_dir, fname)))
+
+    print("\n" + "=" * 60)
+    print("  ВЫБОР РАСЧЁТНОЙ ОБЛАСТИ".center(60))
+    print("=" * 60)
+
+    if not candidates:
+        print(f"\n  Файлы геометрии (*_domain.npy) не найдены.")
+        print(f"  Папка: {geom_dir}")
+        print(f"\n  Сначала запустите модуль G2D.")
+        print("=" * 60)
+        return None
+
+    print(f"  Папка: Geometry/Data/    Найдено: {len(candidates)}")
+    print("-" * 60)
+    for i, (base, path) in enumerate(candidates, 1):
+        size_kb = os.path.getsize(path) / 1024
+        # Проверяем наличие сопутствующих файлов
+        has_foil = any(
+            os.path.exists(os.path.join(geom_dir, f"{base}_foil{ext}"))
+            for ext in ('.npy', '.txt')
+        )
+        tags = "  [+ профиль]" if has_foil else ""
+        print(f"  [{i:2d}]  {base:<36}  {size_kb:6.1f} кБ{tags}")
+    print("-" * 60)
+    print("  [ 0]  Отмена")
+    print("=" * 60)
+
+    while True:
+        try:
+            idx = int(input("\n  Номер геометрии: ").strip())
+            if idx == 0:
+                return None
+            if 1 <= idx <= len(candidates):
+                base, _ = candidates[idx - 1]
+                print(f"\n  Выбрана геометрия: {base}")
+                return base
+            print(f"  Введите число от 0 до {len(candidates)}")
+        except ValueError:
+            print("  Ошибка: введите число")
+        except KeyboardInterrupt:
+            print()
+            return None
+
+
 def S2DR() -> None:
     """
     Главная функция модуля дискретизации S2DR (интерактивный режим).
@@ -1507,7 +1580,12 @@ def S2DR() -> None:
         if os.name == 'nt':
             freeze_support()
 
-        num_proc = int(input("Количество ядер процессора (1-16): "))
+        # Выбор расчётной области (первым делом, до всех других вопросов)
+        selected_geom = _select_geometry_data()
+        if selected_geom is None:
+            return
+
+        num_proc = int(input("\nКоличество ядер процессора (1-16): "))
         if not 1 <= num_proc <= 16:
             raise ValueError("Некорректное число ядер")
 
@@ -1593,7 +1671,8 @@ def S2DR() -> None:
             bottom_boundary_type=bottom_boundary_type,
             sampling_method=sampling_method,
             adaptive_alpha=adaptive_alpha,
-            adaptive_epsilon_factor=adaptive_epsilon_factor
+            adaptive_epsilon_factor=adaptive_epsilon_factor,
+            geom_name=selected_geom,
         )
 
         sampler = CollocationPoints(config)
