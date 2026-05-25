@@ -80,13 +80,32 @@ def _bootstrap_environment() -> None:
         print("  Виртуальное окружение создано.")
         return True
 
+    def _pip_env() -> dict:
+        # Сбрасываем SOCKS/HTTP прокси: pip не умеет работать с socks без PySocks,
+        # а прямой доступ к PyPI работает без прокси.
+        env = _os.environ.copy()
+        for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+                    'http_proxy', 'https_proxy', 'all_proxy'):
+            env.pop(key, None)
+        env['NO_PROXY'] = '*'
+        env['no_proxy'] = '*'
+        return env
+
+    def _ensure_pip() -> bool:
+        """Устанавливает pip в venv через ensurepip если его нет."""
+        if _os.path.exists(_VENV_PIP):
+            return True
+        r = _sp.run([_VENV_PY, '-m', 'ensurepip', '--upgrade'],
+                    capture_output=True, text=True)
+        return r.returncode == 0
+
     def _install_packages(pip_names: list) -> bool:
-        uv = _sh.which('uv')
         print(f"  Установка: {', '.join(pip_names)} ...", flush=True)
-        if uv:
-            r = _sp.run([uv, 'pip', 'install', '--python', _VENV_PY] + pip_names)
-        else:
-            r = _sp.run([_VENV_PIP, 'install'] + pip_names)
+        if not _ensure_pip():
+            print("  Не удалось инициализировать pip в окружении.")
+            return False
+        r = _sp.run([_VENV_PY, '-m', 'pip', 'install'] + pip_names,
+                    env=_pip_env())
         if r.returncode != 0:
             print("  Ошибка при установке. Проверьте подключение к интернету.")
             return False
