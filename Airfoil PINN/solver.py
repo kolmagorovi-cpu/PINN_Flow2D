@@ -275,6 +275,13 @@ class PINNSolver:
         if dev == 'auto':
             return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         elif dev == 'cuda':
+            if not torch.cuda.is_available():
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    "CUDA запрошена, но недоступна (torch без CUDA или нет GPU). "
+                    "Переключение на CPU."
+                )
+                return torch.device('cpu')
             return torch.device('cuda:0')
         else:
             return torch.device(dev)
