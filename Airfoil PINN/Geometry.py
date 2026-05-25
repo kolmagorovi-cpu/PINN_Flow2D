@@ -37,6 +37,7 @@ from type_hints import (
 # Определяем корневую директорию проекта
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Data")
+DEFAULT_METADATA_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
 DEFAULT_PLOT_DPI = 300
 
 # Путь к YAML-библиотеке профилей
@@ -407,33 +408,41 @@ class AirfoilGeometry:
         else:
             plt.close()
 
-    def save(self, filename: Optional[str] = None, format: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    def save(self, filename: Optional[str] = None, format: Optional[str] = None,
+             metadata_dir: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """
         Сохранение геометрии (координаты в метрах).
+
+        domain  → config.output_dir  (Geometry/Data/)
+        foil    → metadata_dir        (Geometry/Metadata/)
+        metadata→ metadata_dir        (Geometry/Metadata/)
 
         Args:
             filename: Базовое имя файла (без расширения)
             format: Формат сохранения ('npy', 'csv', 'txt')
+            metadata_dir: Директория для foil и metadata (по умолчанию output_dir)
 
         Returns:
             Кортеж (путь_к_профилю, путь_к_области)
 
         Example:
-            >>> foil_path, domain_path = geom.save('naca0012', format='npy')
+            >>> foil_path, domain_path = geom.save('naca0012', format='npy',
+            ...                                      metadata_dir='Geometry/Metadata')
         """
         fmt = format or self.config.save_format
         base_name = filename or "airfoil"
+        meta_dir = metadata_dir or self.config.output_dir
 
         foil_path = None
         domain_path = None
 
         if self.foil_coords is not None:
-            foil_path = self._save_coords(self.foil_coords, f"{base_name}_foil", fmt)
+            foil_path = self._save_coords(self.foil_coords, f"{base_name}_foil", fmt,
+                                          directory=meta_dir)
 
         if self.domain_coords is not None:
             domain_path = self._save_coords(self.domain_coords, f"{base_name}_domain", fmt)
 
-            # Сохраняем метаданные
             metadata = {
                 'geom_type': 'airfoil',
                 'chord': self.chord,
@@ -441,14 +450,16 @@ class AirfoilGeometry:
                 'num_foil_points': len(self.foil_coords) if self.foil_coords is not None else 0,
                 'num_domain_points': len(self.domain_coords)
             }
-            meta_path = os.path.join(self.config.output_dir, f"{base_name}_metadata.npy")
+            meta_path = os.path.join(meta_dir, f"{base_name}_metadata.npy")
+            os.makedirs(meta_dir, exist_ok=True)
             np.save(meta_path, metadata)
             if self.config.verbose:
                 logger.info(f"✅ Метаданные сохранены: {meta_path}")
 
         return foil_path, domain_path
 
-    def _save_coords(self, coords: np.ndarray, basename: str, fmt: str) -> str:
+    def _save_coords(self, coords: np.ndarray, basename: str, fmt: str,
+                     directory: Optional[str] = None) -> str:
         """
         Сохранение координат в указанном формате.
 
@@ -456,11 +467,14 @@ class AirfoilGeometry:
             coords: Массив координат формы (N, 2)
             basename: Базовое имя файла
             fmt: Формат файла ('npy', 'csv', 'txt')
+            directory: Директория сохранения (по умолчанию config.output_dir)
 
         Returns:
             Полный путь к сохранённому файлу
         """
-        filepath = os.path.join(self.config.output_dir, f"{basename}.{fmt}")
+        save_dir = directory or self.config.output_dir
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, f"{basename}.{fmt}")
 
         if fmt == 'npy':
             np.save(filepath, coords)
@@ -720,9 +734,11 @@ class Geometry2D:
         """Визуализация геометрии."""
         self._airfoil_geom.plot(title=title, save_path=save_path)
 
-    def save(self, filename: Optional[str] = None, format: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    def save(self, filename: Optional[str] = None, format: Optional[str] = None,
+             metadata_dir: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """Сохранение геометрии."""
-        return self._airfoil_geom.save(filename=filename, format=format)
+        return self._airfoil_geom.save(filename=filename, format=format,
+                                       metadata_dir=metadata_dir)
 
     def print_stats(self) -> None:
         """Вывод статистики геометрии."""
@@ -900,12 +916,13 @@ def g2d() -> None:
     geom.plot(save_path=plot_path)
 
     print("\n💾 Сохранение...")
-    foil_path, domain_path = geom.save(geom_name)
+    os.makedirs(DEFAULT_METADATA_DIR, exist_ok=True)
+    foil_path, domain_path = geom.save(geom_name, metadata_dir=DEFAULT_METADATA_DIR)
 
     print(f"\n✅ Сохранено:")
-    print(f"   Профиль:     {foil_path}")
     print(f"   Область:     {domain_path}")
-    print(f"   Метаданные:  {os.path.join(config.output_dir, f'{geom_name}_metadata.npy')}")
+    print(f"   Профиль:     {foil_path}")
+    print(f"   Метаданные:  {os.path.join(DEFAULT_METADATA_DIR, f'{geom_name}_metadata.npy')}")
 
     print("\n" + "=" * 60)
     print("✅ РАБОТА МОДУЛЯ ЗАВЕРШЕНА".center(60))

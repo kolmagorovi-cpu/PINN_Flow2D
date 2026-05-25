@@ -62,6 +62,7 @@ except ImportError:
 # Определяем корневую директорию проекта
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEOMETRY_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Data")
+DEFAULT_METADATA_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
 DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Sampler", "Data")
 
 # Импортируем константы после определения локальных констант
@@ -486,43 +487,45 @@ class CollocationPoints:
         """
         Поиск файлов геометрии по geom_name из конфига.
 
-        Ищет {geom_name}_domain.npy (или .txt) и сопутствующие файлы профиля
-        и метаданных. Меню выбора вызывается раньше — в S2DR().
+        domain   → Geometry/Data/       ({geom_name}_domain.npy)
+        foil     → Geometry/Metadata/   ({geom_name}_foil.npy)
+        metadata → Geometry/Metadata/   ({geom_name}_metadata.npy)
 
         Returns:
             Словарь с путями к файлам {'foil': path, 'domain': path, 'metadata': path}
         """
         result = {'foil': None, 'domain': None, 'metadata': None}
-        geom_dir = self.config.geometry_dir
         geom_name = getattr(self.config, 'geom_name', None)
-
-        if not os.path.isdir(geom_dir) or not geom_name:
+        if not geom_name:
             return result
 
-        # Ищем domain-файл
+        data_dir = self.config.geometry_dir          # Geometry/Data/
+        meta_dir = DEFAULT_METADATA_DIR              # Geometry/Metadata/
+
+        # domain — только в Data/
         for ext in ('_domain.npy', '_domain.txt'):
-            path = os.path.join(geom_dir, f"{geom_name}{ext}")
+            path = os.path.join(data_dir, f"{geom_name}{ext}")
             if os.path.exists(path):
                 result['domain'] = path
-                print(f"   ✅ Найдена область: {os.path.basename(path)}")
+                print(f"   ✅ Область:    {os.path.basename(path)}")
                 break
 
         if result['domain'] is None:
             return result
 
-        # Профиль
+        # foil — только в Metadata/
         for ext in ('.npy', '.txt'):
-            path = os.path.join(geom_dir, f"{geom_name}_foil{ext}")
+            path = os.path.join(meta_dir, f"{geom_name}_foil{ext}")
             if os.path.exists(path):
                 result['foil'] = path
-                print(f"   ✅ Найден профиль:  {os.path.basename(path)}")
+                print(f"   ✅ Профиль:   {os.path.basename(path)}")
                 break
 
-        # Метаданные
-        meta = os.path.join(geom_dir, f"{geom_name}_metadata.npy")
+        # metadata — только в Metadata/
+        meta = os.path.join(meta_dir, f"{geom_name}_metadata.npy")
         if os.path.exists(meta):
             result['metadata'] = meta
-            print(f"   ✅ Найдены метаданные: {os.path.basename(meta)}")
+            print(f"   ✅ Метаданные: {os.path.basename(meta)}")
 
         return result
 
@@ -1536,9 +1539,9 @@ def _select_geometry_data() -> Optional[str]:
     print("-" * 60)
     for i, (base, path) in enumerate(candidates, 1):
         size_kb = os.path.getsize(path) / 1024
-        # Проверяем наличие сопутствующих файлов
+        # Проверяем наличие профиля в Metadata/
         has_foil = any(
-            os.path.exists(os.path.join(geom_dir, f"{base}_foil{ext}"))
+            os.path.exists(os.path.join(DEFAULT_METADATA_DIR, f"{base}_foil{ext}"))
             for ext in ('.npy', '.txt')
         )
         tags = "  [+ профиль]" if has_foil else ""
@@ -1582,8 +1585,9 @@ def _show_geometry_preview(base: str, domain_path: str, geom_dir: str) -> None:
         print("-" * 60)
         return
 
+    # Профиль — в Geometry/Metadata/
     for ext in ('.npy', '.txt'):
-        foil_path = os.path.join(geom_dir, f"{base}_foil{ext}")
+        foil_path = os.path.join(DEFAULT_METADATA_DIR, f"{base}_foil{ext}")
         if os.path.exists(foil_path):
             try:
                 foil = np.load(foil_path) if ext == '.npy' else np.loadtxt(foil_path)
