@@ -473,7 +473,9 @@ class CollocationPoints:
                 geom_config = yaml.safe_load(f)
 
             self.config.geom_type = geom_config.get('geom_type', 'airfoil')
-            self.config.geom_name = geom_config.get('geom_name')
+            # Не перезаписываем geom_name если он уже задан (например, через меню S2DR)
+            if self.config.geom_name is None:
+                self.config.geom_name = geom_config.get('geom_name')
 
             logger.info(f"✅ Конфигурация геометрии загружена: {config_path}")
             logger.info(f"   geom_type: {self.config.geom_type}")
