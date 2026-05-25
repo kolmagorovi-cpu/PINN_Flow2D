@@ -85,6 +85,7 @@ class ConfigManager:
                 'fvm': {
                     'enabled': False,
                     'weight': 1.0,
+                    'batch_interval': 1,
                 },
             },
             'training': {
@@ -296,7 +297,8 @@ class ConfigManager:
         fvm_cfg = lw.get('fvm', {})
         fvm_enabled = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
         fvm_weight = fvm_cfg.get('weight', 1.0) if isinstance(fvm_cfg, dict) else float(fvm_cfg)
-        print(f"  fvm_mass_flow   : {fvm_enabled} (weight={fvm_weight})")
+        fvm_bi = fvm_cfg.get('batch_interval', 1) if isinstance(fvm_cfg, dict) else 1
+        print(f"  fvm_mass_flow   : {fvm_enabled} (weight={fvm_weight}, batch_interval={fvm_bi})")
         print()
 
         tr = self.config['training']

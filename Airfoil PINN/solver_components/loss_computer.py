@@ -98,8 +98,10 @@ class LossComputer:
                 self.fvm_weight: float = float(fvm_cfg.get('weight', 1.0)) if fvm_on else 0.0
             else:
                 self.fvm_weight: float = float(fvm_cfg.get('weight', 0.0))
+            self.fvm_batch_interval: int = max(1, int(fvm_cfg.get('batch_interval', 1)))
         else:
             self.fvm_weight: float = float(fvm_cfg)
+            self.fvm_batch_interval: int = 1
         # Заполняется из PINNSolver при наличии mesh_file в конфиге
         self.fvm: Optional["FVMResiduals"] = None
 

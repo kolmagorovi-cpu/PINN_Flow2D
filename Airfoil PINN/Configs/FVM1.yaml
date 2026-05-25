@@ -65,6 +65,7 @@ loss_weights:
   fvm:
     enabled: true
     weight: 1.0
+    batch_interval: 1
   integral_condition: false
   integral_weight: 0.0
   pde_weights:

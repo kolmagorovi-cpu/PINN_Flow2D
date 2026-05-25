@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -315,6 +316,7 @@ def _flip_to_delaunay(
     tris: List[Tuple[int, int, int]],
     coords: np.ndarray,
     constrained_edges: Set[Tuple[int, int]],
+    verbose: bool = False,
 ) -> List[Tuple[int, int, int]]:
     """
     Алгоритм Лоусона: переворачивает все нарушающие критерий Делоне
@@ -333,6 +335,15 @@ def _flip_to_delaunay(
     for ti, (a, b, c) in enumerate(tris):
         for u, v in ((a, b), (b, c), (c, a)):
             edge_map.setdefault((min(u, v), max(u, v)), []).append(ti)
+
+    try:
+        from tqdm import tqdm as _tqdm
+        _have_tqdm = True
+    except ImportError:
+        _have_tqdm = False
+
+    _pbar = (_tqdm(desc="    edge-flip", unit="flip", leave=False)
+             if verbose and _have_tqdm else None)
 
     _it = 0
     for _it in range(max_iter):
@@ -377,12 +388,17 @@ def _flip_to_delaunay(
                             edge_map[k2].append(new_tri_idx)
 
                 n_flips += 1
+                if _pbar is not None:
+                    _pbar.update(1)
+                    _pbar.set_postfix_str(f"iter {_it + 1}")
                 flipped = True
                 break  # перезапускаем обход edge_map с обновлёнными данными
 
         if not flipped:
             break
 
+    if _pbar is not None:
+        _pbar.close()
     logger.info("CDT edge-flip: %d переворотов за %d итераций", n_flips, _it + 1)
     return tris
 
@@ -578,33 +594,68 @@ class Mesh2D:
         Args:
             verbose: показывать tqdm-прогресс-бар (по умолчанию True).
         """
+        self._verbose = verbose
+
         try:
             from tqdm import tqdm as _tqdm
             _have_tqdm = True
         except ImportError:
             _have_tqdm = False
 
-        steps = [
-            ("prepare_vertices",             self._prepare_vertices),
-            ("initial_delaunay",             self._initial_delaunay),
-            ("insert_constrained_edges",     self._insert_all_constrained_edges),
-            ("remove_holes",                 self._remove_holes),
-            ("compute_cv_volumes",           self._compute_cv_volumes),
-            ("compute_internal_faces",       self._compute_internal_faces),
-            ("compute_boundary_faces",       self._compute_boundary_faces),
-            ("verify_conservativity",        self._verify_conservativity),
+        step_names = [
+            "подготовка вершин",
+            "триангуляция Делоне (scipy)",
+            "вставка CDT-рёбер",
+            "удаление дырок",
+            "объёмы КО",
+            "внутренние грани",
+            "граничные грани",
+            "консервативность",
+        ]
+        step_fns = [
+            self._prepare_vertices,
+            self._initial_delaunay,
+            self._insert_all_constrained_edges,
+            self._remove_holes,
+            self._compute_cv_volumes,
+            self._compute_internal_faces,
+            self._compute_boundary_faces,
+            self._verify_conservativity,
         ]
 
+        def _step_result(i: int) -> str:
+            if i == 0:
+                return f"{len(self._nodes)} узлов"
+            if i == 1:
+                return f"{len(self._tris_list)} треуг."
+            if i == 2:
+                return f"{len(self._triangles)} треуг. после CDT"
+            if i == 3:
+                return f"{len(self._triangles)} треуг. после удаления дырок"
+            if i == 4:
+                return "КО готовы"
+            if i == 5:
+                return f"{len(self._faces)} внутр. граней"
+            if i == 6:
+                return f"{len(self._boundary_faces)} граничн. граней"
+            return "OK"
+
         if verbose and _have_tqdm:
-            bar = _tqdm(steps, desc="Building mesh", unit="step",
-                        bar_format="{desc}: {n_fmt}/{total_fmt} "
-                                   "[{bar}] {percentage:3.0f}%  {elapsed}<{remaining}  {postfix}")
-            for name, fn in bar:
-                bar.set_postfix_str(name)
+            bar = _tqdm(
+                total=len(step_fns),
+                desc="Building mesh",
+                unit="шаг",
+                bar_format="{desc}: {n_fmt}/{total_fmt} [{bar}] {percentage:3.0f}%"
+                           "  {elapsed}<{remaining}  {postfix}",
+            )
+            for i, (name, fn) in enumerate(zip(step_names, step_fns)):
+                bar.set_postfix_str(f"{name}…")
                 fn()
-            bar.set_postfix_str("done")
+                bar.set_postfix_str(f"{name} → {_step_result(i)}")
+                bar.update(1)
+            bar.close()
         else:
-            for _, fn in steps:
+            for fn in step_fns:
                 fn()
 
         self._built = True
@@ -1033,15 +1084,28 @@ class Mesh2D:
         else:
             logger.info("CDT: все %d граничных рёбер уже в триангуляции", len(required))
 
+        _verbose = getattr(self, "_verbose", False)
+        try:
+            from tqdm import tqdm as _tqdm
+            _have_tqdm = True
+        except ImportError:
+            _have_tqdm = False
+
         tris = list(self._tris_list)
-        for s, t in missing:
+        _edge_iter = (
+            _tqdm(missing, desc="    вставка рёбер", unit="ребро",
+                  leave=False, total=len(missing))
+            if _verbose and _have_tqdm and missing else missing
+        )
+        for s, t in _edge_iter:
             tris = _insert_constrained_edge(s, t, tris, self._coords)
 
         self._constrained_edges = {(min(s, t), max(s, t)) for s, t in required}
         self._foil_constrained_edges = {(min(s, t), max(s, t)) for s, t in foil_edges}
         self._dom_constrained_edges = {(min(s, t), max(s, t)) for s, t in dom_edges}
 
-        tris = _flip_to_delaunay(tris, self._coords, self._constrained_edges)
+        tris = _flip_to_delaunay(tris, self._coords, self._constrained_edges,
+                                  verbose=_verbose)
 
         self._tris_list = tris
         self._triangles = np.array(tris, dtype=np.int32)
@@ -1092,21 +1156,36 @@ class Mesh2D:
             centroids = self._coords[tris_arr].mean(axis=1)
             mask = np.ones(len(tris_arr), dtype=bool)
 
+            _verbose = getattr(self, "_verbose", False)
+            try:
+                from tqdm import tqdm as _tqdm
+                _have_tqdm = True
+            except ImportError:
+                _have_tqdm = False
+
             if self._airfoil_coords is not None and len(self._airfoil_coords) >= 3:
                 foil_poly = _SPoly(self._airfoil_coords)
                 if not foil_poly.is_valid:
                     foil_poly = foil_poly.buffer(0)
-                for ti, (cx, cy) in enumerate(centroids):
-                    if foil_poly.contains(_SPt(cx, cy)):
-                        mask[ti] = False
+                with ThreadPoolExecutor() as ex:
+                    _it = ex.map(lambda pt: foil_poly.contains(_SPt(pt[0], pt[1])), centroids)
+                    if _verbose and _have_tqdm:
+                        _it = _tqdm(_it, total=len(centroids),
+                                    desc="    профиль (Shapely)", unit="треуг.", leave=False)
+                    foil_inside = np.fromiter(_it, dtype=bool, count=len(centroids))
+                mask &= ~foil_inside
 
             if self._domain_coords is not None and len(self._domain_coords) >= 3:
                 dom_poly = _SPoly(self._domain_coords)
                 if not dom_poly.is_valid:
                     dom_poly = dom_poly.buffer(0)
-                for ti, (cx, cy) in enumerate(centroids):
-                    if mask[ti] and not dom_poly.contains(_SPt(cx, cy)):
-                        mask[ti] = False
+                with ThreadPoolExecutor() as ex:
+                    _it = ex.map(lambda pt: dom_poly.contains(_SPt(pt[0], pt[1])), centroids)
+                    if _verbose and _have_tqdm:
+                        _it = _tqdm(_it, total=len(centroids),
+                                    desc="    домен (Shapely)", unit="треуг.", leave=False)
+                    dom_inside = np.fromiter(_it, dtype=bool, count=len(centroids))
+                mask &= dom_inside
 
             removed_shp = int((~mask).sum())
             if removed_shp:
@@ -1138,17 +1217,17 @@ class Mesh2D:
 
     def _compute_cv_volumes(self) -> None:
         """CV_area(i) = (1/3) × Σ area(T) по треугольникам, содержащим i."""
-        n = len(self._nodes)
-        cv = np.zeros(n, dtype=np.float64)
         c = self._coords
-        for a, b, k in self._triangles:
-            area = 0.5 * abs(
-                (c[b, 0] - c[a, 0]) * (c[k, 1] - c[a, 1])
-                - (c[k, 0] - c[a, 0]) * (c[b, 1] - c[a, 1])
-            )
-            cv[a] += area / 3.0
-            cv[b] += area / 3.0
-            cv[k] += area / 3.0
+        tri = self._triangles
+        a, b, k = tri[:, 0], tri[:, 1], tri[:, 2]
+        areas = 0.5 * np.abs(
+            (c[b, 0] - c[a, 0]) * (c[k, 1] - c[a, 1])
+            - (c[k, 0] - c[a, 0]) * (c[b, 1] - c[a, 1])
+        )
+        cv = np.zeros(len(self._nodes), dtype=np.float64)
+        np.add.at(cv, a, areas / 3.0)
+        np.add.at(cv, b, areas / 3.0)
+        np.add.at(cv, k, areas / 3.0)
         self._cv_volumes = cv
 
     def _compute_internal_faces(self) -> None:

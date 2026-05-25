@@ -115,8 +115,9 @@ class Trainer:
         # Флаг изменения SA-весов (для сигнала solver'у о необходимости пересоздания оптимизатора)
         self.sa_weights_changed = False
 
-        # FVM-потеря: отдельный шаг оптимизации раз в fvm_interval эпох
+        # FVM-потеря: раз в fvm_interval эпох; внутри эпохи — раз в fvm_batch_interval батчей
         self.fvm_interval = config.get('fvm_interval', 1)
+        self.fvm_batch_interval: int = getattr(loss_computer, 'fvm_batch_interval', 1)
         self._fvm_epoch_counter = 0
         self._last_fvm_loss = 0.0
 
@@ -130,7 +131,7 @@ class Trainer:
     # ------------------------------------------------------------------
     # Прямой проход (вычисление всех компонент потерь)
     # ------------------------------------------------------------------
-    def forward_pass(self, batch: Tuple, pde_mult: float = 1.0) -> Dict[str, Any]:
+    def forward_pass(self, batch: Tuple, pde_mult: float = 1.0, add_fvm: bool = False) -> Dict[str, Any]:
         """
         Выполняет прямой проход для одного батча, вычисляет все компоненты потерь
         и возвращает словарь с результатами, включая отдельные тензоры потерь.
@@ -247,8 +248,27 @@ class Trainer:
         # Интегральная потеря
         integral_loss = self.loss_computer.compute_integral_loss(u, v, bt, x, y) * self.loss_computer.integral_weight
 
-        # Полная потеря
-        total_loss = pde_loss + bc_loss + integral_loss
+        # FVM-потеря (полный проход по всей сетке, добавляется к тому же графу)
+        fvm_loss_val = 0.0
+        if add_fvm and self.loss_computer.fvm is not None and self.loss_computer.fvm_weight > 0.0:
+            dh = self.data_handler
+            if hasattr(dh, 'fvm_x'):
+                x_fvm   = dh.fvm_x.to(self.device, dtype=self.dtype)
+                y_fvm   = dh.fvm_y.to(self.device, dtype=self.dtype)
+                sdf_fvm = dh.fvm_sdf.to(self.device, dtype=self.dtype)
+                bt_fvm  = (dh.fvm_bt.to(self.device, dtype=self.dtype)
+                           if dh.fvm_bt is not None else None)
+                inp_fvm  = self.loss_computer.build_input_tensor(x_fvm, y_fvm, sdf_fvm, bt_fvm)
+                out_fvm  = self.model(inp_fvm)
+                fvm_t    = self.loss_computer.compute_fvm_loss(out_fvm[:, :2])
+                fvm_loss_val = fvm_t.item()
+            else:
+                fvm_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
+        else:
+            fvm_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
+
+        # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют
+        total_loss = pde_loss + bc_loss + integral_loss + fvm_t
 
         # Средняя скорость на стенке (для мониторинга)
         wall_speed = None
@@ -266,6 +286,7 @@ class Trainer:
             'bc_comp': {k: v.item() for k, v in bc_comp.items()} if self.loss_computer.bc_type == 'soft' else {},
             'extra_grad': extra_grad.item() if self.loss_computer.bc_type == 'soft' else 0.0,
             'integral_loss': integral_loss.item() if torch.is_tensor(integral_loss) else integral_loss,
+            'fvm_loss': fvm_loss_val,
             'wall_speed': wall_speed,
             # Возвращаем отдельные тензоры потерь для градиентного анализа
             'loss_components': {
@@ -545,15 +566,14 @@ class Trainer:
     # ------------------------------------------------------------------
     def _run_fvm_step(self) -> float:
         """
-        Отдельный шаг оптимизации с FVM-потерей на полном датасете.
-
-        Выполняется после основного батч-цикла PDE/BC. Координаты x, y
-        не требуют requires_grad — нейросеть предсказывает u, v без
-        дифференцирования по пространству.
+        УСТАРЕЛО. FVM-потеря теперь включается в total_loss последнего батча
+        через параметр add_fvm=True в forward_pass (единый backward с PDE/BC).
+        Этот метод сохранён для совместимости и не вызывается из train_epoch_adam.
 
         Returns:
             Значение FVM-потери после шага (float)
         """
+        logger.warning("_run_fvm_step устарел: FVM интегрирован в forward_pass через add_fvm=True.")
         if self.loss_computer.fvm is None or self.loss_computer.fvm_weight == 0.0:
             return 0.0
 
@@ -596,7 +616,7 @@ class Trainer:
     # ------------------------------------------------------------------
     # Шаг обучения (Adam)
     # ------------------------------------------------------------------
-    def train_batch_adam(self, batch: Tuple, accum_step: bool, pde_mult: float = 1.0) -> Dict[str, Any]:
+    def train_batch_adam(self, batch: Tuple, accum_step: bool, pde_mult: float = 1.0, add_fvm: bool = False) -> Dict[str, Any]:
         """
         Выполняет один прямой проход и накопление градиентов для батча (Adam).
         Если accum_step=True, выполняет шаг оптимизации.
@@ -605,11 +625,12 @@ class Trainer:
             batch: кортеж данных
             accum_step: флаг, указывающий, нужно ли выполнять шаг оптимизации
             pde_mult: множитель для PDE потерь
+            add_fvm: если True, добавляет FVM-потерю (полный проход по сетке) к total_loss
 
         Returns:
             словарь с результатами (те же поля, что и в forward_pass, плюс grad_norm)
         """
-        fwd = self.forward_pass(batch, pde_mult)
+        fwd = self.forward_pass(batch, pde_mult, add_fvm=add_fvm)
         total_loss = fwd['total'] / self.accum_steps
 
         # Обратное распространение
@@ -658,6 +679,7 @@ class Trainer:
             'bc_comp': fwd['bc_comp'],
             'extra_grad': fwd['extra_grad'],
             'integral_loss': fwd['integral_loss'],
+            'fvm_loss': fwd.get('fvm_loss', 0.0),
             'wall_speed': fwd['wall_speed'],
             'grad_norm': grad_norm
         }
@@ -708,10 +730,22 @@ class Trainer:
             'grad_norm_count': 0
         }
         n_batches = 0
+        n_total_batches = len(dataloader)
+
+        # FVM добавляется к последнему батчу эпохи (единый backward с PDE/BC)
+        self._fvm_epoch_counter += 1
+        fvm_this_epoch = (
+            self.loss_computer.fvm is not None
+            and self.loss_computer.fvm_weight > 0.0
+            and self._fvm_epoch_counter % self.fvm_interval == 0
+        )
 
         for i, batch in enumerate(dataloader):
-            accum_step = ((i + 1) % self.accum_steps == 0) or (i == len(dataloader) - 1)
-            batch_losses = self.train_batch_adam(batch, accum_step, pde_mult)
+            is_last_batch = (i == n_total_batches - 1)
+            accum_step = ((i + 1) % self.accum_steps == 0) or is_last_batch
+            # FVM добавляется каждые fvm_batch_interval батчей (и всегда на последнем)
+            add_fvm = fvm_this_epoch and (i % self.fvm_batch_interval == 0 or is_last_batch)
+            batch_losses = self.train_batch_adam(batch, accum_step, pde_mult, add_fvm=add_fvm)
 
             epoch_losses['total'] += batch_losses['total']
             for k, v in batch_losses['pde_raw'].items():
@@ -729,6 +763,8 @@ class Trainer:
             if batch_losses['grad_norm'] > 0:
                 epoch_losses['grad_norm_sum'] += batch_losses['grad_norm']
                 epoch_losses['grad_norm_count'] += 1
+            if add_fvm:
+                self._last_fvm_loss = batch_losses.get('fvm_loss', 0.0)
             n_batches += 1
 
             if (i + 1) % 100 == 0:
@@ -759,16 +795,9 @@ class Trainer:
         # Вычисление rate (отношение к предыдущему значению) – для отчёта
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
 
-        # FVM-шаг (отдельный backward на полном датасете, раз в fvm_interval эпох)
-        # Не прибавляется к avg_loss: FVM-loss — абсолютная величина на всей сетке,
-        # avg_loss — среднее по батчам; смешивать масштабы некорректно.
-        # FVM отслеживается отдельно через _last_fvm_loss → history['fvm_loss'].
-        self._fvm_epoch_counter += 1
-        if (self.loss_computer.fvm is not None
-                and self.loss_computer.fvm_weight > 0.0
-                and self._fvm_epoch_counter % self.fvm_interval == 0):
-            self._last_fvm_loss = self._run_fvm_step()
-        else:
+        # _last_fvm_loss уже установлен внутри цикла батчей (add_fvm=True на последнем батче).
+        # Если FVM не запускался в эту эпоху — обнуляем.
+        if not fvm_this_epoch:
             self._last_fvm_loss = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, avg_grad_norm
@@ -803,6 +832,14 @@ class Trainer:
         wall_speed_list = []
         n_batches = 0
 
+        # FVM добавляется прямо в closure — единый backward с PDE/BC
+        self._fvm_epoch_counter += 1
+        fvm_this_epoch = (
+            self.loss_computer.fvm is not None
+            and self.loss_computer.fvm_weight > 0.0
+            and self._fvm_epoch_counter % self.fvm_interval == 0
+        )
+
         def closure():
             self.optimizer.zero_grad()
             total_loss = 0.0
@@ -813,8 +850,11 @@ class Trainer:
             integral_loss_list.clear()
             wall_speed_list.clear()
             n_batches = 0
-            for batch in dataloader:
-                fwd = self.forward_pass(batch, pde_mult=1.0)
+            batches_list = list(dataloader)
+            for k, batch in enumerate(batches_list):
+                is_last = (k == len(batches_list) - 1)
+                add_fvm_b = fvm_this_epoch and (k % self.fvm_batch_interval == 0 or is_last)
+                fwd = self.forward_pass(batch, pde_mult=1.0, add_fvm=add_fvm_b)
                 total_loss += fwd['total']
 
                 pde_raw_list.append(fwd['pde_raw'])
@@ -824,6 +864,8 @@ class Trainer:
                 integral_loss_list.append(fwd['integral_loss'])
                 if fwd['wall_speed'] is not None:
                     wall_speed_list.append(fwd['wall_speed'])
+                if add_fvm_b and fwd.get('fvm_loss', 0.0) > 0:
+                    self._last_fvm_loss = fwd.get('fvm_loss', 0.0)
                 n_batches += 1
 
             total_loss.backward()
@@ -854,14 +896,8 @@ class Trainer:
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
         avg_extra_grad = 0.0  # не вычисляется для L-BFGS
 
-        # FVM-шаг: не поддерживается с L-BFGS (нет closure), не прибавляется к avg_loss.
-        self._fvm_epoch_counter += 1
-        if (self.loss_computer.fvm is not None
-                and self.loss_computer.fvm_weight > 0.0
-                and self._fvm_epoch_counter % self.fvm_interval == 0):
-            logger.warning("FVM step пропущен: несовместим с L-BFGS (требует closure).")
-            self._last_fvm_loss = 0.0
-        else:
+        # _last_fvm_loss установлен внутри closure (последний батч с add_fvm=True).
+        if not fvm_this_epoch:
             self._last_fvm_loss = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, 0.0

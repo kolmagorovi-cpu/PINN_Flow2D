@@ -559,7 +559,8 @@ def loss_function_menu(cfg: ConfigManager) -> None:
             fvm_cfg = lw.get('fvm', {})
             fvm_on = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
             fvm_w = fvm_cfg.get('weight', 1.0) if isinstance(fvm_cfg, dict) else float(fvm_cfg)
-            print(f"FVM Mass flow: {fvm_on}, вес: {fvm_w}")
+            fvm_bi = fvm_cfg.get('batch_interval', 1) if isinstance(fvm_cfg, dict) else 1
+            print(f"FVM Mass flow: {fvm_on}, вес: {fvm_w}, batch_interval: {fvm_bi}")
             input("Нажмите Enter...")
         elif sub == '0':
             print_submenu_footer()
@@ -576,14 +577,16 @@ def weights_menu(cfg: ConfigManager) -> None:
         print(f"2. Адаптивные веса для BC (текущ: {lw['adaptive_bc']})")
         print(f"3. SA-PINN (текущ: {lw['use_sa_weights']})")
         print(f"4. SA-PINN для BC (текущ: {lw['sa_apply_to_bc']})")
-        fvm_cfg = lw.setdefault('fvm', {'enabled': False, 'weight': 1.0})
+        fvm_cfg = lw.setdefault('fvm', {'enabled': False, 'weight': 1.0, 'batch_interval': 1})
         if not isinstance(fvm_cfg, dict):
-            fvm_cfg = {'enabled': bool(fvm_cfg), 'weight': float(fvm_cfg) if float(fvm_cfg) > 0 else 1.0}
+            fvm_cfg = {'enabled': bool(fvm_cfg), 'weight': float(fvm_cfg) if float(fvm_cfg) > 0 else 1.0, 'batch_interval': 1}
             lw['fvm'] = fvm_cfg
+        fvm_cfg.setdefault('batch_interval', 1)
         fvm_enabled = bool(fvm_cfg.get('enabled', False))
         fvm_weight = fvm_cfg.get('weight', 1.0)
+        fvm_bi = fvm_cfg.get('batch_interval', 1)
         print(f"5. Интегральная потеря (текущ: {lw['integral_condition']}, вес: {lw['integral_weight']})")
-        print(f"6. FVM Mass flow (включено: {fvm_enabled}, вес: {fvm_weight})")
+        print(f"6. FVM Mass flow (включено: {fvm_enabled}, вес: {fvm_weight}, каждые {fvm_bi} батч.)")
         print("7. Вывод текущих настроек")
         print("0. Назад")
         ch = input("Выберите: ").strip()
@@ -618,11 +621,20 @@ def weights_menu(cfg: ConfigManager) -> None:
                         fvm_cfg['weight'] = float(w)
                     except ValueError:
                         print("Неверное значение, оставлено текущее.")
-            print(f"FVM Mass flow: {'включено' if fvm_cfg['enabled'] else 'выключено'}, вес: {fvm_cfg.get('weight', 1.0)}")
+                bi = input(f"FVM раз в K батчей (1=каждый батч) [{fvm_cfg.get('batch_interval', 1)}]: ").strip()
+                if bi:
+                    try:
+                        val = int(bi)
+                        fvm_cfg['batch_interval'] = max(1, val)
+                    except ValueError:
+                        print("Неверное значение, оставлено текущее.")
+            print(f"FVM Mass flow: {'включено' if fvm_cfg['enabled'] else 'выключено'}, "
+                  f"вес: {fvm_cfg.get('weight', 1.0)}, каждые {fvm_cfg.get('batch_interval', 1)} батч.")
         elif ch == '7':
             fvm_cfg = lw.get('fvm', {})
             fvm_on = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
             fvm_w = fvm_cfg.get('weight', 1.0) if isinstance(fvm_cfg, dict) else float(fvm_cfg)
+            fvm_bi = fvm_cfg.get('batch_interval', 1) if isinstance(fvm_cfg, dict) else 1
             print("\n--- ТЕКУЩИЕ ВЕСА ---")
             print("PDE weights:", lw['pde_weights'])
             print("BC weights:", lw['bc_weights'])
@@ -630,7 +642,7 @@ def weights_menu(cfg: ConfigManager) -> None:
             print(f"use_sa_weights: {lw['use_sa_weights']}")
             print(f"sa_apply_to_bc: {lw['sa_apply_to_bc']}")
             print(f"integral_condition: {lw['integral_condition']}, weight: {lw['integral_weight']}")
-            print(f"fvm_mass_flow: {fvm_on}, weight: {fvm_w}")
+            print(f"fvm_mass_flow: {fvm_on}, weight: {fvm_w}, batch_interval: {fvm_bi}")
             input("Нажмите Enter...")
         elif ch == '0':
             print_submenu_footer()
