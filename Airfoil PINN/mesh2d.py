@@ -319,14 +319,38 @@ def _insert_constrained_edge(
         )
         return next_id
 
+    # ── Фаза 1б: Выход из start_tid — start_tid НЕ входит в crossed_ids ──────
+    # start_tid содержит вершину s. Удалять его нельзя: это создаёт замещающие
+    # треугольники (s,p,t)/(s,q,t), покрывающие весь коридор, с вершинами p,q
+    # у которых _param<0 («позади» s). При граничном exit-ребре corridor
+    # обрывается, giant-треугольники перекрывают существующие, некоторые узлы
+    # остаются без треугольников → V_i=0 → зажим 1e-30 → R_i≈10³⁰.
+    # Используем start_tid только чтобы найти first_exit_edge коридора.
+    a, b, c = tris[start_tid]
+    first_exit_edge: Optional[Tuple[int, int]] = None
+    for u, v in ((a, b), (b, c), (c, a)):
+        key = (min(u, v), max(u, v))
+        d1 = _cross2d(ps, pt, coords[u])
+        d2 = _cross2d(ps, pt, coords[v])
+        if d1 * d2 < 0:
+            first_exit_edge = key
+            break
+
+    if first_exit_edge is None:
+        return next_id  # t внутри start_tid или ребро (s,t) уже корректно
+
+    first_nbrs = edge_map.get(first_exit_edge, set()) - {start_tid}
+    if not first_nbrs:
+        return next_id  # exit-ребро граничное, соседнего треугольника нет
+
     # ── Фаза 2: Обход коридора ───────────────────────────────────────────────
     # Шагаем по смежным треугольникам вдоль сегмента (s,t).
     # Тест строгого пересечения (ps,pt) с ребром (u,v):
     #   d1 = cross2d(ps,pt, coords[u]),  d2 = cross2d(ps,pt, coords[v])
     #   d1·d2 < 0  ↔  u и v лежат по разные стороны прямой s→t.
     crossed_ids: Set[int] = set()
-    current_tid = start_tid
-    entry_edge: Optional[Tuple[int, int]] = None
+    current_tid = next(iter(first_nbrs))
+    entry_edge: Optional[Tuple[int, int]] = first_exit_edge
     max_steps = len(tris) + 10
 
     for _ in range(max_steps):
@@ -444,7 +468,7 @@ def _flip_to_delaunay(
     Использует Set вместо List в edge_map: discard() — O(1) вместо remove() — O(n).
     """
     n_flips = 0
-    max_iter = len(tris) * 3 + 10
+    max_iter = len(tris) * len(tris) + 10
 
     try:
         from tqdm import tqdm as _tqdm
@@ -626,6 +650,7 @@ class Mesh2D:
         self._boundary_faces: List[BoundaryFace] = []
         self._constrained_edges: Set[Tuple[int, int]] = set()
         self._built = False
+        self._conservativity_ok: Optional[bool] = None
 
     # ── Фабрики ───────────────────────────────────────────────────────────────
 
@@ -747,6 +772,10 @@ class Mesh2D:
                 return f"{len(self._faces)} внутр. граней"
             if i == 6:
                 return f"{len(self._boundary_faces)} граничн. граней"
+            if i == 7:
+                if self._conservativity_ok is None:
+                    return "не запускалась"
+                return "OK" if self._conservativity_ok else "НАРУШЕНА ⚠"
             return "OK"
 
         if verbose and _have_tqdm:
@@ -1500,18 +1529,21 @@ class Mesh2D:
         tol = tol_factor * char_len
 
         violations = np.where(norms > tol)[0]
-        if len(violations) > 0:
+        ok = len(violations) == 0
+        if not ok:
             worst = violations[int(np.argmax(norms[violations]))]
-            logger.warning(
-                "Геометрическая консервативность нарушена: %d/%d узлов, "
-                "макс. остаток %.3e (узел %d, tol=%.3e)",
+            logger.error(
+                "Геометрическая консервативность НАРУШЕНА: %d/%d узлов, "
+                "макс. остаток %.3e (узел %d, tol=%.3e). "
+                "Вероятная причина: некорректная CDT-триангуляция (дыры, "
+                "перекрывающиеся треугольники). FVM-невязка будет ~1e30.",
                 len(violations), n, float(norms[worst]), int(worst), tol,
             )
-            return False
-
-        logger.info("Геометрическая консервативность OK (tol=%.2e, char_len=%.4f)",
-                    tol, char_len)
-        return True
+        else:
+            logger.info("Геометрическая консервативность OK (tol=%.2e, char_len=%.4f)",
+                        tol, char_len)
+        self._conservativity_ok = ok
+        return ok
 
     def _assert_built(self) -> None:
         if not self._built:
