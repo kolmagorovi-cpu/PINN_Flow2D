@@ -334,6 +334,8 @@ class PINNSolver:
             return CyclicLR(self.optimizer, base_lr, max_lr, self.config['training']['lr_cyclic_period'])
         elif lr_schedule == 'detector':
             return None
+        elif lr_schedule == 'constant':
+            return None
         else:
             return optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min',
                                                          factor=0.5, patience=50)
