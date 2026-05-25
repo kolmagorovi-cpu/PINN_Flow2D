@@ -21,6 +21,118 @@ Example:
     ...     main()  # Запуск главного меню программы
 """
 
+# =============================================================================
+# ПРОВЕРКА ОКРУЖЕНИЯ (только stdlib, выполняется до всех остальных импортов)
+# =============================================================================
+import os as _os
+import sys as _sys
+
+
+def _bootstrap_environment() -> None:
+    """Проверяет и при необходимости создаёт виртуальное окружение с зависимостями."""
+    import importlib.util as _ilu
+    import subprocess as _sp
+    import shutil as _sh
+
+    _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
+    _VENV_DIR = _os.path.join(_SCRIPT_DIR, 'venv')
+
+    if _sys.platform == 'win32':
+        _VENV_PY = _os.path.join(_VENV_DIR, 'Scripts', 'python.exe')
+        _VENV_PIP = _os.path.join(_VENV_DIR, 'Scripts', 'pip.exe')
+    else:
+        _VENV_PY = _os.path.join(_VENV_DIR, 'bin', 'python')
+        _VENV_PIP = _os.path.join(_VENV_DIR, 'bin', 'pip')
+
+    # Пакеты: (import_name, pip_name)
+    _PACKAGES = [
+        ('yaml',             'pyyaml'),
+        ('numpy',            'numpy'),
+        ('torch',            'torch'),
+        ('matplotlib',       'matplotlib'),
+        ('scipy',            'scipy'),
+        ('shapely',          'shapely'),
+        ('typing_extensions','typing_extensions'),
+    ]
+
+    _in_our_venv = (
+        _os.path.exists(_VENV_PY)
+        and _os.path.abspath(_sys.executable) == _os.path.abspath(_VENV_PY)
+    )
+
+    def _ask(prompt: str) -> bool:
+        try:
+            return input(prompt).strip().lower() in ('y', 'yes', 'да', 'д')
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    def _create_venv() -> bool:
+        uv = _sh.which('uv')
+        print("  Создание виртуального окружения...", flush=True)
+        if uv:
+            r = _sp.run([uv, 'venv', _VENV_DIR], capture_output=True, text=True)
+        else:
+            r = _sp.run([_sys.executable, '-m', 'venv', _VENV_DIR],
+                        capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"  Ошибка: {r.stderr.strip() or r.stdout.strip()}")
+            return False
+        print("  Виртуальное окружение создано.")
+        return True
+
+    def _install_packages(pip_names: list) -> bool:
+        uv = _sh.which('uv')
+        print(f"  Установка: {', '.join(pip_names)} ...", flush=True)
+        if uv:
+            r = _sp.run([uv, 'pip', 'install', '--python', _VENV_PY] + pip_names)
+        else:
+            r = _sp.run([_VENV_PIP, 'install'] + pip_names)
+        if r.returncode != 0:
+            print("  Ошибка при установке. Проверьте подключение к интернету.")
+            return False
+        print("  Зависимости установлены.")
+        return True
+
+    # --- Случай 1: виртуальное окружение ещё не создано ---
+    if not _os.path.exists(_VENV_DIR):
+        print("\n  Виртуальное окружение не обнаружено.")
+        if not _ask("  Создать и установить зависимости? [y/N]: "):
+            print("  Продолжение без виртуального окружения (возможны ошибки).\n")
+            return
+        if not _create_venv():
+            return
+        _install_packages([pip for _, pip in _PACKAGES])
+        # Перезапуск внутри нового окружения
+        if _os.path.exists(_VENV_PY):
+            print("  Перезапуск в виртуальном окружении...\n", flush=True)
+            r = _sp.run([_VENV_PY] + _sys.argv)
+            _sys.exit(r.returncode)
+        return
+
+    # --- Случай 2: venv есть, но мы запущены вне его — перезапускаемся ---
+    if not _in_our_venv and _os.path.exists(_VENV_PY):
+        r = _sp.run([_VENV_PY] + _sys.argv)
+        _sys.exit(r.returncode)
+
+    # --- Случай 3: мы внутри venv — проверяем наличие пакетов ---
+    missing_pip = [pip for imp, pip in _PACKAGES if _ilu.find_spec(imp) is None]
+    if missing_pip:
+        print(f"\n  Отсутствуют пакеты: {', '.join(missing_pip)}")
+        if _ask("  Установить недостающие пакеты? [y/N]: "):
+            if _install_packages(missing_pip):
+                print("  Перезапуск...\n", flush=True)
+                r = _sp.run([_VENV_PY] + _sys.argv)
+                _sys.exit(r.returncode)
+        else:
+            print("  Продолжение с отсутствующими пакетами (возможны ошибки).\n")
+
+
+_bootstrap_environment()
+del _bootstrap_environment
+
+# =============================================================================
+# ОСНОВНЫЕ ИМПОРТЫ
+# =============================================================================
 import importlib
 import datetime
 import sys

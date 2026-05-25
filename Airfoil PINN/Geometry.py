@@ -774,63 +774,114 @@ def load_geometry_from_config(config_path: str = None, verbose: bool = True) -> 
     return geom
 
 
+def _select_geometry_file() -> Optional[str]:
+    """
+    Меню выбора файла геометрии из папки Geometry/.
+
+    Сканирует Geometry/ рекурсивно на файлы .txt, .csv, .dat
+    и предлагает пользователю выбрать нужный по номеру.
+
+    Returns:
+        Полный путь к выбранному файлу или None при отмене.
+    """
+    geom_dir = os.path.join(PROJECT_ROOT, 'Geometry')
+    allowed_ext = {'.txt', '.csv', '.dat'}
+
+    files: List[Tuple[str, str]] = []
+    for dirpath, _, filenames in os.walk(geom_dir):
+        for fname in sorted(filenames):
+            if os.path.splitext(fname)[1].lower() in allowed_ext:
+                full_path = os.path.join(dirpath, fname)
+                rel_path = os.path.relpath(full_path, PROJECT_ROOT)
+                files.append((rel_path, full_path))
+
+    print("\n" + "=" * 60)
+    print("  ВЫБОР ФАЙЛА ГЕОМЕТРИИ".center(60))
+    print("=" * 60)
+
+    if not files:
+        print(f"\n  Файлы геометрии (.txt, .csv, .dat) не найдены.")
+        print(f"  Поместите файл в папку: {geom_dir}")
+        print("\n" + "=" * 60)
+        return None
+
+    print(f"  Папка: Geometry/    Найдено файлов: {len(files)}")
+    print("-" * 60)
+    for i, (rel_path, _) in enumerate(files, 1):
+        size_kb = os.path.getsize(_) / 1024
+        print(f"  [{i:2d}]  {rel_path:<40}  {size_kb:6.1f} кБ")
+    print("-" * 60)
+    print("  [ 0]  Отмена")
+    print("=" * 60)
+
+    while True:
+        try:
+            raw = input("\n  Номер файла: ").strip()
+            idx = int(raw)
+            if idx == 0:
+                return None
+            if 1 <= idx <= len(files):
+                rel_path, full_path = files[idx - 1]
+                print(f"\n  Выбран: {rel_path}")
+                return full_path
+            print(f"  Введите число от 0 до {len(files)}")
+        except ValueError:
+            print("  Ошибка: введите число")
+        except KeyboardInterrupt:
+            print()
+            return None
+
+
 def g2d() -> None:
     """
-    Главная функция модуля геометрии (автоматический режим).
+    Главная функция модуля геометрии.
 
-    Автоматически загружает конфигурацию из geom_config.yaml,
-    создаёт геометрию, визуализирует и сохраняет результаты.
+    Показывает меню выбора файла из папки Geometry/, затем загружает
+    профиль, создаёт расчётную область, визуализирует и сохраняет.
     """
     print('\033c')
-    print("="*60)
+    print("=" * 60)
     print("МОДУЛЬ ГЕОМЕТРИИ G2D".center(60))
-    print("="*60)
+    print("=" * 60)
+
+    # Выбор файла профиля
+    selected_file = _select_geometry_file()
+    if selected_file is None:
+        return
 
     config = GeometryConfig(
         save_format='npy',
         plot_show=True,
         output_dir=DEFAULT_OUTPUT_DIR,
-        verbose=True
+        verbose=True,
     )
 
-    # Загрузка конфигурации из geom_config.yaml
+    # Читаем базовую конфигурацию для параметров области
     geom_config_path = os.path.join(PROJECT_ROOT, "geom_config.yaml")
-    
-    if not os.path.exists(geom_config_path):
-        logger.error(f"❌ Конфигурационный файл не найден: {geom_config_path}")
-        input("\nНажмите Enter для выхода...")
-        return
+    geom_config: Dict = {}
+    if os.path.exists(geom_config_path):
+        try:
+            with open(geom_config_path, 'r', encoding='utf-8') as f:
+                geom_config = yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать geom_config.yaml: {e}")
 
-    try:
-        with open(geom_config_path, 'r', encoding='utf-8') as f:
-            geom_config = yaml.safe_load(f)
-        
-        geom_type = geom_config.get('geom_type', 'airfoil')
-        geom_name = geom_config.get('geom_name')
-        
-        if geom_name is None:
-            logger.error("❌ В geom_config.yaml не указан параметр 'geom_name'")
-            input("\nНажмите Enter для выхода...")
-            return
-        
-        print(f"\n✅ Конфигурация загружена: {geom_config_path}")
-        print(f"   Тип геометрии: {geom_type}")
-        print(f"   Имя геометрии: {geom_name}")
+    # Имя геометрии = имя файла без расширения
+    geom_name = os.path.splitext(os.path.basename(selected_file))[0]
 
-    except Exception as e:
-        logger.error(f"❌ Ошибка при загрузке конфигурации: {e}")
-        input("\nНажмите Enter для выхода...")
-        return
+    # Подставляем выбранный файл в конфигурацию
+    airfoil_params = geom_config.setdefault('airfoil_params', {})
+    airfoil_params['source_type'] = 'file'
+    airfoil_params['file_path'] = selected_file
+    geom_config['geom_type'] = 'airfoil'
+    geom_config['geom_name'] = geom_name
 
-    if geom_type != 'airfoil':
-        logger.error(f"❌ Поддерживается только geom_type='airfoil', получено: '{geom_type}'")
-        input("\nНажмите Enter для выхода...")
-        return
+    print(f"\n  Файл профиля : {os.path.relpath(selected_file, PROJECT_ROOT)}")
+    print(f"  Имя геометрии: {geom_name}")
 
-    # Инициализация геометрии
+    # Загрузка профиля
     geom = Geometry2D(config=config, geom_type='airfoil')
-
-    if not geom.load_from_config(geom_config_path):
+    if not geom._load_airfoil_from_config(geom_config):
         input("\n❌ Ошибка загрузки. Нажмите Enter...")
         return
 
@@ -839,7 +890,6 @@ def g2d() -> None:
     print("\n🔧 СОЗДАНИЕ РАСЧЁТНОЙ ОБЛАСТИ")
     print("-" * 40)
 
-    airfoil_params = geom_config.get('airfoil_params', {})
     domain_params = airfoil_params.get('domain_params', {})
     geom.create_domain(**domain_params)
 
@@ -853,13 +903,13 @@ def g2d() -> None:
     foil_path, domain_path = geom.save(geom_name)
 
     print(f"\n✅ Сохранено:")
-    print(f"   Профиль: {foil_path}")
-    print(f"   Область: {domain_path}")
-    print(f"   Метаданные: {os.path.join(config.output_dir, f'{geom_name}_metadata.npy')}")
+    print(f"   Профиль:     {foil_path}")
+    print(f"   Область:     {domain_path}")
+    print(f"   Метаданные:  {os.path.join(config.output_dir, f'{geom_name}_metadata.npy')}")
 
-    print("\n" + "="*60)
-    print("✅ РАБОТА МОДУЛЯ ЗАВЕРШЕНА")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print("✅ РАБОТА МОДУЛЯ ЗАВЕРШЕНА".center(60))
+    print("=" * 60)
     input("\nНажмите Enter для выхода...")
 
 
