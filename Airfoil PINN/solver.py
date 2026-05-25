@@ -452,6 +452,9 @@ class PINNSolver:
                     num_points=200,
                     y_max_ratio=self.profile_y_max_ratio
                 )
+                if np.all(np.isnan(u_interp_norm)):
+                    logger.warning(f"Сечение x={x_sec} пропущено: нет данных для интерполяции.")
+                    continue
                 y_phys = y_grid * self.data_handler.chord
                 u_phys = u_interp_norm * self.data_handler.U_inf
                 profiles[x_sec] = (y_phys, u_phys)

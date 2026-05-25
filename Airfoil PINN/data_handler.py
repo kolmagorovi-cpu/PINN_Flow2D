@@ -607,6 +607,12 @@ class DataHandler:
         mask_y = self.dataset.y.flatten() < y_limit
         mask = mask_x & mask_y
 
+        if mask.sum() == 0:
+            logger.warning(f"Нет точек в сечении x={x_target} (tol={tol:.4f}), пропускаем интерполяцию.")
+            if y_grid is None:
+                y_grid = np.linspace(self.y_min, y_limit, num_points)
+            return y_grid, np.full_like(y_grid, np.nan)
+
         if mask.sum() < 3:
             logger.warning(f"Мало точек в сечении x={x_target} после ограничения y<{y_limit:.3f}, интерполяция может быть неточной.")
 
