@@ -1612,10 +1612,10 @@ def S2DR() -> None:
         print("\n🔧 Генерация точек коллокации...")
         sampler.generate_all_points(domain, foil)
 
-        if config.plot_results:
-            print("\n📊 Построение графика...")
-            plot_path = os.path.join(config.output_dir, "collocation_points.png")
-            sampler.plot_points(domain, foil, save_path=plot_path)
+        print("\n📊 Построение графика точек коллокации...")
+        plot_path = os.path.join(config.output_dir, "collocation_points.png")
+        sampler.plot_points(domain, foil, save_path=plot_path)
+        print(f"✅ График сохранён: {plot_path}")
 
         print("\n💾 Сохранение...")
         sampler.save_points()
@@ -1639,6 +1639,12 @@ def S2DR() -> None:
                     print(f"   Узлов: {s['num_nodes']}  |  Треугольников: {s['num_triangles']}")
                     print(f"   Внутренних граней: {s['num_internal_faces']}  |  Граничных граней: {s['num_boundary_faces']}")
                     print(f"   CV min/max/mean: {s['cv_volume_min']:.3e} / {s['cv_volume_max']:.3e} / {s['cv_volume_mean']:.3e} м²")
+
+                    print("\n📊 Построение графика сетки...")
+                    mesh_plot_path = os.path.join(config.output_dir, "mesh2d.png")
+                    mesh.plot(save_path=mesh_plot_path, dpi=config.plot_dpi,
+                              show=config.plot_results)
+                    print(f"✅ График сохранён: {mesh_plot_path}")
                 except Exception as e:
                     print(f"\n❌ Ошибка построения сетки: {e}")
                     logger.error("Ошибка mesh2d.build()", exc_info=True)

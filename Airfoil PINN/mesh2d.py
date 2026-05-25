@@ -754,8 +754,13 @@ class Mesh2D:
         face_vector_scale: float = 1.0,
         save_path: Optional[str] = None,
         dpi: int = 150,
+        show: bool = True,
     ) -> None:
-        """Визуализация сетки."""
+        """Визуализация сетки.
+
+        Args:
+            show: вызывать plt.show() (False — только сохранить в файл).
+        """
         import matplotlib.pyplot as plt
         from matplotlib.collections import PolyCollection
         from matplotlib.cm import ScalarMappable
@@ -815,7 +820,10 @@ class Mesh2D:
         if save_path:
             plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
             logger.info("График сохранён: %s", save_path)
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close()
 
     # ── Внутренние шаги построения ────────────────────────────────────────────
 
