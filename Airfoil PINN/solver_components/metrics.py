@@ -345,10 +345,11 @@ class MetricsCollector:
             print(fmt_line('Integral Flow', rate_int, integral_loss, integral_loss,
                            w_int, w_rms_int, w_max_int))
 
-        # FVM loss (если ненулевая)
-        if fvm_loss > 0.0:
-            fvm_w = getattr(self.loss_computer, 'fvm_weight', 0.0)
-            print(fmt_line('FVM Loss', 1.0, fvm_loss, fvm_loss, fvm_w, fvm_loss * fvm_w, fvm_loss * fvm_w))
+        # FVM loss (если включена)
+        fvm_w = getattr(self.loss_computer, 'fvm_weight', 0.0)
+        if fvm_w > 0.0:
+            rate_fvm = self._compute_rate('fvm', None, fvm_loss)
+            print(fmt_line('FVM Loss', rate_fvm, fvm_loss, fvm_loss, fvm_w, fvm_loss * fvm_w, fvm_loss * fvm_w))
 
         # Totals
         total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0
@@ -406,6 +407,12 @@ class MetricsCollector:
         elif category == 'total_pde':
             if self.history.get('total_pde') and len(self.history['total_pde']) >= 2:
                 prev = self.history['total_pde'][-2]
+            else:
+                return 1.0
+        elif category == 'fvm':
+            hist = self.history.get('fvm_loss', [])
+            if hist and len(hist) >= 2:
+                prev = hist[-2]
             else:
                 return 1.0
         elif category == 'loss':

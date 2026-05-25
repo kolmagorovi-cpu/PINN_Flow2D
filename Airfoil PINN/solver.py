@@ -120,8 +120,12 @@ class PINNSolver:
             dtype=self.dtype
         )
 
-        # FVM-невязки (если задана сетка)
-        if self.data_handler.mesh_data is not None:
+        # FVM-невязки (если задана сетка и fvm.enabled=True)
+        _fvm_cfg = config['loss_weights'].get('fvm', {})
+        _fvm_enabled = isinstance(_fvm_cfg, dict) and bool(_fvm_cfg.get('enabled', False))
+        if _fvm_enabled and self.data_handler.mesh_data is None:
+            logger.warning("FVM Mass flow включён (fvm.enabled=True), но mesh_file не задан — FVM-потеря не будет вычисляться")
+        if self.data_handler.mesh_data is not None and _fvm_enabled:
             try:
                 from fvm_residuals import FVMResiduals
                 fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)

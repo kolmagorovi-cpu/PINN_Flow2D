@@ -82,6 +82,10 @@ class ConfigManager:
                 'sa_apply_to_bc': False,
                 'integral_condition': False,
                 'integral_weight': 0.0,
+                'fvm': {
+                    'enabled': False,
+                    'weight': 1.0,
+                },
             },
             'training': {
                 'two_stage': False,
@@ -288,6 +292,10 @@ class ConfigManager:
         print(f"  use_sa_weights  : {lw['use_sa_weights']}")
         print(f"  sa_apply_to_bc  : {lw['sa_apply_to_bc']}")
         print(f"  integral        : {lw['integral_condition']} (weight={lw['integral_weight']})")
+        fvm_cfg = lw.get('fvm', {})
+        fvm_enabled = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
+        fvm_weight = fvm_cfg.get('weight', 1.0) if isinstance(fvm_cfg, dict) else float(fvm_cfg)
+        print(f"  fvm_mass_flow   : {fvm_enabled} (weight={fvm_weight})")
         print()
 
         tr = self.config['training']

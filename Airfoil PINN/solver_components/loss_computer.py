@@ -87,10 +87,17 @@ class LossComputer:
         self.integral_target = lw.get('integral_target', 0.0)
 
         # FVM-потеря (закон сохранения массы на неструктурированной сетке)
-        # fvm может быть числом (0.5), строкой ("0.5"), bool или dict {'weight': 0.5}
+        # Поддерживаемые форматы:
+        #   dict с enabled/weight (новый): {'enabled': True, 'weight': 1.0}
+        #   dict без enabled (старый):     {'weight': 0.5}  → вес берётся напрямую
+        #   число/строка (legacy):         0.5
         fvm_cfg = lw.get('fvm', {})
         if isinstance(fvm_cfg, dict):
-            self.fvm_weight: float = float(fvm_cfg.get('weight', 0.0))
+            if 'enabled' in fvm_cfg:
+                fvm_on = bool(fvm_cfg['enabled'])
+                self.fvm_weight: float = float(fvm_cfg.get('weight', 1.0)) if fvm_on else 0.0
+            else:
+                self.fvm_weight: float = float(fvm_cfg.get('weight', 0.0))
         else:
             self.fvm_weight: float = float(fvm_cfg)
         # Заполняется из PINNSolver при наличии mesh_file в конфиге
