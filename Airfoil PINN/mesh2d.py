@@ -242,41 +242,130 @@ def _triangulate_polygon_delaunay(polygon: List[int],
 
 
 def _insert_constrained_edge(
-    s: int, t: int,
-    tris: List[Tuple[int, int, int]],
+    s: int,
+    t: int,
+    tris: Dict[int, Tuple[int, int, int]],
     coords: np.ndarray,
-) -> List[Tuple[int, int, int]]:
+    edge_map: Dict[Tuple[int, int], Set[int]],
+    vertex_to_tris: Dict[int, Set[int]],
+    next_id: int,
+) -> int:
     """
-    Вставляет ребро (s,t) в триангуляцию через cavity-retriangulation.
+    Вставляет ребро (s,t) в триангуляцию через локальный обход коридора.
 
-    Алгоритм:
-    1. Находит все треугольники, пересечённые отрезком (s,t).
-    2. Собирает вершины полостей по обе стороны (s,t).
-    3. Делоне-триангулирует каждую из двух полигональных полостей.
+    Сложность O(deg(s) + k·log k) вместо O(T):
+    1. Веерный поиск: находит стартовый треугольник за O(deg(s)).
+    2. Обход коридора: идёт по смежным треугольникам через exit-ребро, O(k).
+    3. Сбор и сортировка полостей: O(k·log k).
+    4. Инкрементальное обновление tris/edge_map/vertex_to_tris: O(k).
 
-    Возвращает обновлённый список треугольников.
+    Изменяет tris, edge_map, vertex_to_tris in-place.
+    Возвращает обновлённый next_id.
     """
+    # Ребро уже в триангуляции?
+    key_st = (min(s, t), max(s, t))
+    if key_st in edge_map and edge_map[key_st]:
+        return next_id
+
     ps, pt = coords[s], coords[t]
+    d = pt - ps
 
-    # ── 1. Найти пересечённые треугольники ─────────────────────────────────
-    crossed_idx: Set[int] = set()
-    for ti, tri in enumerate(tris):
-        if s in tri or t in tri:
+    # ── Фаза 1: Веерный поиск стартового треугольника ───────────────────────
+    # Треугольники вокруг s образуют угловой веер.
+    # Ищем T=(s,p,q) CCW, в угловой сектор которого попадает d = pt−ps:
+    #   dp×d ≥ 0  AND  dq×d ≤ 0,
+    #   где dp = coords[p]−coords[s], dq = coords[q]−coords[s].
+    start_tid: Optional[int] = None
+    for tid in list(vertex_to_tris.get(s, set())):
+        a, b, c = tris[tid]
+        others = [v for v in (a, b, c) if v != s]
+        if len(others) != 2:
             continue
-        a, b, c = tri
-        for u, v in ((a, b), (b, c), (c, a)):
-            if _segs_cross_strict(ps, pt, coords[u], coords[v]):
-                crossed_idx.add(ti)
+        p, q = others[0], others[1]
+
+        # Прямой сосед — ребро (s,t) уже есть как сторона треугольника
+        if t in (p, q):
+            return next_id
+
+        # Привести (s, p, q) к CCW
+        if _cross2d(coords[s], coords[p], coords[q]) < 0:
+            p, q = q, p
+
+        dp = coords[p] - coords[s]
+        dq = coords[q] - coords[s]
+        c1 = dp[0] * d[1] - dp[1] * d[0]   # dp × d
+        c2 = dq[0] * d[1] - dq[1] * d[0]   # dq × d
+
+        if c1 >= -1e-12 and c2 <= 1e-12:    # d попадает в угловой сектор
+            start_tid = tid
+            break
+
+    # Fallback для граничных вершин (неполный веер): ищем в веере ребро
+    # противоположной стороны, которое строго пересекает (ps, pt).
+    if start_tid is None:
+        for tid in list(vertex_to_tris.get(s, set())):
+            a, b, c = tris[tid]
+            others = [v for v in (a, b, c) if v != s]
+            if len(others) != 2:
+                continue
+            p, q = others[0], others[1]
+            if _segs_cross_strict(ps, pt, coords[p], coords[q]):
+                start_tid = tid
                 break
 
-    if not crossed_idx:
-        return tris  # ребро уже присутствует или нет пересечений
+    if start_tid is None:
+        logger.warning(
+            "_insert_constrained_edge: не найден стартовый треугольник для (%d,%d)", s, t
+        )
+        return next_id
 
-    # ── 2. Извлечь вершины полостей ─────────────────────────────────────────
-    upper: List[int] = []  # слева от s→t
-    lower: List[int] = []  # справа от s→t
-    for ti in crossed_idx:
-        for v in tris[ti]:
+    # ── Фаза 2: Обход коридора ───────────────────────────────────────────────
+    # Шагаем по смежным треугольникам вдоль сегмента (s,t).
+    # Тест строгого пересечения (ps,pt) с ребром (u,v):
+    #   d1 = cross2d(ps,pt, coords[u]),  d2 = cross2d(ps,pt, coords[v])
+    #   d1·d2 < 0  ↔  u и v лежат по разные стороны прямой s→t.
+    crossed_ids: Set[int] = set()
+    current_tid = start_tid
+    entry_edge: Optional[Tuple[int, int]] = None
+    max_steps = len(tris) + 10
+
+    for _ in range(max_steps):
+        a, b, c = tris[current_tid]
+
+        if t in (a, b, c):
+            break   # достигли треугольника, содержащего вершину t
+
+        crossed_ids.add(current_tid)
+
+        exit_edge: Optional[Tuple[int, int]] = None
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (min(u, v), max(u, v))
+            if key == entry_edge:
+                continue  # ребро входа не рассматриваем
+            d1 = _cross2d(ps, pt, coords[u])
+            d2 = _cross2d(ps, pt, coords[v])
+            if d1 * d2 < 0:
+                exit_edge = key
+                break
+
+        if exit_edge is None:
+            break   # t находится внутри текущего треугольника
+
+        neighbors = edge_map.get(exit_edge, set()) - {current_tid}
+        if not neighbors:
+            break   # граничное ребро — нет смежного треугольника
+
+        entry_edge = exit_edge
+        current_tid = next(iter(neighbors))
+
+    if not crossed_ids:
+        return next_id   # коридор пуст — ребро уже присутствует
+
+    # ── Фаза 3: Сбор вершин полостей ────────────────────────────────────────
+    upper: List[int] = []   # слева от s→t
+    lower: List[int] = []   # справа от s→t
+    for tid in crossed_ids:
+        for v in tris[tid]:
             if v == s or v == t:
                 continue
             side = _cross2d(ps, pt, coords[v])
@@ -291,21 +380,47 @@ def _insert_constrained_edge(
                 )
 
     def _param(v: int) -> float:
-        d = pt - ps
-        return float(np.dot(coords[v] - ps, d))
+        return float(np.dot(coords[v] - ps, pt - ps))
 
     upper.sort(key=_param)
     lower.sort(key=_param)
 
-    # ── 3. Обновить триангуляцию ────────────────────────────────────────────
-    kept = [tri for ti, tri in enumerate(tris) if ti not in crossed_idx]
+    # ── Фаза 4: Инкрементальное обновление структур ──────────────────────────
+    # 4а — удалить пересечённые треугольники из tris, edge_map, vertex_to_tris
+    for tid in crossed_ids:
+        a, b, c = tris[tid]
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (min(u, v), max(u, v))
+            if key in edge_map:
+                edge_map[key].discard(tid)
+                if not edge_map[key]:
+                    del edge_map[key]
+        for w in (a, b, c):
+            if w in vertex_to_tris:
+                vertex_to_tris[w].discard(tid)
+        del tris[tid]
 
+    # 4б — триангуляция полостей (алгоритм Sloan 1993, без изменений)
     upper_poly = [s] + upper + [t]
     lower_poly = [s] + lower[::-1] + [t]
+    new_triangles = (
+        _triangulate_polygon_delaunay(upper_poly, coords)
+        + _triangulate_polygon_delaunay(lower_poly, coords)
+    )
 
-    kept.extend(_triangulate_polygon_delaunay(upper_poly, coords))
-    kept.extend(_triangulate_polygon_delaunay(lower_poly, coords))
-    return kept
+    # 4в — добавить новые треугольники с монотонно возрастающими ID
+    for tri in new_triangles:
+        tid = next_id
+        next_id += 1
+        tris[tid] = tri
+        a, b, c = tri
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (min(u, v), max(u, v))
+            edge_map.setdefault(key, set()).add(tid)
+        for w in (a, b, c):
+            vertex_to_tris.setdefault(w, set()).add(tid)
+
+    return next_id
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -313,28 +428,23 @@ def _insert_constrained_edge(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _flip_to_delaunay(
-    tris: List[Tuple[int, int, int]],
+    tris: Dict[int, Tuple[int, int, int]],
     coords: np.ndarray,
     constrained_edges: Set[Tuple[int, int]],
+    edge_map: Dict[Tuple[int, int], Set[int]],
     verbose: bool = False,
-) -> List[Tuple[int, int, int]]:
+) -> None:
     """
     Алгоритм Лоусона: переворачивает все нарушающие критерий Делоне
     некonstrained рёбра до достижения полного CDT-состояния.
 
-    Гарантирует, что для каждого внутреннего ребра (a,b), смежного с
-    треугольниками T1=(a,b,c) и T2=(a,b,d), вершина d не лежит строго
-    внутри описанной окружности T1. Ограниченные рёбра не переворачиваются.
-    """
-    tris = list(tris)
-    n_flips = 0
-    max_iter = len(tris) * len(tris) + 10
+    Принимает актуальный edge_map извне (не перестраивает с нуля).
+    Работает in-place по tris и edge_map: возвращает None.
 
-    # Строим edge_map один раз; обновляем инкрементально после каждого флипа.
-    edge_map: Dict[Tuple[int, int], List[int]] = {}
-    for ti, (a, b, c) in enumerate(tris):
-        for u, v in ((a, b), (b, c), (c, a)):
-            edge_map.setdefault((min(u, v), max(u, v)), []).append(ti)
+    Использует Set вместо List в edge_map: discard() — O(1) вместо remove() — O(n).
+    """
+    n_flips = 0
+    max_iter = len(tris) * 3 + 10
 
     try:
         from tqdm import tqdm as _tqdm
@@ -351,7 +461,9 @@ def _flip_to_delaunay(
         for (vi, vj), adj in list(edge_map.items()):
             if len(adj) != 2 or (vi, vj) in constrained_edges:
                 continue
-            t1i, t2i = adj
+            t1i, t2i = tuple(adj)
+            if t1i not in tris or t2i not in tris:
+                continue
             t1, t2 = tris[t1i], tris[t2i]
             c_v = next(v for v in t1 if v != vi and v != vj)
             d_v = next(v for v in t2 if v != vi and v != vj)
@@ -364,14 +476,14 @@ def _flip_to_delaunay(
                 new_t1 = _ensure_ccw((vi, c_v, d_v), coords)
                 new_t2 = _ensure_ccw((vj, d_v, c_v), coords)
 
-                # Инкрементальное обновление edge_map:
-                # удаляем t1i и t2i из всех рёбер старых треугольников
-                for old_tri_idx, old_tri in ((t1i, t1), (t2i, t2)):
+                # Инкрементальное обновление edge_map (Set-версия):
+                # удаляем t1i и t2i из рёбер старых треугольников
+                for old_tid, old_tri in ((t1i, t1), (t2i, t2)):
                     a2, b2, c2 = old_tri
                     for u2, v2 in ((a2, b2), (b2, c2), (c2, a2)):
                         k2 = (min(u2, v2), max(u2, v2))
-                        if k2 in edge_map and old_tri_idx in edge_map[k2]:
-                            edge_map[k2].remove(old_tri_idx)
+                        if k2 in edge_map:
+                            edge_map[k2].discard(old_tid)
                             if not edge_map[k2]:
                                 del edge_map[k2]
 
@@ -379,13 +491,11 @@ def _flip_to_delaunay(
                 tris[t2i] = new_t2
 
                 # добавляем t1i и t2i в рёбра новых треугольников
-                for new_tri_idx, new_tri in ((t1i, new_t1), (t2i, new_t2)):
+                for new_tid, new_tri in ((t1i, new_t1), (t2i, new_t2)):
                     a2, b2, c2 = new_tri
                     for u2, v2 in ((a2, b2), (b2, c2), (c2, a2)):
                         k2 = (min(u2, v2), max(u2, v2))
-                        edge_map.setdefault(k2, [])
-                        if new_tri_idx not in edge_map[k2]:
-                            edge_map[k2].append(new_tri_idx)
+                        edge_map.setdefault(k2, set()).add(new_tid)
 
                 n_flips += 1
                 if _pbar is not None:
@@ -400,7 +510,6 @@ def _flip_to_delaunay(
     if _pbar is not None:
         _pbar.close()
     logger.info("CDT edge-flip: %d переворотов за %d итераций", n_flips, _it + 1)
-    return tris
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1069,14 +1178,29 @@ class Mesh2D:
         dom_edges, foil_edges = self._build_constrained_edge_set()
         required = dom_edges + foil_edges
 
-        # Текущие рёбра триангуляции
-        current_edges: Set[Tuple[int, int]] = set()
-        for a, b, c in self._tris_list:
-            for u, v in ((a, b), (b, c), (c, a)):
-                current_edges.add((min(u, v), max(u, v)))
+        # ── Конвертация: List → Dict (O(T), один раз) ────────────────────────
+        # Dict[tid → (a,b,c)] позволяет удалять/добавлять треугольники без
+        # сдвига индексов — необходимо для инкрементального обновления edge_map.
+        tris: Dict[int, Tuple[int, int, int]] = {
+            i: (int(a), int(b), int(c))
+            for i, (a, b, c) in enumerate(self._tris_list)
+        }
+        next_id: int = len(tris)
 
+        # ── Построение edge_map и vertex_to_tris (O(T), один раз) ───────────
+        # Эти структуры поддерживаются инкрементально через все вставки и флипы.
+        # Set[int] вместо List[int]: discard() — O(1) вместо remove() — O(n).
+        edge_map: Dict[Tuple[int, int], Set[int]] = {}
+        vertex_to_tris: Dict[int, Set[int]] = {}
+        for tid, (a, b, c) in tris.items():
+            for u, v in ((a, b), (b, c), (c, a)):
+                edge_map.setdefault((min(u, v), max(u, v)), set()).add(tid)
+            for w in (a, b, c):
+                vertex_to_tris.setdefault(w, set()).add(tid)
+
+        # ── Проверка missing через edge_map (O(M), без O(T·3) прохода) ───────
         missing = [(s, t) for s, t in required
-                   if (min(s, t), max(s, t)) not in current_edges]
+                   if (min(s, t), max(s, t)) not in edge_map]
 
         if missing:
             logger.info("CDT: вставка %d пропущенных граничных рёбер из %d",
@@ -1091,24 +1215,28 @@ class Mesh2D:
         except ImportError:
             _have_tqdm = False
 
-        tris = list(self._tris_list)
+        # ── Вставка рёбер: O(M·k) вместо O(M·T) ─────────────────────────────
         _edge_iter = (
             _tqdm(missing, desc="    вставка рёбер", unit="ребро",
                   leave=False, total=len(missing))
             if _verbose and _have_tqdm and missing else missing
         )
         for s, t in _edge_iter:
-            tris = _insert_constrained_edge(s, t, tris, self._coords)
+            next_id = _insert_constrained_edge(
+                s, t, tris, self._coords, edge_map, vertex_to_tris, next_id
+            )
 
         self._constrained_edges = {(min(s, t), max(s, t)) for s, t in required}
         self._foil_constrained_edges = {(min(s, t), max(s, t)) for s, t in foil_edges}
         self._dom_constrained_edges = {(min(s, t), max(s, t)) for s, t in dom_edges}
 
-        tris = _flip_to_delaunay(tris, self._coords, self._constrained_edges,
-                                  verbose=_verbose)
+        # ── Flip: передаём готовый edge_map (не перестраивается с нуля) ──────
+        _flip_to_delaunay(tris, self._coords, self._constrained_edges,
+                          edge_map, verbose=_verbose)
 
-        self._tris_list = tris
-        self._triangles = np.array(tris, dtype=np.int32)
+        # ── Конвертация: Dict → List для остального пайплайна ────────────────
+        self._tris_list = list(tris.values())
+        self._triangles = np.array(self._tris_list, dtype=np.int32)
 
     def _remove_holes(self) -> None:
         """
