@@ -28,7 +28,7 @@ checkpoint:
 checkpoint_dir: Checkpoints
 data:
   points_file: Initial\Data\initial.npy
-  mesh_file: Initial\Data\mesh.npz
+  mesh_file: Sampler\Data\mesh2d.npz
 diagnostics:
   compute_grad_cosine: false
   compute_ntk_condition: false

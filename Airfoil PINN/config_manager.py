@@ -143,6 +143,7 @@ class ConfigManager:
             },
             'data': {
                 'points_file': None,
+                'mesh_file': 'Sampler\\Data\\mesh2d.npz',
             },
             'reference': {
                 'path': None,
