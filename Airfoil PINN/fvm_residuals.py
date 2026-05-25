@@ -43,7 +43,9 @@ BC_CODES: Dict[str, int] = {
     'axis_symmetry': 4,
     'interior':      5,
 }
-_WALL_CODE: int = BC_CODES['wall']
+_WALL_CODE: int          = BC_CODES['wall']
+_SYMMETRY_CODE: int      = BC_CODES['symmetry']
+_AXIS_SYMMETRY_CODE: int = BC_CODES['axis_symmetry']
 
 # Нижняя граница объёма КО — защита от деления на ноль при вырожденной сетке.
 # Значение много меньше любого физически реального объёма (< 1e-10 м²).
@@ -119,6 +121,18 @@ class FVMResiduals:
         self._u_prescribed    = torch.zeros(self.B, 2, dtype=torch.float32)
         self._prescribed_mask = torch.zeros(self.B, 1, dtype=torch.bool)
 
+        # Маска граней с нулевым нормальным потоком: wall (no-slip) и
+        # symmetry/axis_symmetry (непротекание u·n = 0). Предвычислена
+        # однократно — используется в каждом вызове compute_residual.
+        if self.B > 0:
+            self._zero_flux_mask = (
+                (self.bnd_type == _WALL_CODE)
+                | (self.bnd_type == _SYMMETRY_CODE)
+                | (self.bnd_type == _AXIS_SYMMETRY_CODE)
+            ).unsqueeze(1)                                   # (B, 1)
+        else:
+            self._zero_flux_mask = torch.zeros(0, 1, dtype=torch.bool)
+
         logger.info("FVMResiduals: N=%d, M=%d, B=%d", self.N, self.M, self.B)
 
     @staticmethod
@@ -167,9 +181,14 @@ class FVMResiduals:
         """
         Невязка уравнения неразрывности R_i = Φ_i / V_i для каждого КО.
 
-        Алгоритм (см. §9 математического описания):
-          - Upwind-интерполяция на внутренних гранях (направление по u_avg·S_ij).
-          - Граничные грани: u_face = 0 на стенке, u_face = u_узла на inlet/outlet.
+        Алгоритм:
+          - Центральная схема на внутренних гранях: u_face = 0.5*(u_i + u_j).
+          - Граничные грани по типу:
+              wall           : flux = 0  (no-slip, u = 0)
+              symmetry       : flux = 0  (непротекание u·n = 0; для уравнения
+              axis_symmetry    неразрывности эквивалентно стенке)
+              inlet          : flux = u_prescribed · S  (hard BC через set_inlet_velocity)
+              outlet/interior: flux = u_узла · S  (мягкое условие из нейросети)
           - Нормировка на объём КО.
 
         Аргументы:
@@ -208,9 +227,9 @@ class FVMResiduals:
                 self._u_prescribed.to(u.dtype),
                 u_b,
             )
-            # Стенка (no-slip): всегда ноль, перекрывает любые предписания
-            wall_mask = (self.bnd_type == _WALL_CODE).unsqueeze(1)
-            u_face_b  = u_face_b.masked_fill(wall_mask, 0.0)
+            # Wall (no-slip) и symmetry/axis_symmetry (u·n = 0): нулевой поток.
+            # Перекрывает prescribed BC — симметрийная грань не может быть inlet.
+            u_face_b  = u_face_b.masked_fill(self._zero_flux_mask, 0.0)
             flux_b    = (u_face_b * self.bnd_S).sum(dim=1)       # (B,)
 
             res = res.index_add(0, self.bnd_node, flux_b)
@@ -404,7 +423,8 @@ class FVMResiduals:
         self._device = torch.device(device)
         for attr in ('V', 'edge_i', 'edge_j', 'edge_S',
                      'bnd_node', 'bnd_S', 'bnd_type',
-                     '_u_prescribed', '_prescribed_mask'):
+                     '_u_prescribed', '_prescribed_mask',
+                     '_zero_flux_mask'):
             setattr(self, attr, getattr(self, attr).to(self._device))
         return self
 
