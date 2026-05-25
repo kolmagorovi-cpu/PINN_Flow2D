@@ -184,14 +184,13 @@ class FVMResiduals:
         if self.M > 0:
             u_i   = u[self.edge_i]                                # (M, 2)
             u_j   = u[self.edge_j]                                # (M, 2)
-            u_avg = 0.5 * (u_i + u_j)                            # (M, 2)
 
-            # Направление потока: δ_ij = u_avg · S_ij
-            direction = (u_avg * self.edge_S).sum(dim=1)          # (M,)
-
-            # Upwind-маска: 1.0 если поток идёт из i → j, 0.0 если j → i
-            mask  = (direction >= 0.0).to(u.dtype).unsqueeze(1)   # (M, 1)
-            u_face = u_i * mask + u_j * (1.0 - mask)             # (M, 2)
+            # Центральная схема: u_face = 0.5*(u_i + u_j).
+            # Для уравнения неразрывности (∇·u = 0) центральная схема
+            # корректна физически и полностью дифференцируема — в отличие от
+            # upwind, она не создаёт разрывов в графе вычислений при смене
+            # знака потока, что критично для устойчивости градиентного спуска.
+            u_face = 0.5 * (u_i + u_j)                           # (M, 2)
             flux   = (u_face * self.edge_S).sum(dim=1)            # (M,)
 
             # Аккумулирование: +flux для i, −flux для j
