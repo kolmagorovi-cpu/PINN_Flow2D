@@ -420,6 +420,57 @@ class DataHandler:
             self.mesh_data.n_nodes, self.mesh_data.n_triangles,
             self.mesh_data.n_int_faces, self.mesh_data.n_bnd_faces,
         )
+        self._prepare_fvm_tensors()
+
+    def _prepare_fvm_tensors(self) -> None:
+        """
+        Подготавливает нормированные тензоры (x, y, sdf, boundary_types) для FVM-шага.
+
+        Координаты берутся из узлов сетки (mesh_data.coords / chord).
+        SDF интерполируется из ближайших точек обучающего датасета.
+        Типы границ строятся из mesh_data.node_bnd_type с тем же one-hot, что и датасет.
+
+        Результат: self.fvm_x, self.fvm_y, self.fvm_sdf, self.fvm_bt — готовы для
+        loss_computer.build_input_tensor() без участия обучающего датасета.
+        """
+        coords = self.mesh_data.coords          # (N, 2) физические
+        N = len(coords)
+
+        x_norm_np = (coords[:, 0] / self.chord).astype(np.float32)
+        y_norm_np = (coords[:, 1] / self.chord).astype(np.float32)
+
+        # SDF по ближайшему соседу из обучающего датасета
+        x_data = self.dataset.x.numpy().flatten().astype(np.float32)
+        y_data = self.dataset.y.numpy().flatten().astype(np.float32)
+        sdf_data = self.dataset.sdf.numpy().flatten().astype(np.float32)
+
+        # Матрица квадратов расстояний (N_mesh, N_data); для сеток < 50k узлов ОК
+        dx = x_norm_np[:, None] - x_data[None, :]
+        dy = y_norm_np[:, None] - y_data[None, :]
+        nn_idx = np.argmin(dx ** 2 + dy ** 2, axis=1)  # (N_mesh,)
+        sdf_norm_np = sdf_data[nn_idx]
+
+        # One-hot типов границ (по именам из датасета)
+        bt_names = self.dataset.boundary_type_names
+        type_to_idx = self.dataset.type_to_idx
+        bt_one_hot = np.zeros((N, len(bt_names)), dtype=np.float32)
+        for i, t in enumerate(self.mesh_data.node_bnd_type):
+            t_lower = str(t).lower()
+            if t_lower in type_to_idx:
+                bt_one_hot[i, type_to_idx[t_lower]] = 1.0
+
+        self.fvm_x   = torch.tensor(x_norm_np,   dtype=torch.float32).view(-1, 1)
+        self.fvm_y   = torch.tensor(y_norm_np,   dtype=torch.float32).view(-1, 1)
+        self.fvm_sdf = torch.tensor(sdf_norm_np, dtype=torch.float32).view(-1, 1)
+        self.fvm_bt  = torch.tensor(bt_one_hot,  dtype=torch.float32) if bt_names else None
+
+        if N != self.n_points:
+            logger.warning(
+                "FVM-сетка (%d узлов) ≠ датасет (%d точек) — "
+                "Sampler пропустил %d узлов. FVM использует координаты сетки напрямую.",
+                N, self.n_points, abs(N - self.n_points),
+            )
+        logger.info("FVM-тензоры подготовлены: %d узлов", N)
 
     def get_dataloader(self) -> DataLoader:
         """

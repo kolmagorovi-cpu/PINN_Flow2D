@@ -557,31 +557,24 @@ class Trainer:
         if self.loss_computer.fvm is None or self.loss_computer.fvm_weight == 0.0:
             return 0.0
 
-        dataset = self.data_handler.dataset
-        n_dataset = dataset.x.shape[0]
-
-        # Проверка согласованности размеров: датасет мог вырасти после RAR
-        if n_dataset != self.loss_computer.fvm.N:
-            logger.warning(
-                "FVM step пропущен: датасет (%d точек) и сетка (%d узлов) "
-                "не совпадают (вероятно, выполнялся RAR). "
-                "Пересоздайте FVMResiduals после обновления сетки.",
-                n_dataset, self.loss_computer.fvm.N,
-            )
+        dh = self.data_handler
+        if not hasattr(dh, 'fvm_x'):
+            logger.warning("FVM step: fvm-тензоры не подготовлены (load_mesh не вызывался?), пропускаю.")
             return 0.0
 
         self.model.train()
-        # Градиенты уже обнулены последним батчем (accum_step всегда True для последнего батча)
 
-        x_all   = dataset.x.to(self.device, dtype=self.dtype)
-        y_all   = dataset.y.to(self.device, dtype=self.dtype)
-        sdf_all = dataset.sdf.to(self.device, dtype=self.dtype)
-        bt_all  = (dataset.boundary_types.to(self.device, dtype=self.dtype)
-                   if dataset.boundary_types is not None else None)
+        # Используем координаты узлов сетки напрямую — не датасет.
+        # Это корректно даже если датасет и сетка имеют разный размер.
+        x_all   = dh.fvm_x.to(self.device, dtype=self.dtype)
+        y_all   = dh.fvm_y.to(self.device, dtype=self.dtype)
+        sdf_all = dh.fvm_sdf.to(self.device, dtype=self.dtype)
+        bt_all  = (dh.fvm_bt.to(self.device, dtype=self.dtype)
+                   if dh.fvm_bt is not None else None)
 
         input_all = self.loss_computer.build_input_tensor(x_all, y_all, sdf_all, bt_all)
-        out_all   = self.model(input_all)          # (N, output_dim)
-        u_fvm     = out_all[:, :2]                  # (N, 2) — u и v
+        out_all   = self.model(input_all)          # (N_mesh, output_dim)
+        u_fvm     = out_all[:, :2]                  # (N_mesh, 2) — u и v
 
         fvm_loss = self.loss_computer.compute_fvm_loss(u_fvm)
 
