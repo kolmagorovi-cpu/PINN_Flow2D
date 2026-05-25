@@ -757,12 +757,14 @@ class Trainer:
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
 
         # FVM-шаг (отдельный backward на полном датасете, раз в fvm_interval эпох)
+        # Не прибавляется к avg_loss: FVM-loss — абсолютная величина на всей сетке,
+        # avg_loss — среднее по батчам; смешивать масштабы некорректно.
+        # FVM отслеживается отдельно через _last_fvm_loss → history['fvm_loss'].
         self._fvm_epoch_counter += 1
         if (self.loss_computer.fvm is not None
                 and self.loss_computer.fvm_weight > 0.0
                 and self._fvm_epoch_counter % self.fvm_interval == 0):
             self._last_fvm_loss = self._run_fvm_step()
-            avg_loss += self._last_fvm_loss
         else:
             self._last_fvm_loss = 0.0
 
@@ -849,13 +851,13 @@ class Trainer:
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
         avg_extra_grad = 0.0  # не вычисляется для L-BFGS
 
-        # FVM-шаг (аналогично Adam; счётчик общий для обоих режимов)
+        # FVM-шаг: не поддерживается с L-BFGS (нет closure), не прибавляется к avg_loss.
         self._fvm_epoch_counter += 1
         if (self.loss_computer.fvm is not None
                 and self.loss_computer.fvm_weight > 0.0
                 and self._fvm_epoch_counter % self.fvm_interval == 0):
-            self._last_fvm_loss = self._run_fvm_step()
-            avg_loss += self._last_fvm_loss
+            logger.warning("FVM step пропущен: несовместим с L-BFGS (требует closure).")
+            self._last_fvm_loss = 0.0
         else:
             self._last_fvm_loss = 0.0
 

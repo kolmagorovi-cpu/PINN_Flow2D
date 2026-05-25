@@ -174,6 +174,8 @@ class InteractiveHandler:
             print(f"  {key}: {value:.2e}")
         if self.loss_computer.integral_condition:
             print(f"  integral_weight: {self.loss_computer.integral_weight:.2e}")
+        if self.loss_computer.fvm is not None:
+            print(f"  fvm_weight: {self.loss_computer.fvm_weight:.2e}")
         print("\nВведите новые значения (Enter оставляет текущее). Для выхода без изменений введите 'q'.")
 
         new_weights = {}
@@ -193,7 +195,7 @@ class InteractiveHandler:
         # Обновляем веса в loss_computer
         self.loss_computer.loss_weights.update(new_weights)
 
-        # Если есть интегральное условие, обновляем его вес
+        # Интегральное условие
         if self.loss_computer.integral_condition:
             val = input(f"integral_weight [{self.loss_computer.integral_weight:.2e}]: ").strip()
             if val.lower() == 'q':
@@ -202,6 +204,18 @@ class InteractiveHandler:
             if val:
                 try:
                     self.loss_computer.integral_weight = float(val)
+                except ValueError:
+                    print("Неверный формат, вес оставлен без изменений.")
+
+        # FVM-потеря
+        if self.loss_computer.fvm is not None:
+            val = input(f"fvm_weight [{self.loss_computer.fvm_weight:.2e}]: ").strip()
+            if val.lower() == 'q':
+                print("Редактирование отменено.")
+                return
+            if val:
+                try:
+                    self.loss_computer.fvm_weight = float(val)
                 except ValueError:
                     print("Неверный формат, вес оставлен без изменений.")
 
