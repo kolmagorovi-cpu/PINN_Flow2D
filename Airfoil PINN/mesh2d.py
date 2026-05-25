@@ -563,7 +563,7 @@ class Mesh2D:
 
     # ── Публичный API ─────────────────────────────────────────────────────────
 
-    def build(self) -> None:
+    def build(self, verbose: bool = True) -> None:
         """
         Строит CDT-сетку:
           1. Подготовка вершин (коллокация + геометрия)
@@ -574,15 +574,39 @@ class Mesh2D:
           6. Вычисление внутренних граней (S_ij)
           7. Вычисление граничных дуальных граней (BoundaryFace)
           8. Проверка геометрической консервативности
+
+        Args:
+            verbose: показывать tqdm-прогресс-бар (по умолчанию True).
         """
-        self._prepare_vertices()
-        self._initial_delaunay()
-        self._insert_all_constrained_edges()
-        self._remove_holes()
-        self._compute_cv_volumes()
-        self._compute_internal_faces()
-        self._compute_boundary_faces()
-        self._verify_conservativity()
+        try:
+            from tqdm import tqdm as _tqdm
+            _have_tqdm = True
+        except ImportError:
+            _have_tqdm = False
+
+        steps = [
+            ("prepare_vertices",             self._prepare_vertices),
+            ("initial_delaunay",             self._initial_delaunay),
+            ("insert_constrained_edges",     self._insert_all_constrained_edges),
+            ("remove_holes",                 self._remove_holes),
+            ("compute_cv_volumes",           self._compute_cv_volumes),
+            ("compute_internal_faces",       self._compute_internal_faces),
+            ("compute_boundary_faces",       self._compute_boundary_faces),
+            ("verify_conservativity",        self._verify_conservativity),
+        ]
+
+        if verbose and _have_tqdm:
+            bar = _tqdm(steps, desc="Building mesh", unit="step",
+                        bar_format="{desc}: {n_fmt}/{total_fmt} "
+                                   "[{bar}] {percentage:3.0f}%  {elapsed}<{remaining}  {postfix}")
+            for name, fn in bar:
+                bar.set_postfix_str(name)
+                fn()
+            bar.set_postfix_str("done")
+        else:
+            for _, fn in steps:
+                fn()
+
         self._built = True
         logger.info(
             "Mesh2D (CDT): %d узлов, %d треугольников, %d внутр. граней, %d граничн. граней",
