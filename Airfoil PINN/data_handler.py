@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 import logging
 from typing import Dict, List, Optional, Tuple
+from scipy.spatial import cKDTree
 
 from type_hints import PointDtypeDict
 
@@ -444,10 +445,8 @@ class DataHandler:
         y_data = self.dataset.y.numpy().flatten().astype(np.float32)
         sdf_data = self.dataset.sdf.numpy().flatten().astype(np.float32)
 
-        # Матрица квадратов расстояний (N_mesh, N_data); для сеток < 50k узлов ОК
-        dx = x_norm_np[:, None] - x_data[None, :]
-        dy = y_norm_np[:, None] - y_data[None, :]
-        nn_idx = np.argmin(dx ** 2 + dy ** 2, axis=1)  # (N_mesh,)
+        tree = cKDTree(np.column_stack([x_data, y_data]))
+        _, nn_idx = tree.query(np.column_stack([x_norm_np, y_norm_np]), workers=-1)
         sdf_norm_np = sdf_data[nn_idx]
 
         # One-hot типов границ (по именам из датасета)
