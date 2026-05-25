@@ -50,7 +50,6 @@ Figure_*.png
 # Данные (сгенерированные файлы)
 Fluids/
 Conditions/
-Configs/
 Geometry/Data/
 Geometry/*.png
 Sampler/Data/
