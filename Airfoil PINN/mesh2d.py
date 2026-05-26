@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -249,7 +250,7 @@ def _insert_constrained_edge(
     edge_map: Dict[Tuple[int, int], Set[int]],
     vertex_to_tris: Dict[int, Set[int]],
     next_id: int,
-) -> int:
+) -> Tuple[int, List[int]]:
     """
     Вставляет ребро (s,t) в триангуляцию через локальный обход коридора.
 
@@ -260,12 +261,16 @@ def _insert_constrained_edge(
     4. Инкрементальное обновление tris/edge_map/vertex_to_tris: O(k).
 
     Изменяет tris, edge_map, vertex_to_tris in-place.
-    Возвращает обновлённый next_id.
+    Возвращает (next_id, collinear_verts).
+    collinear_verts непуст, если ребро (s,t) требует разбиения: вершины лежат
+    строго между s и t на прямой s→t. Caller должен заменить (s,t) на
+    (s,v0),(v0,v1),...,(vn,t) в порядке возрастания параметра вдоль s→t.
+    В этом случае триангуляция НЕ изменяется (caller переставляет подрёбра).
     """
     # Ребро уже в триангуляции?
     key_st = (min(s, t), max(s, t))
     if key_st in edge_map and edge_map[key_st]:
-        return next_id
+        return next_id, []
 
     ps, pt = coords[s], coords[t]
     d = pt - ps
@@ -285,7 +290,7 @@ def _insert_constrained_edge(
 
         # Прямой сосед — ребро (s,t) уже есть как сторона треугольника
         if t in (p, q):
-            return next_id
+            return next_id, []
 
         # Привести (s, p, q) к CCW
         if _cross2d(coords[s], coords[p], coords[q]) < 0:
@@ -309,7 +314,7 @@ def _insert_constrained_edge(
             if len(others) != 2:
                 continue
             p, q = others[0], others[1]
-            if _segs_cross_strict(ps, pt, coords[p], coords[q]):
+            if _cross2d(ps, pt, coords[p]) * _cross2d(ps, pt, coords[q]) < 0:
                 start_tid = tid
                 break
 
@@ -325,7 +330,7 @@ def _insert_constrained_edge(
             if s in (_a, _b, _c) or t in (_a, _b, _c):
                 continue
             for _u, _v in ((_a, _b), (_b, _c), (_c, _a)):
-                if _segs_cross_strict(ps, pt, coords[_u], coords[_v]):
+                if _cross2d(ps, pt, coords[_u]) * _cross2d(ps, pt, coords[_v]) < 0:
                     _fc.add(_tid)
                     break
         if _fc:
@@ -338,7 +343,7 @@ def _insert_constrained_edge(
                 "_insert_constrained_edge: ребро (%d,%d) в зазоре веера, "
                 "пересечений нет — пропуск.", s, t,
             )
-            return next_id
+            return next_id, []
 
     crossed_ids: Set[int]
     if _direct_crossed is not None:
@@ -362,11 +367,11 @@ def _insert_constrained_edge(
                 break
 
         if first_exit_edge is None:
-            return next_id  # t внутри start_tid или ребро (s,t) уже корректно
+            return next_id, []  # t внутри start_tid или ребро (s,t) уже корректно
 
         first_nbrs = edge_map.get(first_exit_edge, set()) - {start_tid}
         if not first_nbrs:
-            return next_id  # exit-ребро граничное, соседнего треугольника нет
+            return next_id, []  # exit-ребро граничное, соседнего треугольника нет
 
         # ── Фаза 2: Обход коридора ───────────────────────────────────────────
         # Шагаем по смежным треугольникам вдоль сегмента (s,t).
@@ -408,11 +413,14 @@ def _insert_constrained_edge(
             current_tid = next(iter(neighbors))
 
         if not crossed_ids:
-            return next_id   # коридор пуст — ребро уже присутствует
+            return next_id, []   # коридор пуст — ребро уже присутствует
 
     # ── Фаза 3: Сбор вершин полостей ────────────────────────────────────────
-    upper: List[int] = []   # слева от s→t
-    lower: List[int] = []   # справа от s→t
+    upper: List[int] = []     # слева от s→t
+    lower: List[int] = []     # справа от s→t
+    collinear: List[int] = [] # строго между s и t на прямой s→t
+    param_t2 = float(np.dot(d, d))  # |st|²
+
     for tid in crossed_ids:
         for v in tris[tid]:
             if v == s or v == t:
@@ -422,11 +430,32 @@ def _insert_constrained_edge(
                 upper.append(v)
             elif side < 0 and v not in lower:
                 lower.append(v)
-            elif side == 0:
-                logger.warning(
-                    "_insert_constrained_edge: вершина %d коллинеарна с ребром (%d,%d)",
-                    v, s, t,
-                )
+            elif side == 0 and v not in collinear:
+                # Проверяем, лежит ли v строго между s и t
+                param_v = float(np.dot(coords[v] - ps, d))
+                if param_t2 > 0 and 1e-10 * param_t2 < param_v < param_t2 * (1.0 - 1e-10):
+                    # v на отрезке (s,t) — требуется разбиение ребра.
+                    # Возвращаем v в caller без изменения триангуляции.
+                    collinear.append(v)
+                    logger.warning(
+                        "_insert_constrained_edge: вершина %d коллинеарна с (%d,%d)"
+                        " → разбиение ребра", v, s, t,
+                    )
+                else:
+                    # v на продолжении прямой, но вне отрезка — jitter как fallback
+                    d_len = float(np.linalg.norm(d))
+                    if d_len > 0:
+                        perp = np.array([-d[1], d[0]], dtype=np.float64) * (1e-9 / d_len)
+                        coords[v] = coords[v] + perp
+                        side = _cross2d(ps, pt, coords[v])
+                    if side > 0 and v not in upper:
+                        upper.append(v)
+                    elif side < 0 and v not in lower:
+                        lower.append(v)
+
+    if collinear:
+        # Триангуляция НЕ изменялась — возвращаем коллинеарные вершины caller-у.
+        return next_id, collinear
 
     def _param(v: int) -> float:
         return float(np.dot(coords[v] - ps, pt - ps))
@@ -451,7 +480,7 @@ def _insert_constrained_edge(
 
     # 4б — триангуляция полостей (алгоритм Sloan 1993, без изменений)
     upper_poly = [s] + upper + [t]
-    lower_poly = [s] + lower[::-1] + [t]
+    lower_poly = [s] + lower + [t]
     new_triangles = (
         _triangulate_polygon_delaunay(upper_poly, coords)
         + _triangulate_polygon_delaunay(lower_poly, coords)
@@ -469,7 +498,7 @@ def _insert_constrained_edge(
         for w in (a, b, c):
             vertex_to_tris.setdefault(w, set()).add(tid)
 
-    return next_id
+    return next_id, []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1039,6 +1068,151 @@ class Mesh2D:
         else:
             plt.close()
 
+    def plot_cv_volume_map(
+        self,
+        save_path: Optional[str] = None,
+        dpi: int = 150,
+        show: bool = True,
+        log_scale: bool = True,
+    ) -> None:
+        """Карта объёмов контрольных объёмов (CV) по узлам сетки.
+
+        Каждый узел окрашен своим значением CV-объёма. Цветовая шкала
+        логарифмическая (при log_scale=True), что делает видимыми как
+        мелкие (граничные) CV, так и крупные (интерьерные).
+        Узел с минимальным объёмом помечается красным крестом.
+
+        Args:
+            save_path: путь для сохранения PNG (None — не сохранять).
+            dpi:       разрешение при сохранении.
+            show:      вызывать plt.show() (False — только файл).
+            log_scale: логарифмическая цветовая шкала (рекомендуется).
+        """
+        self._assert_built()
+        import matplotlib.pyplot as plt
+        import matplotlib.tri as mtri
+        from matplotlib.colors import LogNorm, Normalize
+
+        vols = self._cv_volumes          # (N,) numpy float64
+        coords = self._coords            # (N, 2)
+        tris = np.array(self._triangles) # (T, 3)
+
+        min_vol = float(vols.min())
+        min_idx = int(vols.argmin())
+        max_vol = float(vols.max())
+
+        fig, ax = plt.subplots(figsize=(14, 8))
+
+        triang = mtri.Triangulation(coords[:, 0], coords[:, 1], tris)
+
+        if log_scale and min_vol > 0:
+            norm = LogNorm(vmin=max(min_vol, max_vol * 1e-8), vmax=max_vol)
+        else:
+            norm = Normalize(vmin=min_vol, vmax=max_vol)
+
+        tcf = ax.tricontourf(triang, vols, levels=64, cmap="plasma", norm=norm)
+        fig.colorbar(tcf, ax=ax, label="Объём CV [м²]",
+                     format="%.2e" if not log_scale else None)
+
+        # Граничные узлы поверх контуров
+        bnd_mask = np.array([nd.node_type == "boundary" for nd in self._nodes])
+        if bnd_mask.any():
+            ax.scatter(coords[bnd_mask, 0], coords[bnd_mask, 1],
+                       c="white", s=6, zorder=4, linewidths=0)
+
+        # Узел с минимальным объёмом
+        ax.scatter(coords[min_idx, 0], coords[min_idx, 1],
+                   c="red", s=80, marker="x", linewidths=1.5,
+                   zorder=6, label=f"min CV={min_vol:.2e} (узел {min_idx})")
+
+        ax.set_aspect("equal")
+        ax.set_xlabel("X, м")
+        ax.set_ylabel("Y, м")
+        scale_str = " (лог. шкала)" if log_scale else ""
+        ax.set_title(
+            f"Карта объёмов CV{scale_str}:  min={min_vol:.2e}  max={max_vol:.2e}  "
+            f"узлов={len(self._nodes)}"
+        )
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            logger.info("Карта CV сохранена: %s", save_path)
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+    def plot_cv_volume_hist(
+        self,
+        bins: int = 100,
+        save_path: Optional[str] = None,
+        dpi: int = 150,
+        show: bool = True,
+    ) -> None:
+        """Гистограмма распределения объёмов CV по 100 бинам.
+
+        Ось X — объём в логарифмической шкале (бины равномерны в log-пространстве),
+        ось Y — количество узлов (лог. шкала). Вертикальные линии отмечают
+        минимум, медиану и максимум.
+
+        Args:
+            bins:      количество бинов (по умолчанию 100).
+            save_path: путь для сохранения PNG (None — не сохранять).
+            dpi:       разрешение при сохранении.
+            show:      вызывать plt.show() (False — только файл).
+        """
+        self._assert_built()
+        import matplotlib.pyplot as plt
+
+        vols = self._cv_volumes   # numpy (N,)
+        min_vol = float(vols.min())
+        max_vol = float(vols.max())
+        med_vol = float(np.median(vols))
+        mean_vol = float(vols.mean())
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+
+        # Логарифмические бины: корректно распределяют плотность по диапазону
+        if min_vol > 0:
+            log_bins = np.logspace(np.log10(max(min_vol, max_vol * 1e-10)),
+                                   np.log10(max_vol), bins + 1)
+            ax.set_xscale("log")
+        else:
+            log_bins = bins
+
+        ax.hist(vols, bins=log_bins, color="steelblue", edgecolor="none", alpha=0.85)
+        ax.set_yscale("log")
+
+        # Вертикальные маркеры
+        ax.axvline(min_vol,  color="red",    lw=1.2, ls="--",
+                   label=f"min  = {min_vol:.2e}")
+        ax.axvline(med_vol,  color="orange", lw=1.2, ls="-.",
+                   label=f"медиана = {med_vol:.2e}")
+        ax.axvline(mean_vol, color="green",  lw=1.2, ls=":",
+                   label=f"среднее = {mean_vol:.2e}")
+        ax.axvline(max_vol,  color="purple", lw=1.2, ls="--",
+                   label=f"max  = {max_vol:.2e}")
+
+        ax.set_xlabel("Объём CV [м²]")
+        ax.set_ylabel("Количество узлов")
+        ax.set_title(
+            f"Распределение объёмов CV  ({len(vols)} узлов,  {bins} бинов)"
+        )
+        ax.legend(fontsize=8)
+        ax.grid(True, which="both", alpha=0.3)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            logger.info("Гистограмма CV сохранена: %s", save_path)
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
     # ── Внутренние шаги построения ────────────────────────────────────────────
 
     def _prepare_vertices(self) -> None:
@@ -1198,21 +1372,140 @@ class Mesh2D:
                 edges.append((a, b))
         return edges
 
+    def _find_boundary_components(self, verts: List[int]) -> List[List[int]]:
+        """
+        Разбивает список вершин на связные компоненты по близости.
+
+        Две вершины принадлежат одной компоненте, если расстояние между ними
+        не превышает 3× медианного шага между соседними вершинами.
+        Компоненты возвращаются в порядке убывания числа вершин.
+        """
+        if not verts:
+            return []
+        if len(verts) == 1:
+            return [verts]
+
+        c = self._coords[verts]
+        tree = cKDTree(c)
+
+        k = min(3, len(verts))
+        dists, _ = tree.query(c, k=k)
+        if dists.ndim > 1 and dists.shape[1] > 1:
+            typical = float(np.median(dists[:, 1:][dists[:, 1:] > 0]))
+        else:
+            typical = float(np.median(dists[dists > 0])) if np.any(dists > 0) else 1e-3
+        gap = max(typical * 3.0, 1e-9)
+
+        # Union-Find
+        parent = list(range(len(verts)))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i, j in tree.query_pairs(gap):
+            ri, rj = _find(i), _find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        groups: Dict[int, List[int]] = {}
+        for i, vi in enumerate(verts):
+            root = _find(i)
+            groups.setdefault(root, []).append(vi)
+
+        comps = sorted(groups.values(), key=len, reverse=True)
+        if len(comps) > 1:
+            logger.info("CDT: %d вершин домена разбиты на %d компонент(ы) границы",
+                        len(verts), len(comps))
+        return comps
+
     def _build_constrained_edge_set(self) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
         """
         Возвращает (domain_edges, foil_edges) — полные упорядоченные цепочки
         граничных рёбер по ВСЕМ граничным точкам коллокации.
+
+        Домен разбивается на связные компоненты; для каждой строится отдельная
+        цепочка (замкнутая или открытая в зависимости от геометрии).
         """
         # ─ Профиль ─
         foil_verts = [nd.index for nd in self._nodes if nd.on_airfoil]
         foil_chain = self._order_boundary_chain(foil_verts, self._airfoil_coords)
-        foil_edges = self._chain_to_edges(foil_chain) if len(foil_chain) >= 3 else []
+        if len(foil_chain) >= 2:
+            _c0, _c1 = self._coords[foil_chain[0]], self._coords[foil_chain[-1]]
+            if len(foil_verts) >= 2:
+                _fp = self._coords[foil_verts]
+                _ft = cKDTree(_fp)
+                _fd, _ = _ft.query(_fp, k=min(2, len(foil_verts)))
+                _foil_step = float(np.median(_fd[:, -1])) if _fd.ndim > 1 else float(np.median(_fd))
+            else:
+                _foil_step = 1e-3
+            foil_is_closed = float(np.linalg.norm(_c1 - _c0)) < _foil_step * 2.5
+            if foil_is_closed and len(foil_chain) >= 3:
+                foil_edges = self._chain_to_edges(foil_chain)
+            else:
+                foil_edges = [(foil_chain[i], foil_chain[i + 1])
+                              for i in range(len(foil_chain) - 1)
+                              if foil_chain[i] != foil_chain[i + 1]]
+            if not foil_is_closed:
+                logger.info("CDT: профиль незамкнут — цепочка не закрывается (%d рёбер)", len(foil_edges))
+        else:
+            foil_edges = []
 
-        # ─ Домен ─
+        # ─ Домен: одна или несколько связных компонент ─
         dom_verts = [nd.index for nd in self._nodes
                      if nd.node_type == "boundary" and not nd.on_airfoil]
-        dom_chain = self._order_boundary_chain(dom_verts, self._domain_coords)
-        dom_edges = self._chain_to_edges(dom_chain) if len(dom_chain) >= 3 else []
+
+        # Исключить узлы домена, геометрически дублирующие границу профиля.
+        # Это происходит, когда domain_coords включает сегменты профиля как часть
+        # внешнего контура (например, пластина-вырез): внешний контур порождает
+        # ~N точек с bt="interior" поверх N точек профиля → пересекающиеся CDT-рёбра.
+        # Критерий: bt=="interior" И расстояние до ближайшего foil-узла < 1.5·h_foil.
+        if foil_verts and dom_verts:
+            _fp = self._coords[foil_verts]
+            _ft = cKDTree(_fp)
+            _fd2, _ = _ft.query(_fp, k=min(2, len(foil_verts)))
+            _h_foil = (float(np.median(_fd2[:, -1])) if _fd2.ndim > 1 else float(np.median(_fd2)))
+            _h_foil = max(_h_foil, 1e-9)
+            _prox = _h_foil * 1.5
+            _dp = self._coords[dom_verts]
+            _dd, _ = _ft.query(_dp)
+            _prev_n = len(dom_verts)
+            dom_verts = [
+                vi for vi, d in zip(dom_verts, _dd)
+                if not (d < _prox and self._nodes[vi].boundary_type == "interior")
+            ]
+            n_excl = _prev_n - len(dom_verts)
+            if n_excl:
+                logger.info(
+                    "CDT: %d вершин домена исключены (bt=interior, близко к профилю)", n_excl
+                )
+
+        dom_edges: List[Tuple[int, int]] = []
+
+        if dom_verts:
+            components = self._find_boundary_components(dom_verts)
+            # Наибольшая компонента — внешний контур, использует domain_coords как референс.
+            # Малые компоненты упорядочиваются по углу от своего центроида.
+            for idx, comp in enumerate(components):
+                ref = self._domain_coords if idx == 0 else None
+                chain = self._order_boundary_chain(comp, ref)
+                if len(chain) < 2:
+                    continue
+                # Определяем, замкнута ли компонента: расстояние между первой и
+                # последней вершиной не больше типичного шага между соседями.
+                c0, c1 = self._coords[chain[0]], self._coords[chain[-1]]
+                comp_pts = self._coords[comp]
+                tree_c = cKDTree(comp_pts)
+                _d, _ = tree_c.query(comp_pts, k=min(2, len(comp)))
+                typical_step = float(np.median(_d[:, -1])) if _d.ndim > 1 else float(np.median(_d))
+                is_closed = float(np.linalg.norm(c1 - c0)) < typical_step * 2.5
+                edges = self._chain_to_edges(chain) if is_closed and len(chain) >= 3 else [
+                    (chain[i], chain[i + 1]) for i in range(len(chain) - 1)
+                    if chain[i] != chain[i + 1]
+                ]
+                dom_edges.extend(edges)
 
         return dom_edges, foil_edges
 
@@ -1269,20 +1562,73 @@ class Mesh2D:
         except ImportError:
             _have_tqdm = False
 
-        # ── Вставка рёбер: O(M·k) вместо O(M·T) ─────────────────────────────
-        _edge_iter = (
-            _tqdm(missing, desc="    вставка рёбер", unit="ребро",
-                  leave=False, total=len(missing))
-            if _verbose and _have_tqdm and missing else missing
+        # ── Вставка рёбер через deque с поддержкой разбиения ─────────────────
+        # Когда _insert_constrained_edge возвращает коллинеарные вершины,
+        # исходное ребро (s,t) заменяется подрёбрами (s,v0),(v0,v1),...,(vn,t).
+        # Подрёбра помещаются в начало очереди (они короче и вставляются первыми).
+        foil_keys_orig: Set[Tuple[int, int]] = {(min(s, t), max(s, t)) for s, t in foil_edges}
+        dom_keys_orig: Set[Tuple[int, int]] = {(min(s, t), max(s, t)) for s, t in dom_edges}
+        all_constrained_keys: Set[Tuple[int, int]] = foil_keys_orig | dom_keys_orig
+        foil_constrained_keys: Set[Tuple[int, int]] = set(foil_keys_orig)
+        dom_constrained_keys: Set[Tuple[int, int]] = set(dom_keys_orig)
+
+        queue: deque = deque(missing)
+        n_total = len(missing)
+        n_done = 0
+        n_splits = 0
+
+        _pbar = (
+            _tqdm(total=n_total, desc="    вставка рёбер", unit="ребро", leave=False)
+            if _verbose and _have_tqdm and missing else None
         )
-        for s, t in _edge_iter:
-            next_id = _insert_constrained_edge(
+
+        while queue:
+            s, t = queue.popleft()
+            next_id, collinear = _insert_constrained_edge(
                 s, t, tris, self._coords, edge_map, vertex_to_tris, next_id
             )
+            if collinear:
+                # Разбиваем (s,t) → (s,v0,...,vn,t) по порядку вдоль ребра
+                d_vec = self._coords[t] - self._coords[s]
+                collinear.sort(
+                    key=lambda v: float(np.dot(self._coords[v] - self._coords[s], d_vec))
+                )
+                orig_key = (min(s, t), max(s, t))
+                is_foil = orig_key in foil_constrained_keys
+                is_dom = orig_key in dom_constrained_keys
+                all_constrained_keys.discard(orig_key)
+                foil_constrained_keys.discard(orig_key)
+                dom_constrained_keys.discard(orig_key)
 
-        self._constrained_edges = {(min(s, t), max(s, t)) for s, t in required}
-        self._foil_constrained_edges = {(min(s, t), max(s, t)) for s, t in foil_edges}
-        self._dom_constrained_edges = {(min(s, t), max(s, t)) for s, t in dom_edges}
+                chain = [s] + collinear + [t]
+                sub_edges: List[Tuple[int, int]] = []
+                for i in range(len(chain) - 1):
+                    a_v, b_v = chain[i], chain[i + 1]
+                    sub_key = (min(a_v, b_v), max(a_v, b_v))
+                    all_constrained_keys.add(sub_key)
+                    if is_foil:
+                        foil_constrained_keys.add(sub_key)
+                    if is_dom:
+                        dom_constrained_keys.add(sub_key)
+                    if sub_key not in edge_map or not edge_map[sub_key]:
+                        sub_edges.append((a_v, b_v))
+                # Вставляем подрёбра в начало очереди (они короче)
+                for se in reversed(sub_edges):
+                    queue.appendleft(se)
+                n_splits += 1
+            else:
+                n_done += 1
+                if _pbar is not None:
+                    _pbar.update(1)
+
+        if _pbar is not None:
+            _pbar.close()
+        if n_splits:
+            logger.info("CDT: %d рёбер разбито на подрёбра (коллинеарные вершины)", n_splits)
+
+        self._constrained_edges = all_constrained_keys
+        self._foil_constrained_edges = foil_constrained_keys
+        self._dom_constrained_edges = dom_constrained_keys
 
         # ── Flip: передаём готовый edge_map (не перестраивается с нуля) ──────
         _flip_to_delaunay(tris, self._coords, self._constrained_edges,

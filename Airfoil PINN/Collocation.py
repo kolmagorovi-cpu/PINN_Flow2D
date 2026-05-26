@@ -1325,6 +1325,18 @@ class CollocationPoints:
             if x_min_foil > x_min_dom + 1e-12:
                 logger.info("\n📌 Нижняя граница (слева от профиля):")
                 bottom_points = self.sample_bottom_edge(x_min_dom, x_min_foil, y_min_dom, step_m)
+                # Исключить точки, уже покрытые внешним контуром (совпадение < step/2).
+                # Без этой фильтрации два набора точек на одной прямой y=y_min создают
+                # взаимно-коллинеарные CDT-рёбра → нарушение консервативности FVM.
+                if bottom_points and self.points_boundary:
+                    _exist_xy = np.array([[p.x, p.y] for p in self.points_boundary])
+                    _tree = cKDTree(_exist_xy)
+                    filtered = [bp for bp in bottom_points
+                                if _tree.query([bp.x, bp.y])[0] > step_m * 0.5]
+                    n_dup = len(bottom_points) - len(filtered)
+                    if n_dup:
+                        logger.info("   Исключено %d дублирующих точек (уже покрыты внешним контуром)", n_dup)
+                    bottom_points = filtered
                 self.points_boundary.extend(bottom_points)
 
         # 4. Внутренние точки
@@ -1759,11 +1771,36 @@ def S2DR() -> None:
                     print(f"   Внутренних граней: {s['num_internal_faces']}  |  Граничных граней: {s['num_boundary_faces']}")
                     print(f"   CV min/max/mean: {s['cv_volume_min']:.3e} / {s['cv_volume_max']:.3e} / {s['cv_volume_mean']:.3e} м²")
 
+                    # ── Диагностика объёмов CV ───────────────────────────────
+                    vols = mesh.cv_volumes
+                    min_vol = float(vols.min())
+                    min_vol_idx = int(vols.argmin())
+                    print(f"   Минимальный объём CV: {min_vol:.3e} (узел {min_vol_idx})")
+
                     print("\n📊 Построение графика сетки...")
                     mesh_plot_path = os.path.join(config.output_dir, "mesh2d.png")
                     mesh.plot(save_path=mesh_plot_path, dpi=config.plot_dpi,
                               show=config.plot_results)
                     print(f"✅ График сохранён: {mesh_plot_path}")
+
+                    print("\n📊 Построение карты объёмов CV...")
+                    cv_map_path = os.path.join(config.output_dir, "mesh2d_cv_map.png")
+                    mesh.plot_cv_volume_map(
+                        save_path=cv_map_path,
+                        dpi=config.plot_dpi,
+                        show=config.plot_results,
+                    )
+                    print(f"✅ Карта CV сохранена: {cv_map_path}")
+
+                    print("\n📊 Построение гистограммы распределения объёмов CV...")
+                    cv_hist_path = os.path.join(config.output_dir, "mesh2d_cv_hist.png")
+                    mesh.plot_cv_volume_hist(
+                        bins=100,
+                        save_path=cv_hist_path,
+                        dpi=config.plot_dpi,
+                        show=config.plot_results,
+                    )
+                    print(f"✅ Гистограмма CV сохранена: {cv_hist_path}")
                 except Exception as e:
                     print(f"\n❌ Ошибка построения сетки: {e}")
                     logger.error("Ошибка mesh2d.build()", exc_info=True)
