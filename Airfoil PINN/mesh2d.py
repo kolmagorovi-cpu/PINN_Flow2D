@@ -524,15 +524,6 @@ def _flip_to_delaunay(
     n_flips = 0
     max_iter = len(tris) * len(tris) + 10
 
-    try:
-        from tqdm import tqdm as _tqdm
-        _have_tqdm = True
-    except ImportError:
-        _have_tqdm = False
-
-    _pbar = (_tqdm(desc="    edge-flip", unit="flip", leave=False)
-             if verbose and _have_tqdm else None)
-
     _it = 0
     for _it in range(max_iter):
         flipped = False
@@ -576,17 +567,17 @@ def _flip_to_delaunay(
                         edge_map.setdefault(k2, set()).add(new_tid)
 
                 n_flips += 1
-                if _pbar is not None:
-                    _pbar.update(1)
-                    _pbar.set_postfix_str(f"iter {_it + 1}")
+                if verbose:
+                    print(f"\r    edge-flip: {n_flips} flip, iter {_it + 1}   ",
+                          end="", flush=True)
                 flipped = True
                 break  # перезапускаем обход edge_map с обновлёнными данными
 
         if not flipped:
             break
 
-    if _pbar is not None:
-        _pbar.close()
+    if verbose and n_flips > 0:
+        print(f"\r    edge-flip: {n_flips} flip за {_it + 1} итераций — готово        ")
     logger.info("CDT edge-flip: %d переворотов за %d итераций", n_flips, _it + 1)
 
 
