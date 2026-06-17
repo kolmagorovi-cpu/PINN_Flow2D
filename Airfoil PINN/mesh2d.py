@@ -37,7 +37,7 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -330,7 +330,7 @@ def _insert_constrained_edge(
             if s in (_a, _b, _c) or t in (_a, _b, _c):
                 continue
             for _u, _v in ((_a, _b), (_b, _c), (_c, _a)):
-                if _cross2d(ps, pt, coords[_u]) * _cross2d(ps, pt, coords[_v]) < 0:
+                if _segs_cross_strict(ps, pt, coords[_u], coords[_v]):
                     _fc.add(_tid)
                     break
         if _fc:
@@ -1204,6 +1204,62 @@ class Mesh2D:
         else:
             plt.close()
 
+    @staticmethod
+    def _boundary_rank(boundary_type: str) -> int:
+        """Priority used when coincident points carry different labels."""
+        ranks = {
+            "interior": 0,
+            "_domain": 1,
+            "outlet": 2,
+            "inlet": 2,
+            "symmetry": 2,
+            "axis_symmetry": 2,
+            "wall": 3,
+        }
+        return ranks.get(str(boundary_type).lower(), 1)
+
+    @classmethod
+    def _prefer_boundary_type(cls, current: str, candidate: str) -> str:
+        if cls._boundary_rank(candidate) > cls._boundary_rank(current):
+            return candidate
+        return current
+
+    @classmethod
+    def _merge_node_metadata(
+        cls,
+        node: MeshNode,
+        node_type: str,
+        boundary_type: str,
+        on_airfoil: bool,
+    ) -> None:
+        if node_type == "boundary":
+            node.node_type = "boundary"
+        node.boundary_type = cls._prefer_boundary_type(node.boundary_type, boundary_type)
+        node.on_airfoil = bool(node.on_airfoil or on_airfoil)
+        if node.on_airfoil:
+            node.node_type = "boundary"
+            node.boundary_type = cls._prefer_boundary_type(node.boundary_type, "wall")
+
+    @staticmethod
+    def _clean_reference_chain(
+        ref_coords: np.ndarray,
+        eps: float = 1e-9,
+    ) -> Tuple[np.ndarray, bool]:
+        """Remove repeated closure/consecutive duplicates and report closedness."""
+        ref = np.asarray(ref_coords, dtype=np.float64).reshape(-1, 2)
+        if len(ref) == 0:
+            return ref, False
+
+        closed = bool(len(ref) > 2 and np.linalg.norm(ref[0] - ref[-1]) <= eps)
+        cleaned = [ref[0]]
+        for xy in ref[1:]:
+            if np.linalg.norm(xy - cleaned[-1]) > eps:
+                cleaned.append(xy)
+        if len(cleaned) > 1 and np.linalg.norm(cleaned[0] - cleaned[-1]) <= eps:
+            cleaned.pop()
+            closed = True
+        return np.asarray(cleaned, dtype=np.float64), closed
+
     # ── Внутренние шаги построения ────────────────────────────────────────────
 
     def _prepare_vertices(self) -> None:
@@ -1214,23 +1270,159 @@ class Mesh2D:
         """
         EPS = 1e-9
 
-        # ─ Начальный пул: коллокационные точки ─
-        coords: List[List[float]] = []
         nodes: List[MeshNode] = []
-        for idx, p in enumerate(self._raw_points):
+        coords_list: List[np.ndarray] = []
+        spatial_hash: Dict[Tuple[int, int], List[int]] = {}
+
+        def _bucket(xy: np.ndarray) -> Tuple[int, int]:
+            return (int(np.floor(float(xy[0]) / EPS)),
+                    int(np.floor(float(xy[1]) / EPS)))
+
+        def _find_existing(xy: np.ndarray) -> Optional[int]:
+            bx, by = _bucket(xy)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for idx_existing in spatial_hash.get((bx + dx, by + dy), []):
+                        if np.linalg.norm(coords_list[idx_existing] - xy) < EPS:
+                            return idx_existing
+            return None
+
+        def _register(idx_new: int, xy: np.ndarray) -> None:
+            spatial_hash.setdefault(_bucket(xy), []).append(idx_new)
+
+        def _add_point(
+            xy: np.ndarray,
+            nt: str,
+            bt: str,
+            on_airfoil: bool,
+            point_id: int = -1,
+        ) -> int:
+            xy = np.asarray(xy, dtype=np.float64)
+            nearest = _find_existing(xy)
+            if nearest is not None:
+                self._merge_node_metadata(nodes[nearest], nt, bt, on_airfoil)
+                return nearest
+
+            idx_new = len(nodes)
+            coords_list.append(xy.copy())
+            nodes.append(MeshNode(
+                index=idx_new, point_id=int(point_id),
+                x=float(xy[0]), y=float(xy[1]),
+                node_type=nt, boundary_type=bt,
+                on_airfoil=bool(on_airfoil),
+            ))
+            if on_airfoil:
+                self._merge_node_metadata(nodes[idx_new], "boundary", "wall", True)
+            _register(idx_new, xy)
+            return idx_new
+
+        boundary_refs: List[np.ndarray] = []
+        if self._domain_coords is not None and len(self._domain_coords) >= 2:
+            boundary_refs.append(np.asarray(self._domain_coords, dtype=np.float64))
+        if self._airfoil_coords is not None and len(self._airfoil_coords) >= 2:
+            boundary_refs.append(np.asarray(self._airfoil_coords, dtype=np.float64))
+
+        raw_boundary = np.array(
+            [[float(p.x), float(p.y)] for p in self._raw_points if p.on_boundary],
+            dtype=np.float64,
+        )
+        if len(raw_boundary) >= 2:
+            raw_boundary = np.unique(np.round(raw_boundary, decimals=12), axis=0)
+        if len(raw_boundary) >= 2:
+            _btree = cKDTree(raw_boundary)
+            _bdist, _ = _btree.query(raw_boundary, k=2)
+            boundary_step = float(np.median(_bdist[:, 1]))
+        else:
+            boundary_step = 1.0
+        near_boundary_tol = max(EPS * 10.0, boundary_step * 0.02)
+
+        def _point_to_ref_distance(xy: np.ndarray) -> float:
+            best = float("inf")
+            for ref in boundary_refs:
+                for i_ref in range(len(ref) - 1):
+                    a_ref = ref[i_ref]
+                    b_ref = ref[i_ref + 1]
+                    seg_ref = b_ref - a_ref
+                    denom_ref = float(np.dot(seg_ref, seg_ref))
+                    if denom_ref <= 1e-30:
+                        dist_ref = float(np.linalg.norm(xy - a_ref))
+                    else:
+                        t_ref = float(np.dot(xy - a_ref, seg_ref) / denom_ref)
+                        t_ref = max(0.0, min(1.0, t_ref))
+                        dist_ref = float(np.linalg.norm(xy - (a_ref + t_ref * seg_ref)))
+                    if dist_ref < best:
+                        best = dist_ref
+            return best
+
+        n_merged = 0
+        n_skipped_near_boundary = 0
+        for p in self._raw_points:
             bt = p.boundary_type.value if hasattr(p.boundary_type, "value") else str(p.boundary_type)
             nt = "boundary" if p.on_boundary else "interior"
-            coords.append([float(p.x), float(p.y)])
-            nodes.append(MeshNode(
-                index=idx, point_id=int(p.id),
-                x=float(p.x), y=float(p.y),
-                node_type=nt, boundary_type=bt,
-                on_airfoil=bool(p.on_airfoil),
-            ))
+            xy = np.array([float(p.x), float(p.y)], dtype=np.float64)
+            if (
+                nt == "interior"
+                and boundary_refs
+                and _point_to_ref_distance(xy) <= near_boundary_tol
+            ):
+                n_skipped_near_boundary += 1
+                continue
+            before = len(nodes)
+            _add_point(
+                xy,
+                nt,
+                bt,
+                bool(p.on_airfoil),
+                int(p.id),
+            )
+            if len(nodes) == before:
+                n_merged += 1
 
-        coords_arr = (np.array(coords, dtype=np.float64).reshape(-1, 2)
-                      if coords else np.empty((0, 2), dtype=np.float64))
+        if n_merged:
+            logger.info("Mesh2D: merged %d duplicate input points before Delaunay", n_merged)
+        if n_skipped_near_boundary:
+            logger.info(
+                "Mesh2D: skipped %d interior points closer than %.3e m to a boundary",
+                n_skipped_near_boundary, near_boundary_tol,
+            )
 
+        self._domain_idx = []
+        self._foil_idx = []
+
+        if self._domain_coords is not None:
+            for xy in self._domain_coords:
+                idx = _add_point(xy, "boundary", "_domain", False)
+                self._domain_idx.append(idx)
+
+        if self._airfoil_coords is not None:
+            for xy in self._airfoil_coords:
+                idx = _add_point(xy, "boundary", "wall", True)
+                self._foil_idx.append(idx)
+
+        self._coords = (np.vstack(coords_list).astype(np.float64)
+                        if coords_list else np.empty((0, 2), dtype=np.float64))
+        self._nodes = nodes
+
+        if self._domain_coords is not None:
+            bnd_pts = np.array([[p.x, p.y] for p in self._raw_points if p.on_boundary and not p.on_airfoil])
+            bnd_bt = [p.boundary_type.value if hasattr(p.boundary_type, "value") else str(p.boundary_type)
+                      for p in self._raw_points if p.on_boundary and not p.on_airfoil]
+            if len(bnd_pts) > 0:
+                tree = cKDTree(bnd_pts)
+                for vi in self._domain_idx:
+                    nd = self._nodes[vi]
+                    if nd.boundary_type == "_domain":
+                        _, nn = tree.query(self._coords[vi])
+                        nd.boundary_type = bnd_bt[nn]
+            for vi in self._domain_idx:
+                if self._nodes[vi].boundary_type == "_domain":
+                    self._nodes[vi].boundary_type = "interior"
+
+        return
+
+        coords_arr = np.empty((0, 2), dtype=np.float64)
+
+        # ─ Начальный пул: коллокационные точки ─
         def _add_geom_point(xy: np.ndarray, nt: str, bt: str, on_airfoil: bool) -> int:
             """Добавляет вершину если её ещё нет, возвращает индекс."""
             nonlocal coords_arr, nodes
@@ -1303,6 +1495,9 @@ class Mesh2D:
         c = self._coords
 
         if ref_coords is not None and len(ref_coords) >= 2:
+            ref_chain, ref_closed = self._clean_reference_chain(ref_coords)
+            if len(ref_chain) < 2:
+                return vertex_indices
             # Оцениваем типичный шаг между граничными точками коллокации
             # для задания перпендикулярного допуска
             if len(vertex_indices) >= 2:
@@ -1321,9 +1516,10 @@ class Mesh2D:
             # Ключевой критерий: ПЕРПЕНДИКУЛЯРНОЕ расстояние до прямой < perp_tol.
             ordered: List[Tuple[float, int]] = []
             cumlen = 0.0
-            for k in range(len(ref_coords)):
-                A = ref_coords[k]
-                B = ref_coords[(k + 1) % len(ref_coords)]
+            seg_count = len(ref_chain) if ref_closed else len(ref_chain) - 1
+            for k in range(seg_count):
+                A = ref_chain[k]
+                B = ref_chain[(k + 1) % len(ref_chain)]
                 seg = B - A
                 seg_len = float(np.linalg.norm(seg))
                 if seg_len < 1e-12:
@@ -1432,7 +1628,10 @@ class Mesh2D:
                 _foil_step = float(np.median(_fd[:, -1])) if _fd.ndim > 1 else float(np.median(_fd))
             else:
                 _foil_step = 1e-3
-            foil_is_closed = float(np.linalg.norm(_c1 - _c0)) < _foil_step * 2.5
+            if self._airfoil_coords is not None:
+                _, foil_is_closed = self._clean_reference_chain(self._airfoil_coords)
+            else:
+                foil_is_closed = float(np.linalg.norm(_c1 - _c0)) < _foil_step * 2.5
             if foil_is_closed and len(foil_chain) >= 3:
                 foil_edges = self._chain_to_edges(foil_chain)
             else:
@@ -1445,6 +1644,26 @@ class Mesh2D:
             foil_edges = []
 
         # ─ Домен: одна или несколько связных компонент ─
+        if self._domain_coords is not None and len(self._domain_coords) >= 2:
+            dom_verts_ref = [nd.index for nd in self._nodes if nd.node_type == "boundary"]
+            dom_chain = self._order_boundary_chain(dom_verts_ref, self._domain_coords)
+            _, dom_is_closed = self._clean_reference_chain(self._domain_coords)
+
+            if dom_is_closed and len(dom_chain) >= 3:
+                dom_edges = self._chain_to_edges(dom_chain)
+            else:
+                dom_edges = [
+                    (dom_chain[i], dom_chain[i + 1])
+                    for i in range(len(dom_chain) - 1)
+                    if dom_chain[i] != dom_chain[i + 1]
+                ]
+
+            logger.info(
+                "CDT: domain reference chain -> %d vertices, %d edges",
+                len(dom_chain), len(dom_edges),
+            )
+            return dom_edges, foil_edges
+
         dom_verts = [nd.index for nd in self._nodes
                      if nd.node_type == "boundary" and not nd.on_airfoil]
 
@@ -1649,7 +1868,12 @@ class Mesh2D:
 
         # ── 1. Flood-fill: профиль ───────────────────────────────────────────
         foil_ce: Set[Tuple[int, int]] = getattr(self, "_foil_constrained_edges", set())
-        if self._airfoil_coords is not None and len(self._airfoil_coords) >= 3 and foil_ce:
+        foil_is_closed = (
+            self._airfoil_coords is not None
+            and len(self._airfoil_coords) >= 3
+            and self._clean_reference_chain(self._airfoil_coords)[1]
+        )
+        if foil_is_closed and foil_ce:
             try:
                 from shapely.geometry import Polygon as _SPolyFF
                 foil_seed = np.array(
@@ -1682,7 +1906,7 @@ class Mesh2D:
             except ImportError:
                 _have_tqdm = False
 
-            if self._airfoil_coords is not None and len(self._airfoil_coords) >= 3:
+            if foil_is_closed:
                 foil_poly = _SPoly(self._airfoil_coords)
                 if not foil_poly.is_valid:
                     foil_poly = foil_poly.buffer(0)
@@ -1830,6 +2054,7 @@ class Mesh2D:
                 edge_map.setdefault(key, []).append((t_idx, (a, b, c)))
 
         node_bt = [nd.boundary_type for nd in self._nodes]
+        foil_edges: Set[Tuple[int, int]] = getattr(self, "_foil_constrained_edges", set())
 
         bfaces: List[BoundaryFace] = []
         for (vi, vj), adj in edge_map.items():
@@ -1847,21 +2072,95 @@ class Mesh2D:
                 S_raw = -S_raw
 
             area_vec = 0.5 * S_raw
+            edge_key = (min(vi, vj), max(vi, vj))
+            bt_i = "wall" if edge_key in foil_edges else node_bt[vi]
+            bt_j = "wall" if edge_key in foil_edges else node_bt[vj]
 
             bfaces.append(BoundaryFace(
                 node=vi, neighbor_node=vj,
-                boundary_type=node_bt[vi],
+                boundary_type=bt_i,
                 area_vector=area_vec.copy(),
             ))
             bfaces.append(BoundaryFace(
                 node=vj, neighbor_node=vi,
-                boundary_type=node_bt[vj],
+                boundary_type=bt_j,
                 area_vector=area_vec.copy(),
             ))
 
         self._boundary_faces = bfaces
         logger.info("BoundaryFaces: %d (по %d граничным рёбрам)",
                     len(bfaces), len(bfaces) // 2)
+
+    def _validate_topology(self) -> None:
+        """Fail fast on mesh states that make FVM volumes/faces invalid."""
+        coords = self._coords
+        triangles = self._triangles
+        cv = self._cv_volumes
+        errors: List[str] = []
+
+        if coords is None or triangles is None or cv is None:
+            raise RuntimeError("Mesh topology validation called before mesh arrays are ready")
+
+        if len(coords) == 0:
+            errors.append("no nodes")
+        if len(triangles) == 0:
+            errors.append("no triangles")
+
+        rounded = np.round(coords, decimals=12)
+        _, counts = np.unique(rounded, axis=0, return_counts=True)
+        duplicate_groups = int(np.sum(counts > 1))
+        if duplicate_groups:
+            errors.append(f"{duplicate_groups} duplicate coordinate groups")
+
+        repeated = int(sum(len(set(map(int, tri))) < 3 for tri in triangles))
+        if repeated:
+            errors.append(f"{repeated} triangles with repeated vertices")
+
+        if len(triangles):
+            a, b, k = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+            areas = 0.5 * np.abs(
+                (coords[b, 0] - coords[a, 0]) * (coords[k, 1] - coords[a, 1])
+                - (coords[k, 0] - coords[a, 0]) * (coords[b, 1] - coords[a, 1])
+            )
+            bbox = coords.max(axis=0) - coords.min(axis=0)
+            area_tol = max(1e-20, float(np.prod(bbox)) * 1e-18)
+            degenerate = int(np.sum(areas <= area_tol))
+            if degenerate:
+                errors.append(f"{degenerate} degenerate triangles (area <= {area_tol:.3e})")
+
+        edge_counts: Counter = Counter()
+        used_nodes: Set[int] = set()
+        for a_i, b_i, c_i in triangles:
+            ia, ib, ic = int(a_i), int(b_i), int(c_i)
+            used_nodes.update((ia, ib, ic))
+            for u, v in ((ia, ib), (ib, ic), (ic, ia)):
+                if u > v:
+                    u, v = v, u
+                edge_counts[(u, v)] += 1
+
+        nonmanifold = sum(1 for n_adj in edge_counts.values() if n_adj > 2)
+        if nonmanifold:
+            errors.append(f"{nonmanifold} non-manifold edges with more than two adjacent triangles")
+
+        unused = len(coords) - len(used_nodes)
+        if unused:
+            errors.append(f"{unused} nodes are not referenced by any triangle")
+
+        zero_cv = int(np.sum(cv <= 0.0))
+        if zero_cv:
+            errors.append(f"{zero_cv} control volumes are zero or negative")
+
+        interior_bfaces = sum(
+            1 for face in self._boundary_faces
+            if str(face.boundary_type).lower() == "interior"
+        )
+        if interior_bfaces:
+            errors.append(f"{interior_bfaces} boundary faces have boundary_type='interior'")
+
+        if errors:
+            raise ValueError("Invalid Mesh2D topology: " + "; ".join(errors))
+
+        logger.info("Mesh2D topology OK")
 
     def _verify_conservativity(self, tol_factor: float = 1e-8) -> bool:
         """
@@ -1874,6 +2173,8 @@ class Mesh2D:
         Returns:
             True если все узлы прошли проверку, False при нарушении.
         """
+        self._validate_topology()
+
         n = len(self._nodes)
         flux_sum = np.zeros((n, 2), dtype=np.float64)
 

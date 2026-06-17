@@ -592,6 +592,44 @@ class CollocationPoints:
         else:
             return np.loadtxt(filepath, delimiter='\t')
 
+    @staticmethod
+    def _point_to_polyline_distance(point: np.ndarray, polyline: np.ndarray) -> float:
+        """Минимальное расстояние от точки до ломаной."""
+        if len(polyline) < 2:
+            return float("inf")
+
+        p = np.asarray(point, dtype=np.float64)
+        best = float("inf")
+        for i in range(len(polyline) - 1):
+            a = np.asarray(polyline[i], dtype=np.float64)
+            b = np.asarray(polyline[i + 1], dtype=np.float64)
+            ab = b - a
+            denom = float(np.dot(ab, ab))
+            if denom <= 1e-30:
+                dist = float(np.linalg.norm(p - a))
+            else:
+                t = float(np.dot(p - a, ab) / denom)
+                t = max(0.0, min(1.0, t))
+                dist = float(np.linalg.norm(p - (a + t * ab)))
+            if dist < best:
+                best = dist
+        return best
+
+    @classmethod
+    def _polyline_lies_on_polyline(
+        cls,
+        child: Optional[np.ndarray],
+        parent: Optional[np.ndarray],
+        tol: float,
+    ) -> bool:
+        """True, если все вершины child лежат на parent с заданным допуском."""
+        if child is None or parent is None or len(child) == 0 or len(parent) < 2:
+            return False
+        child_arr = np.asarray(child, dtype=np.float64)
+        parent_arr = np.asarray(parent, dtype=np.float64)
+        return all(cls._point_to_polyline_distance(pt, parent_arr) <= tol
+                   for pt in child_arr)
+
     # ------------------------------------------------------------------
     # Генерация точек на внешнем контуре (прямоугольник)
     # ------------------------------------------------------------------
@@ -599,7 +637,8 @@ class CollocationPoints:
         self,
         contour: np.ndarray,
         step: float,
-        bounds: Dict[str, float]
+        bounds: Dict[str, float],
+        foil: Optional[np.ndarray] = None,
     ) -> List[CollocationPoint]:
         """
         Точки на внешнем контуре области (равномерно).
@@ -612,33 +651,81 @@ class CollocationPoints:
         Returns:
             Список точек на внешней границе
         """
-        line = LineString(contour)
-        length = line.length
-        # Удаляем замыкающую точку для расчёта длины
-        if np.allclose(contour[0], contour[-1], atol=1e-6):
-            line = LineString(contour[:-1])
-            length = line.length
+        contour = np.asarray(contour, dtype=np.float64)
+        if len(contour) < 2:
+            return []
 
-        num_points = int(length / step) + 1
+        tol = max(step * CLASSIFICATION_TOLERANCE_FACTOR, 1e-9)
+        closed = bool(np.linalg.norm(contour[0] - contour[-1]) <= tol)
+
+        vertices = [contour[0]]
+        for xy in contour[1:]:
+            if np.linalg.norm(xy - vertices[-1]) > tol * 0.1:
+                vertices.append(xy)
+        if len(vertices) > 1 and np.linalg.norm(vertices[0] - vertices[-1]) <= tol:
+            vertices.pop()
+
+        if len(vertices) < 2:
+            return []
+
+        if closed:
+            segments = [(vertices[i], vertices[(i + 1) % len(vertices)])
+                        for i in range(len(vertices))]
+        else:
+            segments = [(vertices[i], vertices[i + 1])
+                        for i in range(len(vertices) - 1)]
+
+        foil_line = None
+        if foil is not None and len(foil) >= 2:
+            foil_line = np.asarray(foil, dtype=np.float64)
+
+        total_length = sum(float(np.linalg.norm(b - a)) for a, b in segments)
         points = []
+        seen: set = set()
 
-        for i in range(num_points):
-            distance = i * step
-            if distance <= length:
-                pt = line.interpolate(distance)
-                x, y = pt.x, pt.y
-                btype = self._classify_external_boundary(x, y, bounds, step)
-                points.append(CollocationPoint(
-                    id=self._get_next_id(),
-                    x=x, y=y,
-                    boundary_type=btype,
-                    on_airfoil=False,
-                    on_boundary=True
-                ))
+        def _coord_key(x: float, y: float) -> Tuple[int, int]:
+            return (int(round(x / tol)), int(round(y / tol)))
+
+        def _append_point(x: float, y: float) -> None:
+            key = _coord_key(x, y)
+            if key in seen:
+                return
+            seen.add(key)
+
+            xy = np.array([x, y], dtype=np.float64)
+            on_foil = (
+                foil_line is not None
+                and self._point_to_polyline_distance(xy, foil_line) <= tol
+            )
+            btype = BoundaryType.WALL if on_foil else self._classify_external_boundary(x, y, bounds, step)
+            points.append(CollocationPoint(
+                id=self._get_next_id(),
+                x=x, y=y,
+                boundary_type=btype,
+                on_airfoil=on_foil,
+                on_boundary=True
+            ))
+
+        for a, b in segments:
+            seg = b - a
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len <= 1e-14:
+                continue
+
+            n_full = int(np.floor(seg_len / step))
+            distances = [i * step for i in range(n_full + 1)]
+            if not distances or abs(distances[-1] - seg_len) > tol:
+                distances.append(seg_len)
+
+            for distance in distances:
+                t = min(1.0, max(0.0, distance / seg_len))
+                xy = a + t * seg
+                _append_point(float(xy[0]), float(xy[1]))
+
         type_counts = {}
         for p in points:
             type_counts[p.boundary_type] = type_counts.get(p.boundary_type, 0) + 1
-        logger.info(f"✅ Внешняя граница: {len(points)} точек")
+        logger.info(f"✅ Внешняя граница: {len(points)} точек, длина={total_length:.6f} м")
         for bt, cnt in type_counts.items():
             logger.info(f"   {bt.value}: {cnt}")
         return points
@@ -1300,7 +1387,12 @@ class CollocationPoints:
         if not poly_domain.is_valid:
             poly_domain = poly_domain.buffer(0)
         foil_area = 0.0
-        if foil is not None and len(foil) >= 3:
+        foil_is_closed = bool(
+            foil is not None
+            and len(foil) >= 3
+            and np.allclose(foil[0], foil[-1], atol=max(step_m * CLASSIFICATION_TOLERANCE_FACTOR, 1e-9))
+        )
+        if foil is not None and len(foil) >= 3 and foil_is_closed:
             poly_foil = Polygon(foil)
             if not poly_foil.is_valid:
                 poly_foil = poly_foil.buffer(0)
@@ -1309,15 +1401,26 @@ class CollocationPoints:
         effective_area = poly_domain.area - foil_area
         num_interior = int(effective_area / step_m ** 2 * self.config.interior_point_density)
 
+        foil_on_domain = self._polyline_lies_on_polyline(
+            foil, domain, max(step_m * CLASSIFICATION_TOLERANCE_FACTOR, 1e-9)
+        )
+
         # 1. Точки на внешнем контуре
         logger.info("\n📌 Внешний контур:")
-        self.points_boundary = self.sample_boundary_external(domain, step_m, bounds)
+        self.points_boundary = self.sample_boundary_external(
+            domain,
+            step_m,
+            bounds,
+            foil=foil if foil_on_domain else None,
+        )
 
         # 2. Точки на профиле (если есть)
-        if foil is not None:
+        if foil is not None and not foil_on_domain:
             logger.info("\n📌 Профиль (WALL):")
             foil_points = self.sample_boundary_foil(foil, step_m)
             self.points_boundary.extend(foil_points)
+        elif foil is not None:
+            logger.info("\n📌 Профиль уже входит в контур области — повторная генерация WALL-точек пропущена")
 
         # 3. Нижняя граница слева от профиля
         if foil is not None:
