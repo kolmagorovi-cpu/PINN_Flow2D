@@ -419,7 +419,7 @@ class Visualizer:
         u_phys = u_np * data_handler.U_inf
         v_phys = v_np * data_handler.U_inf
         p_dyn = 0.5 * data_handler.rho * data_handler.U_inf ** 2
-        p_phys = p_np * p_dyn
+        p_phys = p_np * p_dyn + data_handler.p_ref
         x_phys = x_np * data_handler.chord
         y_phys = y_np * data_handler.chord
 
@@ -477,23 +477,16 @@ class Visualizer:
                                     boundary_types, boundary_type_names)
 
         # Определяем, какие величины отображать
-        _cfg = config or {}
         if plot_physical:
             u_plot = u_norm * data_handler.U_inf
             v_plot = v_norm * data_handler.U_inf
             p_dyn = 0.5 * data_handler.rho * data_handler.U_inf ** 2
-            p_plot = p_norm * p_dyn
-            # Обратное масштабирование координат (если использовалось масштабирование)
-            scale_factor = _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
-            if _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
-                x_plot = (x_norm / scale_factor) * data_handler.chord
-                y_plot = (y_norm / scale_factor) * data_handler.chord
-            else:
-                x_plot = x_norm * data_handler.chord
-                y_plot = y_norm * data_handler.chord
+            p_plot = p_norm * p_dyn + data_handler.p_ref
+            x_plot = x_norm * data_handler.chord
+            y_plot = y_norm * data_handler.chord
             u_label = 'Скорость U, м/с'
             v_label = 'Скорость V, м/с'
-            p_label = 'Избыточное давление, Па'
+            p_label = 'Давление, Па'
             x_label = 'x, м'
             y_label = 'y, м'
             title_suffix = ' (physical)'
@@ -509,14 +502,8 @@ class Visualizer:
             u_plot = u_norm
             v_plot = v_norm
             p_plot = p_norm
-            # Обратное масштабирование координат (если использовалось масштабирование)
-            scale_factor = _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('scale_factor', 1.0)
-            if _cfg.get('architecture', {}).get('coordinate_scaling', {}).get('enabled', False):
-                x_plot = x_norm / scale_factor
-                y_plot = y_norm / scale_factor
-            else:
-                x_plot = x_norm
-                y_plot = y_norm
+            x_plot = x_norm
+            y_plot = y_norm
             u_label = 'U (норм.)'
             v_label = 'V (норм.)'
             p_label = 'P (норм.)'
@@ -621,6 +608,49 @@ class Visualizer:
         plt.savefig(os.path.join(savedir, f"profiles_multiple{suffix}.png"), dpi=150)
         plt.close()
         logger.info(f"Множественные профили сохранены: profiles_multiple{suffix}.png")
+
+    def plot_1d_spectrum(self,
+                         y_np: np.ndarray,
+                         u_np: np.ndarray,
+                         savedir: str,
+                         epoch: Optional[Union[int, str]] = None,
+                         x_section: Optional[float] = None) -> None:
+        """
+        Строит одномерный спектр профиля u(y) в заданном сечении.
+        """
+        if len(y_np) < 2 or len(u_np) < 2:
+            logger.warning("1D спектр пропущен: недостаточно точек.")
+            return
+
+        os.makedirs(savedir, exist_ok=True)
+        suffix = f"_epoch_{epoch}" if epoch is not None else "_final"
+
+        sort_idx = np.argsort(y_np)
+        y_sorted = y_np[sort_idx]
+        u_sorted = u_np[sort_idx]
+        dy = float(np.mean(np.diff(y_sorted)))
+        if dy <= 0:
+            logger.warning("1D спектр пропущен: некорректная сетка по y.")
+            return
+
+        signal = u_sorted - np.mean(u_sorted)
+        spectrum = np.abs(np.fft.rfft(signal))
+        k = np.fft.rfftfreq(len(signal), d=dy) * 2 * np.pi
+
+        plt.figure(figsize=(10, 6))
+        plt.loglog(k[1:], spectrum[1:] + 1e-30, 'b-')
+        plt.xlabel(r'$k_y$, рад/м')
+        plt.ylabel('|FFT(u)|')
+        title = '1D spectrum of u'
+        if x_section is not None:
+            title += f' at x={x_section:.3f} м'
+        if epoch is not None:
+            title += f' (epoch {epoch})'
+        plt.title(title)
+        plt.grid(True)
+        plt.savefig(os.path.join(savedir, f"spectrum_1d{suffix}.png"), dpi=150)
+        plt.close()
+        logger.info(f"1D спектр сохранён: spectrum_1d{suffix}.png")
 
     def plot_2d_spectrum(self, x_np: np.ndarray, y_np: np.ndarray, u_np: np.ndarray,
                          savedir: str, epoch: Optional[Union[int, str]] = None,

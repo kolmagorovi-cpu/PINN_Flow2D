@@ -161,6 +161,7 @@ class ConfigManager:
                 'compute_grad_cosine': False,
                 'compute_ntk_condition': False,
                 'save_rar_history': True,
+                'mass_metrics_interval': 1,
             },
             'enable_key_listener': True,
             'checkpoint_dir': 'Checkpoints',
@@ -264,6 +265,8 @@ class ConfigManager:
 
         print("ВХОДНЫЕ ПАРАМЕТРЫ:")
         inp = self.config['input_params']
+        print(f"  coordinates     : {inp.get('coordinates', True)}")
+        print(f"  sdf             : {inp.get('sdf', True)}")
         print(f"  inlet_velocity  : {inp['inlet_velocity']}")
         print(f"  viscosity       : {inp['viscosity']}")
         print(f"  density         : {inp['density']}")
@@ -369,6 +372,7 @@ class ConfigManager:
         print(f"  compute_grad_cosine      : {diag.get('compute_grad_cosine', False)}")
         print(f"  compute_ntk_condition    : {diag.get('compute_ntk_condition', False)}")
         print(f"  save_rar_history         : {diag.get('save_rar_history', True)}")
+        print(f"  mass_metrics_interval    : {diag.get('mass_metrics_interval', 1)}")
         print("=" * 70)
 
     def _deep_update(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:

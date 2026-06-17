@@ -70,7 +70,7 @@ def get_menu_choice(
     while True:
         try:
             if allow_zero:
-                print(f"\n{prompt} (0 для выхода): ", end="")
+                print(f"\n{prompt} (0 - {zero_action}): ", end="")
             else:
                 print(f"\n{prompt}: ", end="")
             

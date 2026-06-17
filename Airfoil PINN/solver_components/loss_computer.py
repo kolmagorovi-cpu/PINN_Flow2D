@@ -64,6 +64,7 @@ class LossComputer:
 
         # Параметры из конфигурации
         self.flow_type = config['pde']['flow_type']
+        self.pde_system = config['pde'].get('system', 'incompressible_navier_stokes')
         self.bc_type = config['boundary_conditions']['type']  # 'soft' или 'hard'
         self.pde_components = self._setup_pde_components()
 
@@ -167,6 +168,15 @@ class LossComputer:
             словарь с ключами, соответствующими self.pde_components,
             значениями – тензоры невязок той же формы, что и входные поля.
         """
+        if self.pde_system == 'euler':
+            if self.flow_type == 'axisymmetric':
+                return PDEResiduals.compute_residuals_euler_axisymmetric(
+                    u, v, p, x, y, self.rho_norm, safe_grad, self.eps_axi
+                )
+            return PDEResiduals.compute_residuals_euler_2d(
+                u, v, p, x, y, self.rho_norm, safe_grad
+            )
+
         if self.flow_type == 'axisymmetric':
             return PDEResiduals.compute_residuals_axisymmetric(
                 u, v, p, x, y, self.rho_norm, self.mu_norm, safe_grad, self.eps_axi
@@ -387,7 +397,11 @@ class LossComputer:
         Returns:
             тензор формы (batch_size, input_dim)
         """
-        inputs = [x, y, sdf]
+        inputs = []
+        if self.input_params.get('coordinates', True):
+            inputs.extend([x, y])
+        if self.input_params.get('sdf', True):
+            inputs.append(sdf)
         if boundary_types is not None and boundary_types.shape[1] > 0:
             inputs.append(boundary_types)
 
@@ -404,6 +418,9 @@ class LossComputer:
         if self.input_params.get('density', False):
             rho = torch.ones_like(x) * self.rho_norm
             inputs.append(rho)
+
+        if not inputs:
+            raise ValueError("build_input_tensor: не выбран ни один входной признак")
 
         return torch.cat(inputs, dim=1)
 

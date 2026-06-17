@@ -130,6 +130,7 @@ class InteractiveHandler:
         sdf_norm = dataset.sdf.to(self.device, dtype=self.dtype)
         bt = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
 
+        was_training = self.model.training
         self.model.eval()
         with torch.no_grad():
             input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
@@ -150,6 +151,8 @@ class InteractiveHandler:
                 )
             else:
                 u, v, p = u_raw, v_raw, p_raw
+        if was_training:
+            self.model.train()
 
         # Сохраняем поля (нормализованные и физические)
         if self.plots_dir:

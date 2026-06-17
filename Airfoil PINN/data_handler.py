@@ -22,7 +22,7 @@ import os
 import numpy as np
 import torch
 from dataclasses import dataclass
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import logging
 from typing import Dict, List, Optional, Tuple
 from scipy.spatial import cKDTree
@@ -217,6 +217,7 @@ class PINNDataset(Dataset):
                     # u = 0
 
         self.n_points = len(self.x)
+        self.source_indices = torch.arange(self.n_points, dtype=torch.long)
         logger.info(f"Типы границ в данных: {self.boundary_type_names}")
         if 'inlet' in self.boundary_type_names:
             logger.warning(
@@ -298,6 +299,7 @@ class PINNDataset(Dataset):
         Returns:
             Новый расширенный датасет
         """
+        indices = indices.detach().cpu().long()
         new_dataset = PINNDataset.__new__(PINNDataset)
         # Копируем все атрибуты, конкатенируя тензоры
         for attr in ['x', 'y', 'sdf', 'p_target', 'u_target', 'v_target',
@@ -312,6 +314,14 @@ class PINNDataset(Dataset):
 
         new_dataset.boundary_type_names = self.boundary_type_names
         new_dataset.type_to_idx = self.type_to_idx
+        if hasattr(self, 'source_indices'):
+            new_dataset.source_indices = torch.cat(
+                [self.source_indices, self.source_indices[indices]],
+                dim=0
+            )
+        else:
+            base = torch.arange(len(self.x), dtype=torch.long)
+            new_dataset.source_indices = torch.cat([base, base[indices]], dim=0)
         new_dataset.n_points = len(new_dataset.x)
         return new_dataset
 
@@ -479,6 +489,46 @@ class DataHandler:
             DataLoader для итерации по батчам
         """
         return self.dataloader
+
+    def get_eval_dataloader(self, batch_size: Optional[int] = None) -> DataLoader:
+        """
+        Возвращает DataLoader без перемешивания для диагностики и сохранения полей.
+
+        Порядок элементов совпадает с порядком тензоров датасета, поэтому результаты
+        можно безопасно индексировать масками из self.dataset.
+        """
+        return DataLoader(
+            self.dataset,
+            batch_size=batch_size or self.batch_size,
+            shuffle=False
+        )
+
+    def get_boundary_eval_dataloader(
+        self,
+        type_names: Tuple[str, ...] = ('inlet', 'outlet'),
+        batch_size: Optional[int] = None
+    ) -> DataLoader:
+        """
+        Возвращает DataLoader только для заданных типов границ.
+
+        Используется для дешёвого мониторинга inlet/outlet вместо полного
+        прохода по внутренним точкам датасета.
+        """
+        if self.dataset.boundary_types is None or not self.boundary_type_names:
+            return DataLoader(Subset(self.dataset, []), batch_size=batch_size or self.batch_size)
+
+        mask = torch.zeros(self.n_points, dtype=torch.bool)
+        for name in type_names:
+            idx = self.dataset.type_to_idx.get(name)
+            if idx is not None and idx < self.dataset.boundary_types.shape[1]:
+                mask |= self.dataset.boundary_types[:, idx] > 0.5
+
+        indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+        return DataLoader(
+            Subset(self.dataset, indices),
+            batch_size=batch_size or self.batch_size,
+            shuffle=False
+        )
 
     @property
     def n_points(self) -> int:

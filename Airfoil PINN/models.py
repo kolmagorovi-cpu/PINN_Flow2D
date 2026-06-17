@@ -93,6 +93,7 @@ class PINNIncompressible(nn.Module):
         # Параметры масштабирования координат
         self.coordinate_scaling = coordinate_scaling or {'enabled': False, 'scale_factor': 1.0}
         self.scale_factor = self.coordinate_scaling.get('scale_factor', 1.0) if self.coordinate_scaling.get('enabled', False) else 1.0
+        self.coord_dim = int(self.coordinate_scaling.get('coord_dim', 2))
 
         prev = input_dim
         for hidden in layers:
@@ -162,9 +163,11 @@ class PINNIncompressible(nn.Module):
         Returns:
             тензор формы (batch_size, output_dim)
         """
-        # Масштабирование координат для улучшения обусловленности
-        if self.coordinate_scaling.get('enabled', False):
-            h = x * self.scale_factor
+        # Масштабирование только координат x,y; остальные признаки сохраняют физический смысл.
+        if self.coordinate_scaling.get('enabled', False) and self.coord_dim > 0:
+            h = x.clone()
+            coord_dim = min(self.coord_dim, h.shape[1])
+            h[:, :coord_dim] = h[:, :coord_dim] * self.scale_factor
         else:
             h = x
         
@@ -189,7 +192,10 @@ class SelfAdaptiveWeights(nn.Module):
             init_val: начальное значение весов
         """
         super().__init__()
-        self.log_weights = nn.Parameter(torch.full((n_points, n_eqns), np.log(init_val)))
+        if init_val <= 0:
+            raise ValueError("init_val для SelfAdaptiveWeights должен быть положительным")
+        self.initial_raw_value = float(np.log(np.expm1(init_val)))
+        self.log_weights = nn.Parameter(torch.full((n_points, n_eqns), self.initial_raw_value))
         self.softplus = nn.Softplus()
 
     def forward(self) -> torch.Tensor:

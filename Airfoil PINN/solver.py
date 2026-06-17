@@ -74,7 +74,10 @@ class PINNSolver:
         # Устройство и тип данных
         self.device = self._init_device(config['process'])
         self.dtype = self._init_dtype(config['process']['dtype'])
-        self.use_amp = config['process'].get('use_amp', False)
+        requested_amp = bool(config['process'].get('use_amp', False))
+        self.use_amp = requested_amp and self.device.type == 'cuda' and self.dtype == torch.float32
+        if requested_amp and not self.use_amp:
+            logger.warning("AMP отключён: требуется CUDA и dtype=float32.")
 
         # Параметры мониторинга памяти
         self.memory_threshold_gb = config.get('process', {}).get('memory_threshold_gb', 0.5)
@@ -156,8 +159,7 @@ class PINNSolver:
         self.optimizer = self._init_optimizer(optim_type='adam')
         self.scheduler = self._init_scheduler()
 
-        # Исправление FutureWarning для GradScaler
-        if self.use_amp and self.device.type == 'cuda':
+        if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
@@ -174,6 +176,10 @@ class PINNSolver:
         self.profile_y_max_ratio = self.diagnostics_config.get('profile_y_max_ratio', 0.95)
         # Включение двумерного спектра
         self.plot_2d_spectrum = self.diagnostics_config.get('plot_2d_spectrum', False)
+        self.plot_1d_spectrum = self.diagnostics_config.get('plot_spectrum', True)
+        self.compute_ntk_condition = self.diagnostics_config.get('compute_ntk_condition', False)
+        self.ntk_sample_size = self.diagnostics_config.get('ntk_sample_size', 64)
+        self.mass_metrics_interval = self.diagnostics_config.get('mass_metrics_interval', 1)
         # Разрешение сетки для 2D спектра
         self.spectrum_2d_resolution = self.diagnostics_config.get('spectrum_2d_resolution', 256)
 
@@ -189,7 +195,8 @@ class PINNSolver:
             sa_weights=self.sa_weights,
             scaler=self.scaler,
             using_lbfgs=False,
-            diagnostics_config=self.diagnostics_config
+            diagnostics_config=self.diagnostics_config,
+            use_amp=self.use_amp,
         )
 
         # MetricsCollector
@@ -250,6 +257,18 @@ class PINNSolver:
         self.use_lbfgs = config['training']['switch_to_lbfgs_epoch'] > 0
         self.adam_epochs = config['training']['switch_to_lbfgs_epoch']
 
+        # Early stopping
+        early_cfg = config['training'].get('early_stopping', {})
+        self.early_stopping_enabled = bool(early_cfg.get('enabled', False))
+        self.early_stopping_patience = int(early_cfg.get('patience', 100))
+        self.early_stopping_min_delta = float(early_cfg.get('min_delta', 1e-6))
+        self.early_stopping_restore_best = bool(early_cfg.get('restore_best', True))
+        self._early_best_loss = float('inf')
+        self._early_best_epoch = 0
+        self._early_bad_epochs = 0
+        self._early_best_model_state = None
+        self._early_best_sa_state = None
+
         # Детектор локальных минимумов
         self.minima_detector = None
         if config['training']['lr_schedule'] == 'detector':
@@ -305,7 +324,8 @@ class PINNSolver:
         actual_input_dim = input_tensor.shape[1]
         
         # Получаем параметры масштабирования координат
-        coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0})
+        coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0}).copy()
+        coord_scaling['coord_dim'] = 2 if self.config.get('input_params', {}).get('coordinates', True) else 0
 
         return PINNIncompressible(
             input_dim=actual_input_dim,
@@ -429,6 +449,12 @@ class PINNSolver:
         """Сбор и сохранение диагностических данных в заданную эпоху."""
         logger.info(f"Запуск диагностики на эпохе {epoch}")
         plots_dir = self._get_plots_dir()
+        need_predictions = (
+            self.diagnostics_config.get('plot_profiles', True)
+            or self.plot_1d_spectrum
+            or self.plot_2d_spectrum
+        )
+        pred_norm = self._get_predictions_norm() if need_predictions else None
 
         # 1. Карта невязки PDE (используем скользящее среднее point_residual вместо max_residual)
         if self.diagnostics_config.get('plot_residual_map', True):
@@ -438,9 +464,7 @@ class PINNSolver:
             self.visualizer.plot_residual_map(x_np, y_np, residual, plots_dir, epoch)
 
         # 2. Профили скорости в нескольких сечениях с фильтрацией по y
-        if self.diagnostics_config.get('plot_profiles', True):
-            # Получаем предсказания модели на всём датасете (нормализованные значения)
-            pred_norm = self._get_predictions_norm()
+        if self.diagnostics_config.get('plot_profiles', True) and pred_norm is not None:
             u_pred_norm = pred_norm['u_norm']  # одномерный массив numpy
             profiles = {}
             for x_sec in self.profile_sections:
@@ -460,25 +484,31 @@ class PINNSolver:
                 profiles[x_sec] = (y_phys, u_phys)
             self.visualizer.plot_velocity_profiles_multiple(profiles, plots_dir, epoch)
 
-        # 3. Двумерный спектр (если включено) – с фильтрацией граничных точек
-        if self.plot_2d_spectrum:
-            # Используем предсказанные поля u (физические) из модели
-            # Получаем все точки датасета
-            dataset = self.data_handler.dataset
-            x_np = dataset.x.cpu().numpy().flatten() * self.data_handler.chord
-            y_np = dataset.y.cpu().numpy().flatten() * self.data_handler.chord
-            # Получаем предсказания модели для всех точек
-            self.model.eval()
-            with torch.no_grad():
-                x_t = dataset.x.to(self.device, dtype=self.dtype)
-                y_t = dataset.y.to(self.device, dtype=self.dtype)
-                sdf_t = dataset.sdf.to(self.device, dtype=self.dtype)
-                bt_t = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
-                input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt_t)
-                out = self.model(input_tensor)
-                u_norm = out[:, 0].cpu().numpy().flatten()
-                # Переводим в физические единицы
-                u_phys = u_norm * self.data_handler.U_inf
+        # 3. Одномерный спектр в заданном сечении
+        if self.plot_1d_spectrum and pred_norm is not None:
+            x_sec = self.diagnostics_config.get('spectrum_section_x', 0.5)
+            y_grid, u_interp_norm = self.data_handler.interpolate_profile(
+                x_sec,
+                u_vals=torch.from_numpy(pred_norm['u_norm']).to(dtype=self.dtype),
+                num_points=256,
+                y_max_ratio=self.profile_y_max_ratio
+            )
+            if not np.all(np.isnan(u_interp_norm)):
+                self.visualizer.plot_1d_spectrum(
+                    y_grid * self.data_handler.chord,
+                    u_interp_norm * self.data_handler.U_inf,
+                    plots_dir,
+                    epoch,
+                    x_section=x_sec * self.data_handler.chord
+                )
+            else:
+                logger.warning(f"1D спектр пропущен: нет данных в сечении x={x_sec}.")
+
+        # 4. Двумерный спектр (если включено) – с фильтрацией граничных точек
+        if self.plot_2d_spectrum and pred_norm is not None:
+            x_np = pred_norm['x_norm'] * self.data_handler.chord
+            y_np = pred_norm['y_norm'] * self.data_handler.chord
+            u_phys = pred_norm['u_norm'] * self.data_handler.U_inf
 
             # Исключаем граничные точки (отступ 5% от каждой границы)
             eps_x = 0.05 * (x_np.max() - x_np.min())
@@ -517,8 +547,9 @@ class PINNSolver:
         Возвращает предсказания модели на всём датасете в нормализованных единицах.
         Возвращает словарь с ключами 'x_norm', 'y_norm', 'u_norm', 'v_norm', 'p_norm'.
         """
+        was_training = self.model.training
         self.model.eval()
-        dataloader = self.data_handler.get_dataloader()
+        dataloader = self.data_handler.get_eval_dataloader()
         all_u = []
         all_v = []
         all_p = []
@@ -560,7 +591,8 @@ class PINNSolver:
                 all_x.append(x.cpu().numpy().flatten())
                 all_y.append(y.cpu().numpy().flatten())
 
-        self.model.train()
+        if was_training:
+            self.model.train()
         return {
             'x_norm': np.concatenate(all_x),
             'y_norm': np.concatenate(all_y),
@@ -611,6 +643,10 @@ class PINNSolver:
 
                 # Сбор дополнительных метрик для диагностики (если нужно)
                 extra_diag = {'fvm_loss': self.trainer._last_fvm_loss}
+                sample_batch = None
+                if self.sa_weights is not None:
+                    with torch.no_grad():
+                        extra_diag['sa_weights_mean'] = self.sa_weights().mean().item()
                 if self.compute_grad_cosine and not self.using_lbfgs and epoch % self.diagnostics_interval == 0:
                     # Берём один батч
                     sample_batch = next(iter(self.data_handler.get_dataloader()))
@@ -618,9 +654,19 @@ class PINNSolver:
                     extra_diag['grad_norm_pde'] = grad_metrics['pde_norm']
                     extra_diag['grad_norm_bc'] = grad_metrics['bc_norm']
                     extra_diag['grad_cosine'] = grad_metrics['cosine']
+                if self.compute_ntk_condition and not self.using_lbfgs and epoch % self.diagnostics_interval == 0:
+                    if sample_batch is None:
+                        sample_batch = next(iter(self.data_handler.get_dataloader()))
+                    extra_diag['ntk_condition'] = self.trainer.compute_ntk_condition(
+                        sample_batch,
+                        max_samples=self.ntk_sample_size
+                    )
 
                 # Средние скорости на inlet/outlet для мониторинга баланса масс
-                avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(epoch)
+                avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(
+                    epoch,
+                    interval=self.mass_metrics_interval
+                )
                 mass_error = abs(avg_u_in - avg_u_out) / (abs(avg_u_in) + 1e-12)
                 extra_diag['avg_u_in'] = avg_u_in
                 extra_diag['avg_u_out'] = avg_u_out
@@ -638,6 +684,15 @@ class PINNSolver:
                 # Адаптивные веса BC (активируется через config['loss_weights']['adaptive_bc'])
                 if epoch % 50 == 0 and self.loss_computer.adaptive_bc:
                     self.trainer.update_adaptive_weights(self.loss_computer.loss_weights)
+
+                # Периодический сброс оптимизатора с шумом
+                if (
+                    self.trainer.reset_interval > 0
+                    and not self.using_lbfgs
+                    and epoch % self.trainer.reset_interval == 0
+                ):
+                    self.trainer.reset_optimizer(reset_noise=self.trainer.reset_noise)
+                    self._recreate_optimizer()
 
                 # RAR
                 if self.trainer.rar_enable and not self.using_lbfgs and epoch % self.trainer.rar_interval == 0:
@@ -693,6 +748,9 @@ class PINNSolver:
                 if epoch % self.diagnostics_interval == 0:
                     self._run_diagnostics(epoch)
 
+                if self._update_early_stopping(epoch, loss):
+                    break
+
                 # Очистка кэша CUDA (редко, чтобы не замедлять)
                 if self.device.type == 'cuda' and epoch % 50 == 0:
                     torch.cuda.empty_cache()
@@ -703,6 +761,7 @@ class PINNSolver:
             self.visualizer.save_plots(self._get_plots_dir(), 'interrupted')
             self.interactive._save_current_results(epoch)
             self._finalize()
+            return
         except Exception as e:
             logger.error(f"Критическая ошибка во время обучения: {e}", exc_info=True)
             self._save_checkpoint('error')
@@ -714,7 +773,7 @@ class PINNSolver:
 
         self._save_checkpoint('final')
         self.visualizer.save_plots(self._get_plots_dir(), 'final')
-        self.interactive._save_current_results(epochs)
+        self.interactive._save_current_results(epoch)
         self._finalize()
 
     def _get_pde_multiplier(self, epoch: int) -> float:
@@ -725,6 +784,54 @@ class PINNSolver:
         ramp_progress = (epoch - self.stage1_epochs) / max(1, self.stage2_ramp_epochs)
         ramp_progress = min(1.0, max(0.0, ramp_progress))
         return self.stage2_pde_weight_start + ramp_progress * (self.stage2_pde_weight_end - self.stage2_pde_weight_start)
+
+    def _capture_trainable_state(self) -> tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+        base_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        model_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+        sa_state = None
+        if self.sa_weights is not None:
+            sa_state = {k: v.detach().cpu().clone() for k, v in self.sa_weights.state_dict().items()}
+        return model_state, sa_state
+
+    def _restore_trainable_state(
+        self,
+        model_state: Dict[str, torch.Tensor],
+        sa_state: Optional[Dict[str, torch.Tensor]]
+    ) -> None:
+        base_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        base_model.load_state_dict({k: v.to(self.device) for k, v in model_state.items()})
+        if self.sa_weights is not None and sa_state is not None:
+            self.sa_weights.load_state_dict({k: v.to(self.device) for k, v in sa_state.items()})
+
+    def _update_early_stopping(self, epoch: int, loss: float) -> bool:
+        if not self.early_stopping_enabled:
+            return False
+
+        if loss < self._early_best_loss - self.early_stopping_min_delta:
+            self._early_best_loss = loss
+            self._early_best_epoch = epoch
+            self._early_bad_epochs = 0
+            if self.early_stopping_restore_best:
+                self._early_best_model_state, self._early_best_sa_state = self._capture_trainable_state()
+            return False
+
+        self._early_bad_epochs += 1
+        if self._early_bad_epochs < self.early_stopping_patience:
+            return False
+
+        logger.info(
+            "Early stopping: нет улучшения %d эпох. Лучшая эпоха: %d, loss=%.4e",
+            self.early_stopping_patience,
+            self._early_best_epoch,
+            self._early_best_loss,
+        )
+        if (
+            self.early_stopping_restore_best
+            and self._early_best_model_state is not None
+        ):
+            self._restore_trainable_state(self._early_best_model_state, self._early_best_sa_state)
+            logger.info("Восстановлено лучшее состояние модели перед финальным сохранением.")
+        return True
 
     def _switch_to_lbfgs(self):
         logger.info(f"Переключение на L-BFGS после эпохи {self.adam_epochs}")

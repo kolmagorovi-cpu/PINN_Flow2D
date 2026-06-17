@@ -89,6 +89,7 @@ class MetricsCollector:
             'avg_u_out': [],
             'avg_u_in': [],
             'wall_gradient': [],
+            'ntk_condition': [],
         }
 
         # Для кэширования средних скоростей на границах (нормированные)
@@ -138,8 +139,8 @@ class MetricsCollector:
                 self.history['bc'][k].append(v)
         self.history['wall_speed'].append(wall_speed)
         if self.history['sa_weights_mean'] is not None:
-            # SA-веса обновляются отдельно в solver, добавим позже через отдельный метод
-            pass
+            if extra_diag and 'sa_weights_mean' in extra_diag:
+                self.history['sa_weights_mean'].append(extra_diag['sa_weights_mean'])
         if self.history['integral_loss'] is not None:
             self.history['integral_loss'].append(integral_loss)
         for k, v in pde_max.items():
@@ -174,6 +175,8 @@ class MetricsCollector:
                 self.history['avg_u_out'].append(extra_diag['avg_u_out'])
             if 'wall_gradient' in extra_diag:
                 self.history['wall_gradient'].append(extra_diag['wall_gradient'])
+            if 'ntk_condition' in extra_diag:
+                self.history['ntk_condition'].append(extra_diag['ntk_condition'])
 
     # ------------------------------------------------------------------
     # Вычисление средней скорости на входе/выходе (с кэшированием)
@@ -204,8 +207,9 @@ class MetricsCollector:
 
     def _update_boundary_avg_velocities(self) -> None:
         """Вычисляет средние скорости на inlet/outlet с помощью модели (нормированные)."""
+        was_training = self.model.training
         self.model.eval()
-        dataloader = self.data_handler.get_dataloader()
+        dataloader = self.data_handler.get_boundary_eval_dataloader(('inlet', 'outlet'))
         u_inlet_sum = 0.0
         u_outlet_sum = 0.0
         count_inlet = 0
@@ -222,6 +226,8 @@ class MetricsCollector:
                     bt = bt.to(self.device, dtype=self.dtype)
                 else:
                     bt = None
+                if bt is None:
+                    continue
                 mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
                 u_bc = u_bc.to(self.device, dtype=self.dtype).view(-1, 1)
 
@@ -251,6 +257,8 @@ class MetricsCollector:
 
         self._cached_u_in_norm = u_inlet_sum / count_inlet if count_inlet > 0 else 0.0
         self._cached_u_out_norm = u_outlet_sum / count_outlet if count_outlet > 0 else 0.0
+        if was_training:
+            self.model.train()
 
     # ------------------------------------------------------------------
     # Вывод таблицы потерь в консоль
@@ -349,7 +357,8 @@ class MetricsCollector:
         fvm_w = getattr(self.loss_computer, 'fvm_weight', 0.0)
         if fvm_w > 0.0:
             rate_fvm = self._compute_rate('fvm', None, fvm_loss)
-            print(fmt_line('FVM Loss', rate_fvm, fvm_loss, fvm_loss, fvm_w, fvm_loss * fvm_w, fvm_loss * fvm_w))
+            fvm_raw = fvm_loss / fvm_w if fvm_w else fvm_loss
+            print(fmt_line('FVM Loss', rate_fvm, fvm_raw, fvm_raw, fvm_w, fvm_loss, fvm_loss))
 
         # Totals
         total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0
@@ -524,9 +533,24 @@ class MetricsCollector:
                 with torch.no_grad():
                     input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
                     out = self.model(input_tensor)
-                    u_pred = out[:, 0:1].cpu().numpy().flatten()
-                    v_pred = out[:, 1:2].cpu().numpy().flatten()
-                    p_pred = out[:, 2:3].cpu().numpy().flatten()
+                    u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+                    if self.loss_computer.bc_type == 'hard':
+                        u_pred_t, v_pred_t, p_pred_t = self.loss_computer.apply_hard_constraints(
+                            u_raw, v_raw, p_raw,
+                            dataset.mask_u_fixed.to(self.device).view(-1, 1),
+                            dataset.mask_v_fixed.to(self.device).view(-1, 1),
+                            dataset.mask_p_fixed.to(self.device).view(-1, 1),
+                            dataset.u_bc.to(self.device, dtype=self.dtype).view(-1, 1),
+                            dataset.v_bc.to(self.device, dtype=self.dtype).view(-1, 1),
+                            dataset.p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
+                        )
+                    else:
+                        u_pred_t, v_pred_t, p_pred_t = u_raw, v_raw, p_raw
+
+                    p_dyn = 0.5 * self.data_handler.rho * self.data_handler.U_inf ** 2
+                    u_pred = (u_pred_t * self.data_handler.U_inf).cpu().numpy().flatten()
+                    v_pred = (v_pred_t * self.data_handler.U_inf).cpu().numpy().flatten()
+                    p_pred = (p_pred_t * p_dyn + self.data_handler.p_ref).cpu().numpy().flatten()
 
                 # Физические координаты
                 x_phys = x_norm.cpu().numpy().flatten() * self.data_handler.chord

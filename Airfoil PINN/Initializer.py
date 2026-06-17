@@ -6,7 +6,7 @@
 Возвращает данные в нормализованном виде для PINN:
     - координаты делятся на хорду
     - скорости делятся на U_inf
-    - давление переводится в избыточное и делится на ρU_inf²
+    - давление переводится в избыточное и делится на 0.5*ρ*U_inf²
     - SDF нормализуется на хорду (sdf_norm = sdf / chord)
     - на стенке скорость обнуляется, на границах симметрии обнуляются соответствующие компоненты
     - добавлена возможность выбора начального поля скорости (constant, linear_x, perturbed)
@@ -44,7 +44,7 @@ from type_hints import InitializerMetadataDict
 
 # Импортируем наши модули и классы
 from Fluids import FluidLibrary, Fluid
-from Conditions import ConditionsManager, BoundaryConditions
+from Conditions import ConditionsManager, BoundaryConditions, select_fluid as choose_fluid
 
 # Определяем корневую директорию проекта
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -301,25 +301,12 @@ class Initializer:
         Raises:
             RuntimeError: Если библиотека жидкостей пуста
         """
-        fluids = self.fluid_lib.list_fluids()
-        if not fluids:
-            raise RuntimeError("Библиотека жидкостей пуста.")
-        print("\nДоступные жидкости:")
-        for i, name in enumerate(fluids, 1):
-            fluid = self.fluid_lib.get(name)
-            print(f"{i}. {fluid.display()}")
-        while True:
-            try:
-                choice = input("Выберите номер жидкости: ").strip()
-                idx = int(choice) - 1
-                if 0 <= idx < len(fluids):
-                    self.fluid = self.fluid_lib.get(fluids[idx])
-                    self.fluid_name = fluids[idx]
-                    return fluids[idx]
-                else:
-                    print("Неверный номер.")
-            except ValueError:
-                print("Введите число.")
+        fluid_name = choose_fluid(self.fluid_lib)
+        if fluid_name is None:
+            raise RuntimeError("Жидкость не выбрана.")
+        self.fluid = self.fluid_lib.get(fluid_name)
+        self.fluid_name = fluid_name
+        return fluid_name
 
     def select_conditions(self) -> str:
         """

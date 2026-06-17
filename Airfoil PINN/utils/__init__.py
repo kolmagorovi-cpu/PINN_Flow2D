@@ -16,6 +16,8 @@ from .ui_utils import (
     input_with_default,
     clear_screen,
     print_header,
+    pause_and_continue,
+    Colors,
 )
 from .io_utils import (
     save_json,
@@ -37,6 +39,8 @@ __all__ = [
     'input_with_default',
     'clear_screen',
     'print_header',
+    'pause_and_continue',
+    'Colors',
     # I/O
     'save_json',
     'load_json',

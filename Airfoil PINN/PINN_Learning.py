@@ -157,6 +157,8 @@ def _configure_input_params(cfg: ConfigManager) -> None:
     print_submenu_header("Входные параметры")
     inp = cfg.config['input_params']
     
+    inp['coordinates'] = yes_no("Использовать координаты x,y", inp.get('coordinates', True))
+    inp['sdf'] = yes_no("Использовать SDF", inp.get('sdf', True))
     inp['inlet_velocity'] = yes_no("Использовать компоненты скорости на входе", inp['inlet_velocity'])
     inp['viscosity'] = yes_no("Использовать вязкость жидкости", inp['viscosity'])
     inp['density'] = yes_no("Использовать плотность жидкости", inp['density'])
@@ -663,7 +665,8 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
         print("6. Переключение Adam → L-BFGS")
         print("7. Размер батча и градиентное накопление")
         print("8. Количество эпох")
-        print("9. Вывод текущей стратегии")
+        print("9. Early stopping")
+        print("10. Вывод текущей стратегии")
         print("0. Выход")
         sub = input("Выберите пункт: ").strip()
 
@@ -711,6 +714,18 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
         elif sub == '8':
             tr['epochs'] = int(input(f"Количество эпох [{tr['epochs']}]: ") or tr['epochs'])
         elif sub == '9':
+            es = tr.setdefault('early_stopping', {
+                'enabled': False,
+                'patience': 100,
+                'min_delta': 1e-6,
+                'restore_best': True,
+            })
+            es['enabled'] = yes_no("Early stopping", es.get('enabled', False))
+            if es['enabled']:
+                es['patience'] = int(input(f"Patience [{es.get('patience', 100)}]: ") or es.get('patience', 100))
+                es['min_delta'] = float(input(f"Min delta [{es.get('min_delta', 1e-6)}]: ") or es.get('min_delta', 1e-6))
+                es['restore_best'] = yes_no("Восстановить лучшую модель", es.get('restore_best', True))
+        elif sub == '10':
             print("\n--- ТЕКУЩАЯ СТРАТЕГИЯ ОБУЧЕНИЯ ---")
             print(f"Двухэтапное обучение: {tr['two_stage']}")
             if tr['two_stage']:
@@ -723,6 +738,10 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
             print(f"Переключение на L-BFGS: эпоха {tr['switch_to_lbfgs_epoch']}")
             print(f"Батч: {tr['batch_size']}, накопление: {tr['gradient_accumulation_steps']}")
             print(f"Эпох: {tr['epochs']}")
+            es = tr.get('early_stopping', {})
+            print(f"Early stopping: {es.get('enabled', False)} "
+                  f"(patience={es.get('patience', 100)}, min_delta={es.get('min_delta', 1e-6)}, "
+                  f"restore_best={es.get('restore_best', True)})")
             input("Нажмите Enter...")
         elif sub == '0':
             print_submenu_footer()
@@ -813,7 +832,8 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
         print("9. Вычисление раздельных градиентов")
         print("10. Вычисление NTK")
         print("11. Сохранение истории RAR")
-        print("12. Показать текущие настройки")
+        print("12. Интервал inlet/outlet метрик")
+        print("13. Показать текущие настройки")
         print("0. Выход")
         sub = input("Выберите пункт: ").strip()
 
@@ -846,6 +866,12 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
         elif sub == '11':
             diag['save_rar_history'] = yes_no("Сохранять историю RAR", diag.get('save_rar_history', True))
         elif sub == '12':
+            diag['mass_metrics_interval'] = int(
+                input(f"Интервал inlet/outlet метрик [{diag.get('mass_metrics_interval', 1)}]: ")
+                or diag.get('mass_metrics_interval', 1)
+            )
+            diag['mass_metrics_interval'] = max(1, diag['mass_metrics_interval'])
+        elif sub == '13':
             print("\n--- ТЕКУЩИЕ НАСТРОЙКИ ДИАГНОСТИКИ ---")
             print(f"Интервал: {diag.get('interval', 50)}")
             print(f"Карта невязки: {diag.get('plot_residual_map', True)}")
@@ -858,6 +884,7 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
             print(f"Раздельные градиенты: {diag.get('compute_grad_cosine', False)}")
             print(f"NTK: {diag.get('compute_ntk_condition', False)}")
             print(f"История RAR: {diag.get('save_rar_history', True)}")
+            print(f"Интервал inlet/outlet метрик: {diag.get('mass_metrics_interval', 1)}")
             input("Нажмите Enter...")
         elif sub == '0':
             print_submenu_footer()

@@ -19,6 +19,7 @@
 
 import logging
 from collections import deque
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Any, Union
 
 import torch
@@ -51,6 +52,7 @@ class Trainer:
         scaler: Optional[GradScaler] = None,
         using_lbfgs: bool = False,
         diagnostics_config: Optional[Dict] = None,
+        use_amp: Optional[bool] = None,
     ):
         """
         Args:
@@ -86,7 +88,7 @@ class Trainer:
         self.rar_enable = tr.get('rar_enable', False)
         self.rar_interval = tr.get('rar_interval', 100)
         self.rar_num_points = tr.get('rar_num_points', 200)
-        self.use_amp = tr.get('use_amp', False)
+        self.use_amp = bool(use_amp) if use_amp is not None else tr.get('use_amp', False)
 
         # Адаптивная балансировка весов BC (только для soft граничных условий)
         # Флаг adaptive_bc читается из LossComputer, который берёт его из config['loss_weights']
@@ -127,6 +129,12 @@ class Trainer:
         self.profile_sections = self.diag_config.get('profile_sections', [0.2, 0.5, 0.8])
         self.spectrum_section_x = self.diag_config.get('spectrum_section_x', 0.5)
         self.compute_grad_cosine = self.diag_config.get('compute_grad_cosine', False)
+        self._fvm_tensor_cache = None
+
+    def _autocast_context(self):
+        if self.use_amp and self.scaler is not None and self.device.type == 'cuda':
+            return torch.autocast(device_type='cuda', dtype=torch.float16)
+        return nullcontext()
 
     # ------------------------------------------------------------------
     # Прямой проход (вычисление всех компонент потерь)
@@ -251,13 +259,8 @@ class Trainer:
         # FVM-потеря (полный проход по всей сетке, добавляется к тому же графу)
         fvm_loss_val = 0.0
         if add_fvm and self.loss_computer.fvm is not None and self.loss_computer.fvm_weight > 0.0:
-            dh = self.data_handler
-            if hasattr(dh, 'fvm_x'):
-                x_fvm   = dh.fvm_x.to(self.device, dtype=self.dtype)
-                y_fvm   = dh.fvm_y.to(self.device, dtype=self.dtype)
-                sdf_fvm = dh.fvm_sdf.to(self.device, dtype=self.dtype)
-                bt_fvm  = (dh.fvm_bt.to(self.device, dtype=self.dtype)
-                           if dh.fvm_bt is not None else None)
+            if hasattr(self.data_handler, 'fvm_x'):
+                x_fvm, y_fvm, sdf_fvm, bt_fvm = self._get_fvm_tensors()
                 inp_fvm  = self.loss_computer.build_input_tensor(x_fvm, y_fvm, sdf_fvm, bt_fvm)
                 out_fvm  = self.model(inp_fvm)
                 fvm_t    = self.loss_computer.compute_fvm_loss(out_fvm[:, :2])
@@ -319,24 +322,83 @@ class Trainer:
         loss_bc = fwd['loss_components']['bc']
         # Интегральная потеря не включается в раздельные градиенты
 
+        def _flatten_grads() -> torch.Tensor:
+            grads = [p.grad.reshape(-1).clone()
+                     for p in self.model.parameters()
+                     if p.grad is not None]
+            if not grads:
+                return torch.empty(0, device=self.device, dtype=self.dtype)
+            return torch.cat(grads)
+
         # Градиенты от PDE
         loss_pde.backward(retain_graph=True)
-        grad_pde = torch.cat([p.grad.view(-1).clone() for p in self.model.parameters() if p.grad is not None])
+        grad_pde = _flatten_grads()
         self.model.zero_grad()
 
         # Градиенты от BC
         loss_bc.backward(retain_graph=True)
-        grad_bc = torch.cat([p.grad.view(-1).clone() for p in self.model.parameters() if p.grad is not None])
+        grad_bc = _flatten_grads()
         self.model.zero_grad()
 
-        norm_pde = torch.norm(grad_pde).item()
-        norm_bc = torch.norm(grad_bc).item()
+        norm_pde = torch.norm(grad_pde).item() if grad_pde.numel() else 0.0
+        norm_bc = torch.norm(grad_bc).item() if grad_bc.numel() else 0.0
         if norm_pde > 0 and norm_bc > 0:
             cosine = torch.dot(grad_pde, grad_bc).item() / (norm_pde * norm_bc)
         else:
             cosine = 0.0
 
         return {'pde_norm': norm_pde, 'bc_norm': norm_bc, 'cosine': cosine}
+
+    def compute_ntk_condition(self, batch: Tuple, max_samples: int = 64) -> float:
+        """
+        Оценивает condition number эмпирического NTK по малому подбатчу.
+
+        Диагностика дорогая, поэтому используется только при явном включении
+        compute_ntk_condition и ограничивает число точек max_samples.
+        """
+        was_training = self.model.training
+        was_training = self.model.training
+        self.model.eval()
+
+        idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+        n = min(max_samples, x.shape[0])
+        if n <= 1:
+            if was_training:
+                self.model.train()
+            return 0.0
+
+        x = x[:n].to(self.device, dtype=self.dtype)
+        y = y[:n].to(self.device, dtype=self.dtype)
+        sdf = sdf[:n].to(self.device, dtype=self.dtype)
+        bt = bt[:n].to(self.device, dtype=self.dtype) if bt.shape[1] > 0 else None
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        rows = []
+
+        for i in range(n):
+            input_i = self.loss_computer.build_input_tensor(
+                x[i:i + 1],
+                y[i:i + 1],
+                sdf[i:i + 1],
+                bt[i:i + 1] if bt is not None else None
+            )
+            out_i = self.model(input_i).sum()
+            grads = torch.autograd.grad(out_i, params, retain_graph=False, allow_unused=True)
+            flat = [
+                g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1)
+                for g, p in zip(grads, params)
+            ]
+            rows.append(torch.cat(flat).detach())
+
+        if was_training:
+            self.model.train()
+
+        J = torch.stack(rows, dim=0).float()
+        K = J @ J.t()
+        eigvals = torch.linalg.eigvalsh(K)
+        positive = eigvals[eigvals > 1e-12]
+        if positive.numel() == 0:
+            return float('inf')
+        return (positive.max() / positive.min()).item()
 
     # ------------------------------------------------------------------
     # Получение предсказаний на всём датасете (для диагностики)
@@ -348,7 +410,7 @@ class Trainer:
         Возвращает словарь с ключами 'x', 'y', 'u', 'v', 'p' (физические единицы).
         """
         self.model.eval()
-        dataloader = self.data_handler.get_dataloader()
+        dataloader = self.data_handler.get_eval_dataloader()
         all_u = []
         all_v = []
         all_p = []
@@ -403,12 +465,15 @@ class Trainer:
         rho = self.data_handler.rho
         p_dyn = 0.5 * rho * U_inf**2
 
+        if was_training:
+            self.model.train()
+
         return {
             'x': x_np * chord,
             'y': y_np * chord,
             'u': u_np * U_inf,
             'v': v_np * U_inf,
-            'p': p_np * p_dyn
+            'p': p_np * p_dyn + self.data_handler.p_ref
         }
 
     # ------------------------------------------------------------------
@@ -523,13 +588,26 @@ class Trainer:
         if not self.rar_enable:
             return
         logger.info("Применение RAR: добавление точек с наибольшей невязкой...")
-        top_k = min(self.rar_num_points, len(self.point_residual))
-        if top_k == 0:
-            return
-        values, indices = torch.topk(self.point_residual, top_k)
-        indices = indices.numpy()
-
         dataset = self.data_handler.dataset
+        source_indices = getattr(dataset, 'source_indices', torch.arange(len(self.point_residual)))
+        used_sources = getattr(self, '_rar_used_sources', set())
+        source_list = source_indices.cpu().tolist()
+        candidate_mask = torch.tensor(
+            [src not in used_sources for src in source_list],
+            dtype=torch.bool,
+            device='cpu'
+        )
+        candidate_count = int(candidate_mask.sum().item())
+        top_k = min(self.rar_num_points, candidate_count)
+        if top_k == 0:
+            logger.info("RAR: нет новых исходных точек для перевзвешивания.")
+            return
+        candidate_residual = self.point_residual.clone()
+        candidate_residual[~candidate_mask] = -torch.inf
+        values, indices = torch.topk(candidate_residual, top_k)
+        indices = indices.numpy()
+        selected_sources = source_indices[torch.tensor(indices, dtype=torch.long)].cpu().tolist()
+        self._rar_used_sources = used_sources | set(int(s) for s in selected_sources)
 
         # Сохраняем статистику по типам границ добавленных точек
         if dataset.boundary_types is not None:
@@ -551,8 +629,9 @@ class Trainer:
         # Если используются SA-веса, расширяем их и устанавливаем флаг
         if self.sa_weights is not None:
             old_weights = self.sa_weights.log_weights.detach().cpu()
-            # Для новых точек инициализируем веса так же, как в начале (init_val=1.0 -> log(1)=0)
-            new_weights = torch.zeros(top_k, old_weights.shape[1], device='cpu')
+            # Для новых точек используем тот же raw-параметр, что и при начальной инициализации.
+            init_raw = float(getattr(self.sa_weights, 'initial_raw_value', 0.0))
+            new_weights = torch.full((top_k, old_weights.shape[1]), init_raw, device='cpu')
             combined_weights = torch.cat([old_weights, new_weights], dim=0)
             # Заменяем параметр (это допустимо, так как оптимизатор будет пересоздан)
             self.sa_weights.log_weights = nn.Parameter(combined_weights.to(self.device))
@@ -560,6 +639,24 @@ class Trainer:
             logger.warning("RAR: SA-веса расширены. Требуется пересоздание оптимизатора в solver.")
 
         logger.info(f"RAR: добавлено {top_k} точек. Теперь всего точек: {self.data_handler.n_points}")
+
+    def _get_fvm_tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Возвращает FVM-тензоры на рабочем device/dtype, кэшируя перенос."""
+        dh = self.data_handler
+        if not hasattr(dh, 'fvm_x'):
+            raise RuntimeError("FVM-тензоры не подготовлены")
+        cache_key = (id(dh.fvm_x), self.device.type, self.device.index, self.dtype)
+        if self._fvm_tensor_cache is None or self._fvm_tensor_cache[0] != cache_key:
+            bt = dh.fvm_bt.to(self.device, dtype=self.dtype) if dh.fvm_bt is not None else None
+            self._fvm_tensor_cache = (
+                cache_key,
+                dh.fvm_x.to(self.device, dtype=self.dtype),
+                dh.fvm_y.to(self.device, dtype=self.dtype),
+                dh.fvm_sdf.to(self.device, dtype=self.dtype),
+                bt,
+            )
+        _, x_fvm, y_fvm, sdf_fvm, bt_fvm = self._fvm_tensor_cache
+        return x_fvm, y_fvm, sdf_fvm, bt_fvm
 
     # ------------------------------------------------------------------
     # FVM-шаг (полный датасет, отдельный от батч-цикла)
@@ -589,11 +686,7 @@ class Trainer:
 
         # Используем координаты узлов сетки напрямую — не датасет.
         # Это корректно даже если датасет и сетка имеют разный размер.
-        x_all   = dh.fvm_x.to(self.device, dtype=self.dtype)
-        y_all   = dh.fvm_y.to(self.device, dtype=self.dtype)
-        sdf_all = dh.fvm_sdf.to(self.device, dtype=self.dtype)
-        bt_all  = (dh.fvm_bt.to(self.device, dtype=self.dtype)
-                   if dh.fvm_bt is not None else None)
+        x_all, y_all, sdf_all, bt_all = self._get_fvm_tensors()
 
         input_all = self.loss_computer.build_input_tensor(x_all, y_all, sdf_all, bt_all)
         out_all   = self.model(input_all)          # (N_mesh, output_dim)
@@ -630,8 +723,9 @@ class Trainer:
         Returns:
             словарь с результатами (те же поля, что и в forward_pass, плюс grad_norm)
         """
-        fwd = self.forward_pass(batch, pde_mult, add_fvm=add_fvm)
-        total_loss = fwd['total'] / self.accum_steps
+        with self._autocast_context():
+            fwd = self.forward_pass(batch, pde_mult, add_fvm=add_fvm)
+            total_loss = fwd['total'] / self.accum_steps
 
         # Обратное распространение
         if self.use_amp and self.scaler is not None:

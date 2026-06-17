@@ -155,46 +155,9 @@ del _bootstrap_environment
 import importlib
 import datetime
 import sys
-import os
 from typing import Dict, Optional, List, Callable, Any
 
-from constants import IS_WINDOWS
-
-
-# =============================================================================
-# ЦВЕТОВОЕ ОФОРМЛЕНИЕ
-# =============================================================================
-
-class Colors:
-    """
-    Цвета для консольного вывода.
-    
-    Работает в Unix-системах через ANSI escape-последовательности.
-    Для Windows цвета отключаются (автоматически).
-    
-    Example:
-        >>> print(f"{Colors.GREEN}Успех!{Colors.RESET}")
-        >>> print(f"{Colors.BOLD}{Colors.RED}Ошибка!{Colors.RESET}")
-    """
-    GREEN: str = '\033[92m'
-    BLUE: str = '\033[94m'
-    YELLOW: str = '\033[93m'
-    RED: str = '\033[91m'
-    CYAN: str = '\033[96m'
-    MAGENTA: str = '\033[95m'
-    BOLD: str = '\033[1m'
-    UNDERLINE: str = '\033[4m'
-    RESET: str = '\033[0m'
-
-    # Для Windows можно отключить цвета
-    if IS_WINDOWS:
-        GREEN = BLUE = YELLOW = RED = CYAN = MAGENTA = BOLD = UNDERLINE = RESET = ''
-
-
-def clear_screen() -> None:
-    """Очищает экран консоли"""
-    os.system('cls' if sys.platform == 'win32' else 'clear')
-    print('\033c')
+from utils.ui_utils import Colors, clear_screen, get_menu_choice, pause_and_continue
 
 
 def print_banner() -> None:
@@ -369,10 +332,8 @@ def run_modules_menu(modules: List[Dict[str, Any]]) -> None:
         print_banner()
         print_module_info(modules)
 
-        print(f"\n{Colors.BOLD}{Colors.BLUE}Выберите модуль (1-{len(modules)}) или 0 для возврата:{Colors.RESET} ", end="")
-
         try:
-            choice: str = input().strip()
+            choice: str = get_menu_choice("Выберите модуль", valid_range=(1, len(modules)), allow_zero=True, zero_action="назад")
 
             if choice == "0":
                 break
@@ -406,18 +367,15 @@ def run_modules_menu(modules: List[Dict[str, Any]]) -> None:
                         print(f"{Colors.CYAN}Заглушка модуля {module_info['name']}{Colors.RESET}")
                         print("Функциональность будет доступна в следующей версии.")
 
-                print(f"\n{Colors.CYAN}Нажмите Enter чтобы продолжить...{Colors.RESET}", end="")
-                input()
+                pause_and_continue("Нажмите Enter чтобы продолжить...")
 
             else:
                 print(f"{Colors.RED}❌ Неверный номер. Введите число от 0 до {len(modules)}{Colors.RESET}")
-                print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
-                input()
+                pause_and_continue("Нажмите Enter...")
 
         except ValueError:
             print(f"{Colors.RED}❌ Ошибка: введите число!{Colors.RESET}")
-            print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
-            input()
+            pause_and_continue("Нажмите Enter...")
         except KeyboardInterrupt:
             print(f"\n{Colors.YELLOW}⚠️  Возврат в главное меню{Colors.RESET}")
             break
@@ -437,10 +395,8 @@ def run_settings_menu() -> None:
         print_banner()
         print_settings_menu()
 
-        print(f"\n{Colors.BOLD}{Colors.BLUE}Выберите действие (0-4):{Colors.RESET} ", end="")
-
         try:
-            choice: str = input().strip()
+            choice: str = get_menu_choice("Выберите действие", valid_range=(1, 4), allow_zero=True, zero_action="назад")
 
             if choice == "0":
                 break
@@ -465,13 +421,11 @@ def run_settings_menu() -> None:
             else:
                 print(f"{Colors.RED}❌ Неверный номер{Colors.RESET}")
             
-            print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
-            input()
+            pause_and_continue("Нажмите Enter...")
             
         except ValueError:
             print(f"{Colors.RED}❌ Ошибка: введите число!{Colors.RESET}")
-            print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
-            input()
+            pause_and_continue("Нажмите Enter...")
         except KeyboardInterrupt:
             print(f"\n{Colors.YELLOW}⚠️  Возврат в главное меню{Colors.RESET}")
             break
@@ -542,10 +496,8 @@ def main() -> None:
     while True:
         print_main_menu()
         
-        print(f"\n{Colors.BOLD}{Colors.BLUE}Выберите действие (0-4):{Colors.RESET} ", end="")
-        
         try:
-            choice: str = input().strip()
+            choice: str = get_menu_choice("Выберите действие", valid_range=(1, 4), allow_zero=True, zero_action="выход")
 
             if choice == "0":
                 print(f"\n{Colors.GREEN}👋 Программа завершена. До свидания!{Colors.RESET}")
@@ -565,8 +517,7 @@ def main() -> None:
                 clear_screen()
                 print_banner()
                 print_help()
-                print(f"\n{Colors.CYAN}Нажмите Enter чтобы продолжить...{Colors.RESET}", end="")
-                input()
+                pause_and_continue("Нажмите Enter чтобы продолжить...")
                 clear_screen()
                 print_banner()
                 
@@ -576,15 +527,13 @@ def main() -> None:
                 
             else:
                 print(f"{Colors.RED}❌ Неверный номер. Введите число от 0 до 4{Colors.RESET}")
-                print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
-                input()
+                pause_and_continue("Нажмите Enter...")
                 clear_screen()
                 print_banner()
                 
         except ValueError:
             print(f"{Colors.RED}❌ Ошибка: введите число!{Colors.RESET}")
-            print(f"{Colors.CYAN}Нажмите Enter...{Colors.RESET}", end="")
-            input()
+            pause_and_continue("Нажмите Enter...")
             clear_screen()
             print_banner()
             
