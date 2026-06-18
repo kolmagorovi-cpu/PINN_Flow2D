@@ -84,11 +84,19 @@ class PINNSolver:
         self.memory_threshold_gb = config.get('process', {}).get('memory_threshold_gb', 0.5)
 
         # Загрузка данных
+        data_cfg = config.get('data', {})
+        pin_memory = data_cfg.get('pin_memory')
+        if pin_memory is None:
+            pin_memory = self.device.type == 'cuda'
         self.data_handler = DataHandler(
-            points_file=config['data']['points_file'],
+            points_file=data_cfg['points_file'],
             batch_size=config['training']['batch_size'],
             shuffle=True,
-            mesh_file=config['data'].get('mesh_file')
+            mesh_file=data_cfg.get('mesh_file'),
+            num_workers=data_cfg.get('num_workers', 0),
+            pin_memory=pin_memory,
+            persistent_workers=data_cfg.get('persistent_workers'),
+            prefetch_factor=data_cfg.get('prefetch_factor'),
         )
 
         # Константы PDE (нормированные)
@@ -140,6 +148,7 @@ class PINNSolver:
         self.model = self.model.to(self.device, self.dtype)
         if config['process'].get('num_gpus', 1) > 1 and torch.cuda.device_count() > 1:
             self.model = nn.DataParallel(self.model, device_ids=list(range(config['process']['num_gpus'])))
+        self.model = self._maybe_compile_model(self.model)
 
         # Оптимизатор и планировщик
         self.optimizer = self._init_optimizer(optim_type='adam')
@@ -323,6 +332,63 @@ class PINNSolver:
             coordinate_scaling=coord_scaling
         )
 
+    def _maybe_compile_model(self, model: nn.Module) -> nn.Module:
+        """Optionally compiles the model with torch.compile.
+
+        PINN training differentiates outputs with respect to inputs, so the
+        feature is opt-in and conservative by default.
+        """
+        proc = self.config.get('process', {})
+        if not bool(proc.get('torch_compile', False)):
+            return model
+
+        if not hasattr(torch, 'compile'):
+            logger.warning("torch_compile=True, но torch.compile недоступен в этой версии PyTorch.")
+            return model
+
+        if isinstance(model, nn.DataParallel):
+            logger.warning("torch_compile=True пропущен для nn.DataParallel; используйте num_gpus=1.")
+            return model
+
+        compile_kwargs = {
+            'fullgraph': bool(proc.get('torch_compile_fullgraph', False)),
+            'dynamic': proc.get('torch_compile_dynamic'),
+        }
+        mode = proc.get('torch_compile_mode')
+        if mode not in (None, '', 'default'):
+            compile_kwargs['mode'] = mode
+
+        try:
+            compiled_model = torch.compile(model, **compile_kwargs)
+        except Exception as exc:
+            logger.warning("Не удалось включить torch.compile: %s", exc)
+            return model
+
+        logger.info(
+            "Модель скомпилирована через torch.compile "
+            "(mode=%s, fullgraph=%s, dynamic=%s)",
+            mode or 'default',
+            compile_kwargs['fullgraph'],
+            compile_kwargs['dynamic'],
+        )
+        return compiled_model
+
+    @staticmethod
+    def _unwrap_model_for_state(model: nn.Module) -> nn.Module:
+        """Returns the underlying module for stable state_dict operations."""
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        return getattr(model, '_orig_mod', model)
+
+    @staticmethod
+    def _strip_state_prefix(
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str
+    ) -> Dict[str, torch.Tensor]:
+        if state_dict and all(k.startswith(prefix) for k in state_dict):
+            return {k[len(prefix):]: v for k, v in state_dict.items()}
+        return state_dict
+
     def _validate_physics_metadata(self) -> None:
         """Проверяет, что пользовательские input_params не маскируют старые metadata."""
         inp = self.config.get('input_params', {})
@@ -377,12 +443,12 @@ class PINNSolver:
         try:
             from fvm_residuals import FVMResiduals
             fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
+            fvm.to(self.device, dtype=self.dtype)
             inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
             inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
             fvm.set_inlet_velocity(
                 torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
             )
-            fvm.to(self.device)
             self.loss_computer.fvm = fvm
             logger.info("FVMResiduals подключён: %d узлов", fvm.N)
         except Exception as e:
@@ -471,13 +537,9 @@ class PINNSolver:
             # Загрузка модели (адаптация ключей для DataParallel)
             if 'model_state_dict' in checkpoint:
                 state_dict = checkpoint['model_state_dict']
-                if isinstance(self.model, nn.DataParallel):
-                    if all(not k.startswith('module.') for k in state_dict.keys()):
-                        state_dict = {'module.' + k: v for k, v in state_dict.items()}
-                else:
-                    if all(k.startswith('module.') for k in state_dict.keys()):
-                        state_dict = {k[7:]: v for k, v in state_dict.items()}
-                self.model.load_state_dict(state_dict)
+                state_dict = self._strip_state_prefix(state_dict, 'module.')
+                state_dict = self._strip_state_prefix(state_dict, '_orig_mod.')
+                self._unwrap_model_for_state(self.model).load_state_dict(state_dict)
                 logger.info("Модель загружена из чекпоинта")
 
             # Загрузка SA-весов
@@ -924,7 +986,7 @@ class PINNSolver:
         return self.stage2_pde_weight_start + ramp_progress * (self.stage2_pde_weight_end - self.stage2_pde_weight_start)
 
     def _capture_trainable_state(self) -> tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
-        base_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        base_model = self._unwrap_model_for_state(self.model)
         model_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
         sa_state = None
         if self.sa_weights is not None:
@@ -936,7 +998,7 @@ class PINNSolver:
         model_state: Dict[str, torch.Tensor],
         sa_state: Optional[Dict[str, torch.Tensor]]
     ) -> None:
-        base_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        base_model = self._unwrap_model_for_state(self.model)
         base_model.load_state_dict({k: v.to(self.device) for k, v in model_state.items()})
         if self.sa_weights is not None and sa_state is not None:
             self.sa_weights.load_state_dict({k: v.to(self.device) for k, v in sa_state.items()})

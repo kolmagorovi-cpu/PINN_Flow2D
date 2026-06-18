@@ -28,7 +28,11 @@ checkpoint:
 checkpoint_dir: Checkpoints
 data:
   mesh_file: Sampler\Data\mesh2d.npz
+  num_workers: 0
+  persistent_workers: null
+  pin_memory: null
   points_file: Initial\Data\initial.npy
+  prefetch_factor: 2
 diagnostics:
   compute_grad_cosine: false
   compute_ntk_condition: false
@@ -86,6 +90,7 @@ output:
   plot_frequency: 10
 pde:
   flow_type: 2d
+  pde_on_boundary: false
   system: incompressible_navier_stokes
 process:
   device: cuda
@@ -93,6 +98,10 @@ process:
   load_model_path: null
   num_gpus: 1
   seed: 42
+  torch_compile: false
+  torch_compile_dynamic: null
+  torch_compile_fullgraph: false
+  torch_compile_mode: null
   use_amp: false
 project_name: FVM7
 reference:

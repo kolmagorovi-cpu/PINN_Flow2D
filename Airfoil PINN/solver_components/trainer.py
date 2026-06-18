@@ -219,18 +219,23 @@ class Trainer:
         cont = res['cont']
         mom1 = res[self.loss_computer.pde_components[1]]
         mom2 = res[self.loss_computer.pde_components[2]]
-        self._update_pde_point_residual(idx, cont + mom1 + mom2)
+        pde_mask = self._pde_loss_mask(bt, cont)
+        pde_score = cont + mom1 + mom2
+        self._update_pde_point_residual(
+            idx,
+            torch.where(pde_mask, pde_score, torch.zeros_like(pde_score)),
+        )
 
         # Средние и максимальные значения для отчёта
         pde_raw = {
-            'cont': cont.mean().item(),
-            self.loss_computer.pde_components[1]: mom1.mean().item(),
-            self.loss_computer.pde_components[2]: mom2.mean().item()
+            'cont': self._masked_mean(cont, pde_mask).item(),
+            self.loss_computer.pde_components[1]: self._masked_mean(mom1, pde_mask).item(),
+            self.loss_computer.pde_components[2]: self._masked_mean(mom2, pde_mask).item()
         }
         pde_max = {
-            'cont': cont.max().item(),
-            self.loss_computer.pde_components[1]: mom1.max().item(),
-            self.loss_computer.pde_components[2]: mom2.max().item()
+            'cont': self._masked_max(cont, pde_mask).item(),
+            self.loss_computer.pde_components[1]: self._masked_max(mom1, pde_mask).item(),
+            self.loss_computer.pde_components[2]: self._masked_max(mom2, pde_mask).item()
         }
 
         # Взвешивание PDE с учётом SA-весов (если используются)
@@ -244,13 +249,13 @@ class Trainer:
             else:
                 w_pde = w
                 w_bc = None
-            loss_c = torch.mean(w_pde[:, 0] * cont)
-            loss_1 = torch.mean(w_pde[:, 1] * mom1)
-            loss_2 = torch.mean(w_pde[:, 2] * mom2)
+            loss_c = self._masked_mean(w_pde[:, 0].view(-1, 1) * cont, pde_mask)
+            loss_1 = self._masked_mean(w_pde[:, 1].view(-1, 1) * mom1, pde_mask)
+            loss_2 = self._masked_mean(w_pde[:, 2].view(-1, 1) * mom2, pde_mask)
         else:
-            loss_c = torch.mean(cont)
-            loss_1 = torch.mean(mom1)
-            loss_2 = torch.mean(mom2)
+            loss_c = self._masked_mean(cont, pde_mask)
+            loss_1 = self._masked_mean(mom1, pde_mask)
+            loss_2 = self._masked_mean(mom2, pde_mask)
             w_bc = None
 
         # PDE потеря с учётом весов из конфигурации
@@ -265,10 +270,12 @@ class Trainer:
             bc_comp, extra_grad = self.loss_computer.compute_bc_loss(u, v, p, bt, x, y)
             # Если SA-веса применяются к BC, используем только их; иначе — фиксированные веса
             if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
-                bc_loss = sum(
-                    torch.mean(w_bc[:, i] * bc_comp[name])
-                    for i, name in enumerate(self.data_handler.boundary_type_names)
-                    if name in bc_comp and self.loss_computer.loss_weights.get(name, 0.0) > 0
+                bc_loss = self._compute_sa_bc_loss(
+                    u=u,
+                    v=v,
+                    p=p,
+                    boundary_types=bt,
+                    w_bc=w_bc,
                 ) + extra_grad
             else:
                 bc_loss = sum(
@@ -321,6 +328,14 @@ class Trainer:
                 x_fvm, y_fvm, sdf_fvm, bt_fvm = self._get_fvm_tensors()
                 inp_fvm  = self.loss_computer.build_input_tensor(x_fvm, y_fvm, sdf_fvm, bt_fvm)
                 out_fvm  = self.model(inp_fvm)
+                if self.loss_computer.bc_type == 'hard' and bt_fvm is not None:
+                    u_fvm, v_fvm, p_fvm = self._apply_hard_constraints_from_boundary_types(
+                        out_fvm[:, 0:1],
+                        out_fvm[:, 1:2],
+                        out_fvm[:, 2:3],
+                        bt_fvm,
+                    )
+                    out_fvm = torch.cat([u_fvm, v_fvm, p_fvm], dim=1)
             else:
                 logger.warning("FVM/integral: fvm-тензоры не подготовлены, глобальный сеточный проход пропущен.")
 
@@ -377,6 +392,123 @@ class Trainer:
             'y': y.detach(),
             'idx': idx.cpu()
         }
+
+    def _pde_loss_mask(
+        self,
+        boundary_types: Optional[torch.Tensor],
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Возвращает mask точек, участвующих в PDE-loss."""
+        if getattr(self.loss_computer, 'pde_on_boundary', False) or boundary_types is None:
+            return torch.ones_like(reference, dtype=torch.bool)
+
+        interior_idx = getattr(self.data_handler.dataset, 'type_to_idx', {}).get('interior')
+        if interior_idx is None or interior_idx >= boundary_types.shape[1]:
+            return torch.ones_like(reference, dtype=torch.bool)
+
+        mask = boundary_types[:, interior_idx].view(-1, 1) > 0.5
+        if not bool(mask.any()):
+            logger.warning("PDE-loss mask пустая: fallback на весь batch.")
+            return torch.ones_like(reference, dtype=torch.bool)
+        return mask
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Среднее по mask с защитой от пустой маски."""
+        if mask is None or mask.shape != values.shape:
+            return values.mean()
+        if not bool(mask.any()):
+            return values.mean()
+        return values[mask].mean()
+
+    @staticmethod
+    def _masked_max(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Максимум по mask с защитой от пустой маски."""
+        if mask is None or mask.shape != values.shape:
+            return values.max()
+        if not bool(mask.any()):
+            return values.max()
+        return values[mask].max()
+
+    def _compute_sa_bc_loss(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        p: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+        w_bc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pointwise BC-loss с self-adaptive весами по активным boundary-точкам."""
+        if boundary_types is None or boundary_types.shape[1] == 0:
+            return torch.zeros((), device=self.device, dtype=self.dtype)
+
+        terms = []
+        for i, name in enumerate(self.data_handler.boundary_type_names):
+            if i >= boundary_types.shape[1] or i >= w_bc.shape[1]:
+                continue
+            if self.loss_computer.loss_weights.get(name, 0.0) <= 0.0:
+                continue
+
+            mask = boundary_types[:, i].view(-1, 1) > 0.5
+            if not bool(mask.any()):
+                continue
+
+            if name == 'inlet':
+                point_loss = (
+                    (u - self.data_handler.inlet_u_norm) ** 2
+                    + (v - self.data_handler.inlet_v_norm) ** 2
+                )
+            elif name == 'outlet':
+                point_loss = p ** 2
+            elif name == 'wall':
+                point_loss = u ** 2 + v ** 2
+            elif name == 'symmetry':
+                point_loss = v ** 2
+            elif name == 'axis_symmetry':
+                point_loss = u ** 2
+            else:
+                continue
+
+            weighted = point_loss * w_bc[:, i].view(-1, 1)
+            terms.append(weighted[mask].mean())
+
+        if not terms:
+            return torch.zeros((), device=self.device, dtype=self.dtype)
+        return torch.stack(terms).sum()
+
+    def _apply_hard_constraints_from_boundary_types(
+        self,
+        u_raw: torch.Tensor,
+        v_raw: torch.Tensor,
+        p_raw: torch.Tensor,
+        boundary_types: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Применяет hard constraints к произвольному набору точек по one-hot ГУ."""
+        u = u_raw
+        v = v_raw
+        p = p_raw
+
+        for idx, name in enumerate(self.data_handler.boundary_type_names):
+            if idx >= boundary_types.shape[1]:
+                continue
+            mask = boundary_types[:, idx].view(-1, 1) > 0.5
+            if not bool(mask.any()):
+                continue
+
+            if name == 'inlet':
+                u = torch.where(mask, torch.ones_like(u) * self.data_handler.inlet_u_norm, u)
+                v = torch.where(mask, torch.ones_like(v) * self.data_handler.inlet_v_norm, v)
+            elif name == 'outlet':
+                p = torch.where(mask, torch.zeros_like(p), p)
+            elif name == 'wall':
+                u = torch.where(mask, torch.zeros_like(u), u)
+                v = torch.where(mask, torch.zeros_like(v), v)
+            elif name == 'symmetry':
+                v = torch.where(mask, torch.zeros_like(v), v)
+            elif name == 'axis_symmetry':
+                u = torch.where(mask, torch.zeros_like(u), u)
+
+        return u, v, p
 
     def _compute_rar_point_score(
         self,
@@ -1003,6 +1135,7 @@ class Trainer:
         wall_tree = self._build_wall_tree(coords, ds)
         accepted: List[np.ndarray] = []
         accepted_sdf: List[float] = []
+        accepted_arr = np.empty((0, 2), dtype=np.float64)
         max_attempts = max(n_points * self.rar_candidate_multiplier * 20, n_points)
         attempts = 0
 
@@ -1022,27 +1155,50 @@ class Trainer:
             cand = cand[valid]
             src = src[valid]
 
-            for xy, src_i in zip(cand, src):
-                if len(accepted) >= n_points:
-                    break
-                min_dist = self.rar_min_distance_factor * local_h[src_i]
-                if float(existing_tree.query(xy, k=1)[0]) < min_dist:
+            min_dist = self.rar_min_distance_factor * local_h[src]
+            dist_existing, _ = existing_tree.query(cand, k=1, workers=-1)
+            valid = dist_existing >= min_dist
+            if not np.any(valid):
+                continue
+            cand = cand[valid]
+            min_dist = min_dist[valid]
+
+            if len(accepted_arr) > 0:
+                dist_accepted, _ = cKDTree(accepted_arr).query(cand, k=1, workers=-1)
+                valid = dist_accepted >= min_dist
+                if not np.any(valid):
                     continue
-                if accepted:
-                    acc_arr = np.vstack(accepted)
-                    if float(np.linalg.norm(acc_arr - xy, axis=1).min()) < min_dist:
-                        continue
+                cand = cand[valid]
+                min_dist = min_dist[valid]
 
-                if wall_tree is not None:
-                    sdf = float(wall_tree.query(xy, k=1)[0])
-                    min_sdf = self.rar_min_boundary_distance_factor * median_h
-                    if sdf < min_sdf:
-                        continue
-                else:
-                    sdf = 0.0
+            if wall_tree is not None:
+                sdf_vals, _ = wall_tree.query(cand, k=1, workers=-1)
+                min_sdf = self.rar_min_boundary_distance_factor * median_h
+                valid = sdf_vals >= min_sdf
+                if not np.any(valid):
+                    continue
+                cand = cand[valid]
+                min_dist = min_dist[valid]
+                sdf_vals = sdf_vals[valid]
+            else:
+                sdf_vals = np.zeros(len(cand), dtype=np.float64)
 
-                accepted.append(np.asarray(xy, dtype=np.float64))
-                accepted_sdf.append(sdf)
+            batch_pts: List[np.ndarray] = []
+            batch_sdf: List[float] = []
+            for xy, sdf, d_min in zip(cand, sdf_vals, min_dist):
+                if len(accepted) + len(batch_pts) >= n_points:
+                    break
+                if batch_pts:
+                    batch_arr = np.asarray(batch_pts, dtype=np.float64)
+                    if float(np.linalg.norm(batch_arr - xy, axis=1).min()) < float(d_min):
+                        continue
+                batch_pts.append(np.asarray(xy, dtype=np.float64))
+                batch_sdf.append(float(sdf))
+
+            if batch_pts:
+                accepted.extend(batch_pts)
+                accepted_sdf.extend(batch_sdf)
+                accepted_arr = np.vstack([accepted_arr, np.asarray(batch_pts, dtype=np.float64)])
 
         if not accepted:
             logger.warning("Adaptive RAR: не удалось сгенерировать допустимые новые точки.")
@@ -1086,6 +1242,9 @@ class Trainer:
         valid = np.isfinite(xy).all(axis=1)
         if domain_norm is not None and len(domain_norm) >= 3:
             try:
+                from matplotlib.path import Path
+                valid &= Path(domain_norm).contains_points(xy)
+            except Exception:
                 from shapely.geometry import Point, Polygon
                 domain_poly = Polygon(domain_norm)
                 if not domain_poly.is_valid:
@@ -1094,12 +1253,12 @@ class Trainer:
                     [domain_poly.contains(Point(float(p[0]), float(p[1]))) for p in xy],
                     dtype=bool,
                 )
-            except Exception:
-                from matplotlib.path import Path
-                valid &= Path(domain_norm).contains_points(xy)
 
         if foil_norm is not None and len(foil_norm) >= 4 and np.allclose(foil_norm[0], foil_norm[-1]):
             try:
+                from matplotlib.path import Path
+                valid &= ~Path(foil_norm).contains_points(xy)
+            except Exception:
                 from shapely.geometry import Point, Polygon
                 foil_poly = Polygon(foil_norm)
                 if not foil_poly.is_valid:
@@ -1108,9 +1267,6 @@ class Trainer:
                     [foil_poly.contains(Point(float(p[0]), float(p[1]))) for p in xy],
                     dtype=bool,
                 )
-            except Exception:
-                from matplotlib.path import Path
-                valid &= ~Path(foil_norm).contains_points(xy)
         return valid
 
     def _maybe_rebuild_fvm_after_rar(self) -> None:
@@ -1299,18 +1455,15 @@ class Trainer:
         """
         Возвращает индексы batch-ей, где запускается полный FVM-проход.
 
-        batch_interval остаётся пользовательской настройкой, но каждый запуск
-        потом масштабируется так, чтобы суммарный FVM-вклад за эпоху не
-        становился в n_batches раз больше заданного веса.
+        batch_interval задаётся пользователем в one-based терминах:
+        1 — каждый batch, 5 — batch 5, 10, 15, ...
+        Каждый запуск потом масштабируется так, чтобы суммарный FVM-вклад за
+        эпоху не становился больше заданного веса только из-за частоты запусков.
         """
         if not enabled or n_batches <= 0:
             return set()
         interval = max(1, int(self.fvm_batch_interval))
-        if interval <= 1:
-            return {n_batches - 1}
-        indices = set(range(interval - 1, n_batches, interval))
-        indices.add(n_batches - 1)
-        return indices
+        return set(range(interval - 1, n_batches, interval))
 
     # ------------------------------------------------------------------
     # Шаг обучения (Adam)

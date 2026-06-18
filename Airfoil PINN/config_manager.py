@@ -62,6 +62,7 @@ class ConfigManager:
             'pde': {
                 'system': 'incompressible_navier_stokes',
                 'flow_type': '2d',
+                'pde_on_boundary': False,
             },
             'boundary_conditions': {
                 'type': 'soft',
@@ -153,11 +154,19 @@ class ConfigManager:
                 'num_gpus': 1,
                 'dtype': 'float32',
                 'use_amp': False,
+                'torch_compile': False,
+                'torch_compile_mode': None,
+                'torch_compile_fullgraph': False,
+                'torch_compile_dynamic': None,
                 'seed': 42,
             },
             'data': {
                 'points_file': None,
                 'mesh_file': 'Sampler\\Data\\mesh2d.npz',
+                'num_workers': 0,
+                'pin_memory': None,
+                'persistent_workers': None,
+                'prefetch_factor': 2,
             },
             'reference': {
                 'path': None,
@@ -275,6 +284,12 @@ class ConfigManager:
 
         data = self.config['data']
         print(f"Файл точек: {data.get('points_file', 'не указан')}")
+        print(f"FVM-сетка : {data.get('mesh_file', 'не указана')}")
+        print(
+            f"DataLoader: workers={data.get('num_workers', 0)}, "
+            f"pin_memory={data.get('pin_memory', None)}, "
+            f"prefetch={data.get('prefetch_factor', 2)}"
+        )
         print()
 
         print("ВХОДНЫЕ ПАРАМЕТРЫ:")
@@ -372,6 +387,7 @@ class ConfigManager:
         print(f"  num_gpus       : {proc['num_gpus']}")
         print(f"  dtype          : {proc['dtype']}")
         print(f"  use_amp        : {proc['use_amp']}")
+        print(f"  torch_compile  : {proc.get('torch_compile', False)}")
         print(f"  seed           : {proc.get('seed', 42)}")
         print()
 

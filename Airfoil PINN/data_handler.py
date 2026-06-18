@@ -258,7 +258,7 @@ class PINNDataset(Dataset):
         self.source_indices = torch.arange(self.n_points, dtype=torch.long)
         logger.info(f"Типы границ в данных: {self.boundary_type_names}")
         if 'inlet' in self.boundary_type_names:
-            logger.warning(
+            logger.debug(
                 "inlet-точки загружены: маски mask_u_fixed/mask_v_fixed выставлены, "
                 "но u_bc/v_bc = 0 до вызова DataHandler.set_inlet_values(). "
                 "Убедитесь, что DataHandler вызывает set_inlet_values() после загрузки метаданных."
@@ -384,6 +384,10 @@ class DataHandler:
         batch_size: int,
         shuffle: bool = True,
         mesh_file: Optional[str] = None,
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        persistent_workers: Optional[bool] = None,
+        prefetch_factor: Optional[int] = None,
     ) -> None:
         """
         Инициализирует обработчик данных.
@@ -394,10 +398,26 @@ class DataHandler:
             shuffle: Перемешивать ли данные
             mesh_file: Путь к файлу FVM-сетки (.npz от mesh2d).
                        Если None — сетка не загружается.
+            num_workers: число worker-процессов DataLoader.
+            pin_memory: закреплять CPU-память для ускорения копирования на CUDA.
+            persistent_workers: держать worker'ы между эпохами.
+            prefetch_factor: число заранее подготовленных batch на worker.
         """
         self.points_file = points_file
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.num_workers = max(0, int(num_workers))
+        self.pin_memory = bool(pin_memory)
+        self.persistent_workers = (
+            bool(persistent_workers)
+            if persistent_workers is not None
+            else self.num_workers > 0
+        )
+        self.prefetch_factor = (
+            max(1, int(prefetch_factor))
+            if prefetch_factor is not None
+            else 2
+        )
         self.mesh_data: Optional[MeshData] = None
         self.mesh_file = mesh_file
         self.mesh_domain_coords: Optional[np.ndarray] = None
@@ -409,10 +429,28 @@ class DataHandler:
         self.load_mesh_geometry_from_geom_config()
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
-        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
+        self.dataloader = self._make_dataloader(self.dataset, batch_size=batch_size, shuffle=shuffle)
 
         if mesh_file is not None:
             self.load_mesh(mesh_file)
+
+    def _make_dataloader(
+        self,
+        dataset,
+        batch_size: Optional[int] = None,
+        shuffle: bool = False,
+    ) -> DataLoader:
+        """Создаёт DataLoader с едиными настройками multiprocessing/pinned memory."""
+        kwargs = {
+            'batch_size': batch_size or self.batch_size,
+            'shuffle': shuffle,
+            'num_workers': self.num_workers,
+            'pin_memory': self.pin_memory,
+        }
+        if self.num_workers > 0:
+            kwargs['persistent_workers'] = self.persistent_workers
+            kwargs['prefetch_factor'] = self.prefetch_factor
+        return DataLoader(dataset, **kwargs)
 
     def load_metadata(self) -> None:
         """
@@ -754,10 +792,10 @@ class DataHandler:
         Порядок элементов совпадает с порядком тензоров датасета, поэтому результаты
         можно безопасно индексировать масками из self.dataset.
         """
-        return DataLoader(
+        return self._make_dataloader(
             self.dataset,
             batch_size=batch_size or self.batch_size,
-            shuffle=False
+            shuffle=False,
         )
 
     def get_boundary_eval_dataloader(
@@ -772,7 +810,11 @@ class DataHandler:
         прохода по внутренним точкам датасета.
         """
         if self.dataset.boundary_types is None or not self.boundary_type_names:
-            return DataLoader(Subset(self.dataset, []), batch_size=batch_size or self.batch_size)
+            return self._make_dataloader(
+                Subset(self.dataset, []),
+                batch_size=batch_size or self.batch_size,
+                shuffle=False,
+            )
 
         mask = torch.zeros(self.n_points, dtype=torch.bool)
         for name in type_names:
@@ -781,10 +823,10 @@ class DataHandler:
                 mask |= self.dataset.boundary_types[:, idx] > 0.5
 
         indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
-        return DataLoader(
+        return self._make_dataloader(
             Subset(self.dataset, indices),
             batch_size=batch_size or self.batch_size,
-            shuffle=False
+            shuffle=False,
         )
 
     @property
@@ -815,7 +857,7 @@ class DataHandler:
             indices: Индексы точек для добавления
         """
         self.dataset = self.dataset.extend(indices)
-        self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
+        self.dataloader = self._make_dataloader(self.dataset, shuffle=self.shuffle)
         logger.info(f"Датасет расширен: добавлено {len(indices)} точек, всего {self.n_points}")
 
     def add_interior_points(
@@ -890,7 +932,7 @@ class DataHandler:
         )
         ds.n_points = old_n + n_new
 
-        self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
+        self.dataloader = self._make_dataloader(self.dataset, shuffle=self.shuffle)
         logger.info("Adaptive RAR: добавлено %d новых interior-точек, всего %d", n_new, self.n_points)
         return n_new
 
@@ -977,7 +1019,7 @@ class DataHandler:
                 if hasattr(self, attr):
                     delattr(self, attr)
 
-        self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
+        self.dataloader = self._make_dataloader(self.dataset, shuffle=self.shuffle)
         logger.info("DataHandler восстановлен из чекпоинта: %d точек", self.n_points)
 
     # ------------------------------------------------------------------

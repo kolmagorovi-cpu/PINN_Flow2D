@@ -37,6 +37,13 @@ class CheckpointManager:
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
 
+    @staticmethod
+    def _unwrap_model(model: nn.Module) -> nn.Module:
+        """Returns the real model behind DataParallel or torch.compile wrappers."""
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        return getattr(model, '_orig_mod', model)
+
     def save(self,
              filename: str,
              model: nn.Module,
@@ -62,12 +69,8 @@ class CheckpointManager:
             epoch: номер эпохи
             config: полная конфигурация проекта
         """
-        # Извлекаем базовую модель, если используется DataParallel
-        if isinstance(model, nn.DataParallel):
-            base_model = model.module
-        else:
-            base_model = model
-
+        # Извлекаем базовую модель, если используются DataParallel/torch.compile
+        base_model = self._unwrap_model(model)
         state_dict = base_model.state_dict()
         checkpoint = {
             'model_state_dict': state_dict,

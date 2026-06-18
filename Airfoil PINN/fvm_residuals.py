@@ -77,6 +77,7 @@ class FVMResiduals:
 
     def __init__(self, mesh) -> None:
         self._device = torch.device('cpu')
+        self._dtype = torch.float64
         self._build_from_mesh(mesh)
 
     # ── Инициализация ─────────────────────────────────────────────────────────
@@ -92,7 +93,7 @@ class FVMResiduals:
         self.M = len(ei)
         self.B = len(bn)
 
-        self.V = torch.tensor(np.asarray(cv, dtype=np.float32), dtype=torch.float32)
+        self.V = torch.tensor(np.asarray(cv, dtype=np.float64), dtype=self._dtype)
         n_bad = int((self.V <= 0).sum())
         if n_bad:
             logger.warning(
@@ -104,11 +105,11 @@ class FVMResiduals:
 
         self.edge_i = torch.tensor(np.asarray(ei, dtype=np.int64),    dtype=torch.long)
         self.edge_j = torch.tensor(np.asarray(ej, dtype=np.int64),    dtype=torch.long)
-        self.edge_S = torch.tensor(np.asarray(eS, dtype=np.float32).reshape(-1, 2),
-                                   dtype=torch.float32)
+        self.edge_S = torch.tensor(np.asarray(eS, dtype=np.float64).reshape(-1, 2),
+                                   dtype=self._dtype)
         self.bnd_node = torch.tensor(np.asarray(bn, dtype=np.int64),  dtype=torch.long)
-        self.bnd_S    = torch.tensor(np.asarray(bS, dtype=np.float32).reshape(-1, 2),
-                                     dtype=torch.float32)
+        self.bnd_S    = torch.tensor(np.asarray(bS, dtype=np.float64).reshape(-1, 2),
+                                     dtype=self._dtype)
         bnd_codes = np.fromiter(
             (BC_CODES.get(str(t).lower(), BC_CODES['interior']) for t in bt_strs),
             dtype=np.int64, count=self.B,
@@ -118,7 +119,7 @@ class FVMResiduals:
         # Предписанные скорости на гранях (hard BC).
         # По умолчанию — мягкое условие (u_face = u_узла из нейросети).
         # Заполняются через set_bc_velocity() / set_inlet_velocity().
-        self._u_prescribed    = torch.zeros(self.B, 2, dtype=torch.float32)
+        self._u_prescribed    = torch.zeros(self.B, 2, dtype=self._dtype)
         self._prescribed_mask = torch.zeros(self.B, 1, dtype=torch.bool)
 
         # Маска граней с нулевым нормальным потоком: wall (no-slip) и
@@ -135,6 +136,52 @@ class FVMResiduals:
 
         logger.info("FVMResiduals: N=%d, M=%d, B=%d", self.N, self.M, self.B)
 
+    def _validate_velocity(self, u: torch.Tensor) -> None:
+        """Проверяет скорость перед FVM-операциями, чтобы ошибки были явными."""
+        if not torch.is_tensor(u):
+            raise TypeError("FVMResiduals.compute_residual: u должен быть torch.Tensor")
+        if u.ndim != 2 or u.shape != (self.N, 2):
+            raise ValueError(
+                "FVMResiduals.compute_residual: u должен иметь форму "
+                f"({self.N}, 2), получено {tuple(u.shape)}"
+            )
+        if u.device != self._device:
+            raise ValueError(
+                "FVMResiduals.compute_residual: device u не совпадает с геометрией "
+                f"({u.device} != {self._device}). Вызовите fvm.to(u.device, u.dtype)."
+            )
+        if u.dtype != self._dtype:
+            raise ValueError(
+                "FVMResiduals.compute_residual: dtype u не совпадает с геометрией "
+                f"({u.dtype} != {self._dtype}). Вызовите fvm.to(u.device, u.dtype)."
+            )
+
+    def _compute_residual(self, u: torch.Tensor, apply_boundary_conditions: bool) -> torch.Tensor:
+        """Внутренняя реализация FVM-невязки с опциональным применением BC."""
+        self._validate_velocity(u)
+        res = u.new_zeros(self.N)
+
+        if self.M > 0:
+            u_i = u[self.edge_i]
+            u_j = u[self.edge_j]
+            u_face = 0.5 * (u_i + u_j)
+            flux = (u_face * self.edge_S).sum(dim=1)
+
+            res = res.index_add(0, self.edge_i, flux)
+            res = res.index_add(0, self.edge_j, -flux)
+
+        if self.B > 0:
+            u_b = u[self.bnd_node]
+            if apply_boundary_conditions:
+                u_face_b = torch.where(self._prescribed_mask, self._u_prescribed, u_b)
+                u_face_b = u_face_b.masked_fill(self._zero_flux_mask, 0.0)
+            else:
+                u_face_b = u_b
+            flux_b = (u_face_b * self.bnd_S).sum(dim=1)
+            res = res.index_add(0, self.bnd_node, flux_b)
+
+        return res / self.V
+
     @staticmethod
     def _extract_mesh2d(mesh) -> Tuple:
         """Извлекает массивы из объекта Mesh2D."""
@@ -144,20 +191,20 @@ class FVMResiduals:
         if ifaces:
             ei = np.array([f.node_i      for f in ifaces], dtype=np.int64)
             ej = np.array([f.node_j      for f in ifaces], dtype=np.int64)
-            eS = np.array([f.area_vector for f in ifaces], dtype=np.float32)
+            eS = np.array([f.area_vector for f in ifaces], dtype=np.float64)
         else:
             ei = np.empty(0, dtype=np.int64)
             ej = np.empty(0, dtype=np.int64)
-            eS = np.empty((0, 2), dtype=np.float32)
+            eS = np.empty((0, 2), dtype=np.float64)
 
         bfaces = mesh.boundary_faces
         if bfaces:
             bn      = np.array([f.node         for f in bfaces], dtype=np.int64)
-            bS      = np.array([f.area_vector  for f in bfaces], dtype=np.float32)
+            bS      = np.array([f.area_vector  for f in bfaces], dtype=np.float64)
             bt_strs = [f.boundary_type for f in bfaces]
         else:
             bn      = np.empty(0, dtype=np.int64)
-            bS      = np.empty((0, 2), dtype=np.float32)
+            bS      = np.empty((0, 2), dtype=np.float64)
             bt_strs = []
 
         return cv, ei, ej, eS, bn, bS, bt_strs
@@ -169,9 +216,9 @@ class FVMResiduals:
             md.cv_volumes,
             md.int_face_node_i.astype(np.int64),
             md.int_face_node_j.astype(np.int64),
-            md.int_face_area.astype(np.float32),
+            md.int_face_area.astype(np.float64),
             md.bnd_face_node.astype(np.int64),
-            md.bnd_face_area.astype(np.float32),
+            md.bnd_face_area.astype(np.float64),
             list(md.bnd_face_type.astype(str)),
         )
 
@@ -197,45 +244,7 @@ class FVMResiduals:
         Возвращает:
             R: тензор невязок (N,), [с⁻¹]
         """
-        res = u.new_zeros(self.N)
-
-        # ── Внутренние грани (векторизовано по всем M граням) ─────────────────
-        if self.M > 0:
-            u_i   = u[self.edge_i]                                # (M, 2)
-            u_j   = u[self.edge_j]                                # (M, 2)
-
-            # Центральная схема: u_face = 0.5*(u_i + u_j).
-            # Для уравнения неразрывности (∇·u = 0) центральная схема
-            # корректна физически и полностью дифференцируема — в отличие от
-            # upwind, она не создаёт разрывов в графе вычислений при смене
-            # знака потока, что критично для устойчивости градиентного спуска.
-            u_face = 0.5 * (u_i + u_j)                           # (M, 2)
-            flux   = (u_face * self.edge_S).sum(dim=1)            # (M,)
-
-            # Аккумулирование: +flux для i, −flux для j
-            res = res.index_add(0, self.edge_i,  flux)
-            res = res.index_add(0, self.edge_j, -flux)
-
-        # ── Граничные грани ───────────────────────────────────────────────────
-        if self.B > 0:
-            u_b = u[self.bnd_node]                                # (B, 2)
-
-            # Prescribed BC: заменяет u_b там, где _prescribed_mask = True
-            # (например, заданный профиль скорости на inlet).
-            u_face_b = torch.where(
-                self._prescribed_mask,
-                self._u_prescribed.to(u.dtype),
-                u_b,
-            )
-            # Wall (no-slip) и symmetry/axis_symmetry (u·n = 0): нулевой поток.
-            # Перекрывает prescribed BC — симметрийная грань не может быть inlet.
-            u_face_b  = u_face_b.masked_fill(self._zero_flux_mask, 0.0)
-            flux_b    = (u_face_b * self.bnd_S).sum(dim=1)       # (B,)
-
-            res = res.index_add(0, self.bnd_node, flux_b)
-
-        # ── Нормировка на объём КО ────────────────────────────────────────────
-        return res / self.V.to(u.dtype)
+        return self._compute_residual(u, apply_boundary_conditions=True)
 
     def mass_loss(self, u: torch.Tensor) -> torch.Tensor:
         """
@@ -253,16 +262,41 @@ class FVMResiduals:
 
     # ── Вспомогательные методы ────────────────────────────────────────────────
 
+    def check_geometry_conservativity(self, tol: float = 1e-8) -> bool:
+        """
+        Проверяет замыкание векторов площадей для каждого контрольного объёма.
+
+        Этот тест не использует скорости и не применяет физические граничные
+        условия. Он отвечает только на вопрос: сумма всех outward-векторов S
+        вокруг каждого CV равна нулю?
+        """
+        flux_sum = torch.zeros(self.N, 2, device=self._device, dtype=self._dtype)
+        if self.M > 0:
+            flux_sum = flux_sum.index_add(0, self.edge_i, self.edge_S)
+            flux_sum = flux_sum.index_add(0, self.edge_j, -self.edge_S)
+        if self.B > 0:
+            flux_sum = flux_sum.index_add(0, self.bnd_node, self.bnd_S)
+
+        max_norm = float(flux_sum.norm(dim=1).max()) if self.N else 0.0
+        ok = max_norm < tol
+        (logger.info if ok else logger.warning)(
+            "FVMResiduals geometry conservativity %s: max||sum(S)||=%.3e (tol=%.3e)",
+            "OK" if ok else "FAIL", max_norm, tol,
+        )
+        return ok
+
     def check_conservativity(
         self,
         u_const: Optional[torch.Tensor] = None,
         tol: float = 1e-6,
     ) -> bool:
         """
-        Верификация геометрии: для постоянного поля max|R_i| должен быть ≈ 0.
+        Верификация геометрии через постоянное поле скорости.
 
-        Если mesh._verify_conservativity() прошла успешно, этот тест тоже
-        должен проходить (R_i = (1/V_i) u·(Σ S_ij) = 0).
+        Физические BC намеренно не применяются: wall/symmetry/inlet меняют
+        постоянное поле и превращают геометрическую проверку в проверку
+        постановки ГУ. Для проверки рабочей FVM-невязки используйте
+        compute_residual().
 
         Аргументы:
             u_const: тестовое поле (N, 2); None → однородный поток (1, 0)
@@ -272,10 +306,12 @@ class FVMResiduals:
             True если max|R_i| < tol
         """
         if u_const is None:
-            u_const = torch.ones(self.N, 2, dtype=torch.float32, device=self._device)
+            u_const = torch.ones(self.N, 2, dtype=self._dtype, device=self._device)
+        else:
+            u_const = u_const.to(device=self._device, dtype=self._dtype)
 
         with torch.no_grad():
-            R = self.compute_residual(u_const)
+            R = self._compute_residual(u_const, apply_boundary_conditions=False)
 
         max_res = float(R.abs().max())
         ok = max_res < tol
@@ -351,7 +387,7 @@ class FVMResiduals:
             logger.warning("set_bc_velocity: нет граней типа '%s'", boundary_type)
             return self
 
-        u_bc = u_bc.detach().to(device=self._device, dtype=torch.float32)
+        u_bc = u_bc.detach().to(device=self._device, dtype=self._dtype)
 
         if u_bc.dim() == 1 and u_bc.shape[0] == 2:
             self._u_prescribed[type_mask] = u_bc.unsqueeze(0).expand(n_faces, 2)
@@ -413,19 +449,27 @@ class FVMResiduals:
 
     # ── Управление устройством ────────────────────────────────────────────────
 
-    def to(self, device: Union[str, torch.device]) -> "FVMResiduals":
+    def to(
+        self,
+        device: Union[str, torch.device],
+        dtype: Optional[torch.dtype] = None,
+    ) -> "FVMResiduals":
         """
-        Переносит все геометрические тензоры на device.
+        Переносит все геометрические тензоры на device и, опционально, dtype.
 
         Возвращает self для цепочки вызовов:
-            fvm = FVMResiduals(mesh).to('cuda')
+            fvm = FVMResiduals(mesh).to('cuda', torch.float32)
         """
         self._device = torch.device(device)
-        for attr in ('V', 'edge_i', 'edge_j', 'edge_S',
-                     'bnd_node', 'bnd_S', 'bnd_type',
-                     '_u_prescribed', '_prescribed_mask',
-                     '_zero_flux_mask'):
-            setattr(self, attr, getattr(self, attr).to(self._device))
+        if dtype is not None:
+            self._dtype = dtype
+
+        for attr in ('V', 'edge_S', 'bnd_S', '_u_prescribed'):
+            setattr(self, attr, getattr(self, attr).to(device=self._device, dtype=self._dtype))
+        for attr in ('edge_i', 'edge_j', 'bnd_node', 'bnd_type'):
+            setattr(self, attr, getattr(self, attr).to(device=self._device))
+        for attr in ('_prescribed_mask', '_zero_flux_mask'):
+            setattr(self, attr, getattr(self, attr).to(device=self._device))
         return self
 
     def rebuild_from_mesh(self, new_mesh) -> None:
@@ -437,8 +481,9 @@ class FVMResiduals:
             new_mesh: Mesh2D или MeshData с обновлённой геометрией
         """
         device = self._device
+        dtype = self._dtype
         self._build_from_mesh(new_mesh)
-        self.to(device)
+        self.to(device, dtype=dtype)
         logger.info("FVMResiduals перестроен: N=%d, M=%d, B=%d", self.N, self.M, self.B)
 
     # ── Фабрики ───────────────────────────────────────────────────────────────

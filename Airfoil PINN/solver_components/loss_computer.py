@@ -65,6 +65,7 @@ class LossComputer:
         # Параметры из конфигурации
         self.flow_type = config['pde']['flow_type']
         self.pde_system = config['pde'].get('system', 'incompressible_navier_stokes')
+        self.pde_on_boundary = bool(config['pde'].get('pde_on_boundary', False))
         self.bc_type = config['boundary_conditions']['type']  # 'soft' или 'hard'
         self.pde_components = self._setup_pde_components()
 

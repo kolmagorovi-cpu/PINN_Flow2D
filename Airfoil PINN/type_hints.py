@@ -382,6 +382,7 @@ class PDEConfigDict(TypedDict, total=False):
     """Конфигурация уравнений в частных производных."""
     system: str
     flow_type: str
+    pde_on_boundary: bool
 
 
 class BoundaryConditionsConfigDict(TypedDict, total=False):
@@ -464,12 +465,21 @@ class ProcessConfigDict(TypedDict, total=False):
     num_gpus: int
     dtype: str
     use_amp: bool
+    torch_compile: bool
+    torch_compile_mode: Optional[str]
+    torch_compile_fullgraph: bool
+    torch_compile_dynamic: Optional[bool]
     seed: int
 
 
 class DataConfigDict(TypedDict, total=False):
     """Конфигурация данных."""
     points_file: Optional[str]
+    mesh_file: Optional[str]
+    num_workers: int
+    pin_memory: Optional[bool]
+    persistent_workers: Optional[bool]
+    prefetch_factor: int
 
 
 class ReferenceConfigDict(TypedDict, total=False):
