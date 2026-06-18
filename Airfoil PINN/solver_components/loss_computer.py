@@ -44,7 +44,7 @@ class LossComputer:
         y_max: float,
         device: torch.device,
         dtype: torch.dtype
-    ):
+    ) -> None:
         """
         Args:
             config: полная конфигурация (словарь)
@@ -68,6 +68,9 @@ class LossComputer:
         self.pde_on_boundary = bool(config['pde'].get('pde_on_boundary', False))
         self.bc_type = config['boundary_conditions']['type']  # 'soft' или 'hard'
         self.pde_components = self._setup_pde_components()
+        self.strict_autograd = bool(
+            config.get('diagnostics', {}).get('strict_autograd', True)
+        )
 
         # Веса потерь
         lw = config['loss_weights']
@@ -121,6 +124,22 @@ class LossComputer:
         self.eps_axi = 1e-12
         self.two_pi = 2.0 * torch.pi
 
+    def _grad(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        create_graph: bool = True,
+        silent: bool = False,
+    ) -> torch.Tensor:
+        """Вычисляет dy/dx с учетом diagnostics.strict_autograd."""
+        return safe_grad(
+            y,
+            x,
+            create_graph=create_graph,
+            silent=silent,
+            strict=self.strict_autograd,
+        )
+
     # ------------------------------------------------------------------
     # FVM-потеря (закон сохранения массы)
     # ------------------------------------------------------------------
@@ -172,19 +191,19 @@ class LossComputer:
         if self.pde_system == 'euler':
             if self.flow_type == 'axisymmetric':
                 return PDEResiduals.compute_residuals_euler_axisymmetric(
-                    u, v, p, x, y, self.rho_norm, safe_grad, self.eps_axi
+                    u, v, p, x, y, self.rho_norm, self._grad, self.eps_axi
                 )
             return PDEResiduals.compute_residuals_euler_2d(
-                u, v, p, x, y, self.rho_norm, safe_grad
+                u, v, p, x, y, self.rho_norm, self._grad
             )
 
         if self.flow_type == 'axisymmetric':
             return PDEResiduals.compute_residuals_axisymmetric(
-                u, v, p, x, y, self.rho_norm, self.mu_norm, safe_grad, self.eps_axi
+                u, v, p, x, y, self.rho_norm, self.mu_norm, self._grad, self.eps_axi
             )
         else:
             return PDEResiduals.compute_residuals_2d(
-                u, v, p, x, y, self.rho_norm, self.mu_norm, safe_grad
+                u, v, p, x, y, self.rho_norm, self.mu_norm, self._grad
             )
 
     # ------------------------------------------------------------------
@@ -245,13 +264,13 @@ class LossComputer:
             elif name == 'symmetry':
                 bc_comp[name] += torch.mean(v[mask] ** 2)
                 # du/dy = 0 на линии симметрии: градиент по полному тензору, затем маска
-                du_dy = safe_grad(u, y, silent=False)[mask]
+                du_dy = self._grad(u, y, silent=False)[mask]
                 extra_grad += self.loss_weights.get('symmetry_grad', 10.0) * torch.mean(du_dy ** 2)
 
             elif name == 'axis_symmetry':
                 bc_comp[name] += torch.mean(u[mask] ** 2)
                 # dv/dr = 0 на оси: градиент по полному тензору, затем маска
-                dv_dr = safe_grad(v, x, silent=False)[mask]
+                dv_dr = self._grad(v, x, silent=False)[mask]
                 extra_grad += self.loss_weights.get('axis_symmetry_grad', 10.0) * torch.mean(dv_dr ** 2)
 
         return bc_comp, extra_grad

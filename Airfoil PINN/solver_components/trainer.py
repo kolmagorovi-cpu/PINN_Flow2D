@@ -157,7 +157,24 @@ class Trainer:
         self.profile_sections = self.diag_config.get('profile_sections', [0.2, 0.5, 0.8])
         self.spectrum_section_x = self.diag_config.get('spectrum_section_x', 0.5)
         self.compute_grad_cosine = self.diag_config.get('compute_grad_cosine', False)
+        self.strict_autograd = bool(self.diag_config.get('strict_autograd', True))
         self._fvm_tensor_cache = None
+
+    def _grad(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        create_graph: bool = True,
+        silent: bool = False,
+    ) -> torch.Tensor:
+        """Вычисляет dy/dx с учетом diagnostics.strict_autograd."""
+        return safe_grad(
+            y,
+            x,
+            create_graph=create_graph,
+            silent=silent,
+            strict=self.strict_autograd,
+        )
 
     def _autocast_context(self):
         if self.use_amp and self.scaler is not None and self.device.type == 'cuda':
@@ -300,6 +317,7 @@ class Trainer:
             x=x,
             y=y,
             boundary_types=bt,
+            pde_mask=pde_mask,
             pde_mult=pde_mult,
             w_pde=w_pde,
             w_bc=w_bc,
@@ -521,6 +539,7 @@ class Trainer:
         x: torch.Tensor,
         y: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
+        pde_mask: torch.Tensor,
         pde_mult: float,
         w_pde: Optional[torch.Tensor],
         w_bc: Optional[torch.Tensor],
@@ -535,6 +554,7 @@ class Trainer:
         """
         if self.rar_score_mode in ('pde', 'residual', 'pde_residual'):
             score = cont + mom1 + mom2
+            score = torch.where(pde_mask, score, torch.zeros_like(score))
             return torch.nan_to_num(score.flatten(), nan=0.0, posinf=0.0, neginf=0.0)
 
         lw = self.loss_computer.loss_weights
@@ -550,6 +570,7 @@ class Trainer:
                 pde_terms[2] * w_pde[:, 2].view(-1, 1),
             ]
         score = pde_mult * (pde_terms[0] + pde_terms[1] + pde_terms[2])
+        score = torch.where(pde_mask, score, torch.zeros_like(score))
 
         if self.loss_computer.bc_type == 'soft' and boundary_types is not None:
             score = score + self._compute_bc_point_score(
@@ -600,13 +621,13 @@ class Trainer:
             elif name == 'symmetry':
                 # create_graph=True keeps the training graph intact for the
                 # subsequent total_loss.backward().
-                du_dy = safe_grad(u, y, create_graph=True, silent=True)
+                du_dy = self._grad(u, y, create_graph=True, silent=True)
                 point_loss = v ** 2
                 extra_point_loss = self.loss_computer.loss_weights.get('symmetry_grad', 10.0) * du_dy ** 2
             elif name == 'axis_symmetry':
                 # create_graph=True keeps the training graph intact for the
                 # subsequent total_loss.backward().
-                dv_dr = safe_grad(v, x, create_graph=True, silent=True)
+                dv_dr = self._grad(v, x, create_graph=True, silent=True)
                 point_loss = u ** 2
                 extra_point_loss = self.loss_computer.loss_weights.get('axis_symmetry_grad', 10.0) * dv_dr ** 2
             else:
@@ -1457,13 +1478,18 @@ class Trainer:
 
         batch_interval задаётся пользователем в one-based терминах:
         1 — каждый batch, 5 — batch 5, 10, 15, ...
+        Если interval больше числа batch-ей, FVM запускается один раз на
+        последнем batch-е эпохи.
         Каждый запуск потом масштабируется так, чтобы суммарный FVM-вклад за
         эпоху не становился больше заданного веса только из-за частоты запусков.
         """
         if not enabled or n_batches <= 0:
             return set()
         interval = max(1, int(self.fvm_batch_interval))
-        return set(range(interval - 1, n_batches, interval))
+        batches = set(range(interval - 1, n_batches, interval))
+        if not batches:
+            batches.add(n_batches - 1)
+        return batches
 
     # ------------------------------------------------------------------
     # Шаг обучения (Adam)

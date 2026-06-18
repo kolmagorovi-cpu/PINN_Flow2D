@@ -183,6 +183,7 @@ class ConfigManager:
                 'spectrum_2d_resolution': 256,
                 'compute_grad_cosine': False,
                 'compute_ntk_condition': False,
+                'strict_autograd': True,
                 'save_rar_history': True,
                 'mass_metrics_interval': 1,
             },
@@ -409,6 +410,7 @@ class ConfigManager:
         print(f"  spectrum_2d_resolution   : {diag.get('spectrum_2d_resolution', 256)}")
         print(f"  compute_grad_cosine      : {diag.get('compute_grad_cosine', False)}")
         print(f"  compute_ntk_condition    : {diag.get('compute_ntk_condition', False)}")
+        print(f"  strict_autograd          : {diag.get('strict_autograd', True)}")
         print(f"  save_rar_history         : {diag.get('save_rar_history', True)}")
         print(f"  mass_metrics_interval    : {diag.get('mass_metrics_interval', 1)}")
         print("=" * 70)

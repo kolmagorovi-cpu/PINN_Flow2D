@@ -2,7 +2,9 @@
 
 import os
 import sys
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 import yaml
 
@@ -10,9 +12,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data_handler import DataHandler
 from fvm_residuals import FVMResiduals
+from Initializer import SCIPY_AVAILABLE, _compute_sdf_chunk
 from models import PINNIncompressible
 from solver_components.loss_computer import LossComputer
 from solver_components.trainer import Trainer
+from utils import safe_grad
 
 
 def _load_config() -> dict:
@@ -56,6 +60,19 @@ def test_fvm_checks(handler: DataHandler) -> None:
     assert residual.shape == (fvm.N,)
     assert torch.isfinite(residual).all()
 
+    if torch.cuda.is_available():
+        fvm_cuda = FVMResiduals.from_mesh_data(handler.mesh_data).to("cuda", dtype=torch.float32)
+        zeros_cuda = torch.zeros(
+            fvm_cuda.N,
+            2,
+            device=torch.device("cuda"),
+            dtype=torch.float32,
+        )
+        residual_cuda = fvm_cuda.compute_residual(zeros_cuda)
+        assert residual_cuda.shape == (fvm_cuda.N,)
+        assert residual_cuda.device == zeros_cuda.device
+        assert torch.isfinite(residual_cuda).all()
+
 
 def test_fvm_schedule() -> None:
     trainer = Trainer.__new__(Trainer)
@@ -64,8 +81,105 @@ def test_fvm_schedule() -> None:
     trainer.fvm_batch_interval = 2
     assert trainer._scheduled_fvm_batches(5, True) == {1, 3}
     trainer.fvm_batch_interval = 10
-    assert trainer._scheduled_fvm_batches(5, True) == set()
+    assert trainer._scheduled_fvm_batches(5, True) == {4}
     assert trainer._scheduled_fvm_batches(5, False) == set()
+
+
+def test_sdf_chunk() -> None:
+    xs = np.array([0.0, 1.0, 2.0, 1.0], dtype=np.float64)
+    ys = np.array([0.0, 0.0, 0.0, 2.0], dtype=np.float64)
+    wall_points = np.array([[0.0, 0.0], [2.0, 0.0]], dtype=np.float64)
+    indices = np.array([0, 1, 2, 3], dtype=np.int64)
+    expected = np.array([0.0, 1.0, 0.0, np.sqrt(5.0)], dtype=np.float64)
+
+    fallback = _compute_sdf_chunk(
+        indices,
+        xs=xs,
+        ys=ys,
+        wall_points=wall_points,
+        use_scipy=False,
+    )
+    assert np.allclose(fallback, expected)
+
+    if SCIPY_AVAILABLE:
+        scipy_result = _compute_sdf_chunk(
+            indices,
+            xs=xs,
+            ys=ys,
+            wall_points=wall_points,
+            use_scipy=True,
+        )
+        assert np.allclose(scipy_result, expected)
+
+
+def test_safe_grad_strict_mode() -> None:
+    x = torch.tensor([[2.0]], requires_grad=True)
+    y = x ** 2
+    grad = safe_grad(y, x, silent=True, strict=True)
+    assert torch.allclose(grad, torch.tensor([[4.0]]))
+
+    detached_x = torch.tensor([[1.0]], requires_grad=False)
+    assert torch.equal(
+        safe_grad(torch.ones_like(detached_x), detached_x, silent=True),
+        torch.zeros_like(detached_x),
+    )
+    try:
+        safe_grad(torch.ones_like(detached_x), detached_x, silent=True, strict=True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("strict safe_grad must raise when x.requires_grad is False")
+
+
+def test_rar_score_respects_pde_mask() -> None:
+    trainer = Trainer.__new__(Trainer)
+    trainer.rar_score_mode = "total_loss"
+    trainer.loss_computer = SimpleNamespace(
+        loss_weights={"cont": 1.0, "mom_x": 1.0, "mom_y": 1.0},
+        pde_components=["cont", "mom_x", "mom_y"],
+        bc_type="hard",
+    )
+
+    cont = torch.tensor([[1.0], [100.0]])
+    mom_x = torch.tensor([[2.0], [200.0]])
+    mom_y = torch.tensor([[3.0], [300.0]])
+    zeros = torch.zeros_like(cont)
+    pde_mask = torch.tensor([[True], [False]])
+
+    score = trainer._compute_rar_point_score(
+        cont=cont,
+        mom1=mom_x,
+        mom2=mom_y,
+        u=zeros,
+        v=zeros,
+        p=zeros,
+        x=zeros,
+        y=zeros,
+        boundary_types=None,
+        pde_mask=pde_mask,
+        pde_mult=1.0,
+        w_pde=None,
+        w_bc=None,
+    )
+    assert torch.allclose(score, torch.tensor([6.0, 0.0]))
+
+    trainer.rar_score_mode = "pde"
+    score_pde = trainer._compute_rar_point_score(
+        cont=cont,
+        mom1=mom_x,
+        mom2=mom_y,
+        u=zeros,
+        v=zeros,
+        p=zeros,
+        x=zeros,
+        y=zeros,
+        boundary_types=None,
+        pde_mask=pde_mask,
+        pde_mult=1.0,
+        w_pde=None,
+        w_bc=None,
+    )
+    assert torch.allclose(score_pde, torch.tensor([6.0, 0.0]))
 
 
 def test_one_train_batch(cfg: dict, handler: DataHandler) -> None:
@@ -122,6 +236,9 @@ def main() -> None:
 
     test_fvm_checks(handler)
     test_fvm_schedule()
+    test_sdf_chunk()
+    test_safe_grad_strict_mode()
+    test_rar_score_respects_pde_mask()
     test_one_train_batch(cfg, handler)
     print("OK refactor smoke tests")
 

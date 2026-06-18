@@ -80,7 +80,7 @@ def _make_lc(fvm_val):
         'compute_residuals_axisymmetric': staticmethod(lambda *a, **kw: {}),
     })
     stub_utils = types.ModuleType('utils')
-    stub_utils.safe_grad = lambda *a, **kw: torch.zeros(1)
+    stub_utils.safe_grad = lambda *a, **kw: torch.zeros_like(a[1]) if len(a) > 1 else torch.zeros(1)
     sys.modules.setdefault('pde_residuals', stub_pde)
     sys.modules.setdefault('utils', stub_utils)
     spec.loader.exec_module(mod)

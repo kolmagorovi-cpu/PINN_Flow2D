@@ -5,7 +5,8 @@ fvm_residuals.py — FVM-вычислитель невязки уравнени�
 
 Реализует класс FVMResiduals: дискретизация закона сохранения массы для
 несжимаемой жидкости методом FVM на медианной дуальной неструктурированной
-сетке (mesh2d.Mesh2D). Противопоточная (upwind) схема 1-го порядка;
+сетке (mesh2d.Mesh2D). На внутренних гранях используется центральная
+интерполяция скорости u_face = 0.5 * (u_i + u_j);
 все операции векторизованы на PyTorch без Python-циклов по граням.
 
 Поддерживает два источника геометрии:
@@ -145,10 +146,11 @@ class FVMResiduals:
                 "FVMResiduals.compute_residual: u должен иметь форму "
                 f"({self.N}, 2), получено {tuple(u.shape)}"
             )
-        if u.device != self._device:
+        geometry_device = self.V.device
+        if u.device != geometry_device:
             raise ValueError(
                 "FVMResiduals.compute_residual: device u не совпадает с геометрией "
-                f"({u.device} != {self._device}). Вызовите fvm.to(u.device, u.dtype)."
+                f"({u.device} != {geometry_device}). Вызовите fvm.to(u.device, u.dtype)."
             )
         if u.dtype != self._dtype:
             raise ValueError(
@@ -460,16 +462,20 @@ class FVMResiduals:
         Возвращает self для цепочки вызовов:
             fvm = FVMResiduals(mesh).to('cuda', torch.float32)
         """
-        self._device = torch.device(device)
-        if dtype is not None:
-            self._dtype = dtype
+        target_device = torch.device(device)
+        target_dtype = dtype if dtype is not None else self._dtype
 
         for attr in ('V', 'edge_S', 'bnd_S', '_u_prescribed'):
-            setattr(self, attr, getattr(self, attr).to(device=self._device, dtype=self._dtype))
+            setattr(self, attr, getattr(self, attr).to(device=target_device, dtype=target_dtype))
         for attr in ('edge_i', 'edge_j', 'bnd_node', 'bnd_type'):
-            setattr(self, attr, getattr(self, attr).to(device=self._device))
+            setattr(self, attr, getattr(self, attr).to(device=target_device))
         for attr in ('_prescribed_mask', '_zero_flux_mask'):
-            setattr(self, attr, getattr(self, attr).to(device=self._device))
+            setattr(self, attr, getattr(self, attr).to(device=target_device))
+
+        # torch.device("cuda") is an alias; tensors live on a concrete device
+        # such as cuda:0. Store the concrete value to keep validation reliable.
+        self._device = self.V.device
+        self._dtype = self.V.dtype
         return self
 
     def rebuild_from_mesh(self, new_mesh) -> None:

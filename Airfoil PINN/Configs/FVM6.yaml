@@ -32,6 +32,7 @@ data:
 diagnostics:
   compute_grad_cosine: false
   compute_ntk_condition: false
+  strict_autograd: true
   interval: 50
   mass_metrics_interval: 1
   plot_2d_spectrum: false

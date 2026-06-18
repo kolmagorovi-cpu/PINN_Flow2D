@@ -491,6 +491,7 @@ class DiagnosticsConfigDict(TypedDict, total=False):
     """Конфигурация диагностики."""
     interval: int
     plot_residual_map: bool
+    plot_rar_error_map: bool
     plot_profiles: bool
     profile_sections: List[float]
     plot_spectrum: bool
@@ -499,7 +500,9 @@ class DiagnosticsConfigDict(TypedDict, total=False):
     spectrum_2d_resolution: int
     compute_grad_cosine: bool
     compute_ntk_condition: bool
+    strict_autograd: bool
     save_rar_history: bool
+    mass_metrics_interval: int
 
 
 class FullConfigDict(TypedDict, total=False):

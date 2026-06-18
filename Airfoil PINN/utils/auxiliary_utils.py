@@ -87,34 +87,50 @@ def check_memory_usage(device: torch.device,
     return None
 
 
-def safe_grad(y: torch.Tensor, x: torch.Tensor, create_graph: bool = True, silent: bool = False) -> torch.Tensor:
+def safe_grad(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    create_graph: bool = True,
+    silent: bool = False,
+    strict: bool = False,
+) -> torch.Tensor:
     """
     Безопасное вычисление градиента dy/dx.
-    Если x не требует градиента или произошла ошибка, возвращает ноль.
-    В режиме silent предупреждения не выводятся (полезно для ожидаемых ошибок на границах).
+    Если x не требует градиента или произошла ошибка, по умолчанию возвращает ноль.
+    В strict-режиме вместо нуля выбрасывает RuntimeError, чтобы быстро находить
+    оторванный вычислительный граф при отладке PDE/BC-невязок.
 
     Args:
         y: выходной тензор (скаляр или форма, совместимая с x)
         x: входной тензор, по которому берётся производная
         create_graph: создавать ли граф для дальнейшего дифференцирования
         silent: если True, подавляет предупреждения об ошибках
+        strict: если True, не маскирует ошибки нулевым градиентом
 
     Returns:
         Тензор градиента той же формы, что и x, или нулевой тензор при ошибке.
     """
     try:
         if not x.requires_grad:
+            message = "safe_grad: x не требует градиента (requires_grad=False)."
+            if strict:
+                raise RuntimeError(message)
             if not silent:
-                logger.warning(f"safe_grad: x не требует градиента (requires_grad=False). Возвращаю ноль.")
+                logger.warning("%s Возвращаю ноль.", message)
             return torch.zeros_like(x)
         g = torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y),
                                 create_graph=create_graph, allow_unused=True)[0]
         if g is None:
+            message = "safe_grad: градиент равен None (allow_unused=True)."
+            if strict:
+                raise RuntimeError(message)
             if not silent:
-                logger.warning(f"safe_grad: градиент равен None (allow_unused=True). Возвращаю ноль.")
+                logger.warning("%s Возвращаю ноль.", message)
             return torch.zeros_like(x)
         return g
     except RuntimeError as e:
+        if strict:
+            raise RuntimeError(f"Ошибка при вычислении градиента в strict-режиме: {e}") from e
         if not silent:
             logger.warning(f"Ошибка при вычислении градиента: {e}")
         return torch.zeros_like(x)

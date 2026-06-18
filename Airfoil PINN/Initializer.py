@@ -27,6 +27,8 @@ Example:
 Версия: 3.260226 (финальная исправленная)
 """
 
+from __future__ import annotations
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -89,7 +91,9 @@ def _compute_sdf_chunk(
     """
     Вычисляет SDF (в метрах) для набора индексов.
 
-    Строит KDTree внутри процесса, если доступен scipy.
+    При наличии SciPy строит KDTree внутри процесса и выполняет один
+    векторизованный query на весь chunk. Без SciPy использует блочную
+    NumPy-векторизацию, чтобы не делать вложенный Python-цикл по точкам.
 
     Args:
         indices: Индексы точек для вычисления
@@ -101,25 +105,27 @@ def _compute_sdf_chunk(
     Returns:
         Массив расстояний до стенки
     """
-    sdf_chunk = np.zeros(len(indices))
-    if use_scipy and len(wall_points) > 0:
-        # Строим дерево внутри процесса
+    indices = np.asarray(indices, dtype=np.int64)
+    if len(indices) == 0 or len(wall_points) == 0:
+        return np.zeros(len(indices), dtype=np.float64)
+
+    query_points = np.column_stack((xs[indices], ys[indices])).astype(np.float64, copy=False)
+
+    if use_scipy and SCIPY_AVAILABLE and len(wall_points) > 0:
         tree = cKDTree(wall_points)
-        for j, idx in enumerate(indices):
-            dist, _ = tree.query(np.array([xs[idx], ys[idx]]), k=1)
-            sdf_chunk[j] = dist
-    else:
-        # Полный перебор (медленно, но надёжно)
-        for j, idx in enumerate(indices):
-            x0, y0 = xs[idx], ys[idx]
-            min_dist_sq = np.inf
-            for wx, wy in wall_points:
-                dx = x0 - wx
-                dy = y0 - wy
-                d_sq = dx*dx + dy*dy
-                if d_sq < min_dist_sq:
-                    min_dist_sq = d_sq
-            sdf_chunk[j] = np.sqrt(min_dist_sq) if min_dist_sq != np.inf else 0.0
+        dist, _ = tree.query(query_points, k=1)
+        return np.asarray(dist, dtype=np.float64)
+
+    wall_points = np.asarray(wall_points, dtype=np.float64)
+    sdf_chunk = np.empty(len(indices), dtype=np.float64)
+    max_pairs = 1_000_000
+    block_size = max(1, min(len(query_points), max_pairs // max(1, len(wall_points))))
+    for start in range(0, len(query_points), block_size):
+        stop = min(start + block_size, len(query_points))
+        block = query_points[start:stop]
+        delta = block[:, None, :] - wall_points[None, :, :]
+        dist_sq = np.sum(delta * delta, axis=2)
+        sdf_chunk[start:stop] = np.sqrt(np.min(dist_sq, axis=1))
     return sdf_chunk
 
 
@@ -552,23 +558,18 @@ class Initializer:
 
             if num_processes is None:
                 num_processes = mp.cpu_count()
-            num_processes = min(num_processes, N, 16)
+            num_processes = max(1, min(int(num_processes), N, 16))
 
             if num_processes > 1 and mp.cpu_count() > 1:
                 logger.info(f"Используется процессов: {num_processes}")
                 indices = np.arange(N)
-                chunks = np.array_split(indices, num_processes)
-                pool = mp.Pool(processes=num_processes)
-                try:
-                    # Передаём wall_points, а не дерево
+                chunks = [chunk for chunk in np.array_split(indices, num_processes) if len(chunk) > 0]
+                with mp.Pool(processes=num_processes) as pool:
                     func = partial(_compute_sdf_chunk,
                                    xs=xs, ys=ys,
                                    wall_points=self.wall_points,
                                    use_scipy=SCIPY_AVAILABLE)
                     results = pool.map(func, chunks)
-                finally:
-                    pool.close()
-                    pool.join()
 
                 sdf_phys = np.zeros(N)
                 for chunk_idx, sdf_vals in zip(chunks, results):
@@ -576,21 +577,17 @@ class Initializer:
             else:
                 # Однопоточный режим с использованием заранее построенного дерева
                 logger.info("Однопоточный режим.")
-                sdf_phys = np.zeros(N)
                 if SCIPY_AVAILABLE and self.wall_tree is not None:
-                    sdf_phys, _ = self.wall_tree.query(np.column_stack([xs, ys]), k=1)
+                    sdf_phys, _ = self.wall_tree.query(np.column_stack((xs, ys)), k=1)
+                    sdf_phys = np.asarray(sdf_phys, dtype=np.float64)
                 else:
-                    # Полный перебор
-                    for i in range(N):
-                        x0, y0 = xs[i], ys[i]
-                        min_dist_sq = np.inf
-                        for wx, wy in self.wall_points:
-                            dx = x0 - wx
-                            dy = y0 - wy
-                            d_sq = dx*dx + dy*dy
-                            if d_sq < min_dist_sq:
-                                min_dist_sq = d_sq
-                        sdf_phys[i] = np.sqrt(min_dist_sq) if min_dist_sq != np.inf else 0.0
+                    sdf_phys = _compute_sdf_chunk(
+                        np.arange(N),
+                        xs=xs,
+                        ys=ys,
+                        wall_points=self.wall_points,
+                        use_scipy=False,
+                    )
 
         arr_norm['sdf_norm'] = sdf_phys / self.chord
 
