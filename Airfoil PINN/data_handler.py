@@ -24,12 +24,24 @@ import torch
 from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader, Subset
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from scipy.spatial import cKDTree
 
 from type_hints import PointDtypeDict
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MeshPointAdapter:
+    """Минимальная точка для Mesh2D, восстановленная из обучающего датасета."""
+    id: int
+    x: float
+    y: float
+    boundary_type: str
+    on_airfoil: bool = False
+    on_boundary: bool = False
+    segment_id: int = -1
 
 
 @dataclass
@@ -173,6 +185,25 @@ class PINNDataset(Dataset):
         self.u_bc = torch.zeros(len(self.x), dtype=torch.float32).view(-1, 1)
         self.v_bc = torch.zeros(len(self.x), dtype=torch.float32).view(-1, 1)
         self.p_bc = torch.zeros(len(self.x), dtype=torch.float32).view(-1, 1)
+        self.on_boundary = torch.zeros(len(self.x), dtype=torch.bool)
+        self.on_airfoil = torch.zeros(len(self.x), dtype=torch.bool)
+        self.segment_id = torch.full((len(self.x),), -1, dtype=torch.long)
+
+        if 'on_boundary' in data.dtype.names:
+            self.on_boundary = torch.tensor(
+                np.ascontiguousarray(data['on_boundary']),
+                dtype=torch.bool
+            )
+        if 'on_airfoil' in data.dtype.names:
+            self.on_airfoil = torch.tensor(
+                np.ascontiguousarray(data['on_airfoil']),
+                dtype=torch.bool
+            )
+        if 'segment_id' in data.dtype.names:
+            self.segment_id = torch.tensor(
+                np.ascontiguousarray(data['segment_id']),
+                dtype=torch.long
+            )
 
         if 'boundary_type' in data.dtype.names:
             # Приводим все уникальные значения к нижнему регистру
@@ -215,6 +246,13 @@ class PINNDataset(Dataset):
                 elif bt_str == 'axis_symmetry':
                     self.mask_u_fixed[i] = True
                     # u = 0
+
+            if 'on_boundary' not in data.dtype.names:
+                interior_idx = self.type_to_idx.get('interior')
+                if interior_idx is not None:
+                    self.on_boundary = self.boundary_types[:, interior_idx] <= 0.5
+                else:
+                    self.on_boundary = torch.ones(len(self.x), dtype=torch.bool)
 
         self.n_points = len(self.x)
         self.source_indices = torch.arange(self.n_points, dtype=torch.long)
@@ -304,8 +342,10 @@ class PINNDataset(Dataset):
         # Копируем все атрибуты, конкатенируя тензоры
         for attr in ['x', 'y', 'sdf', 'p_target', 'u_target', 'v_target',
                      'mask_u_fixed', 'mask_v_fixed', 'mask_p_fixed',
-                     'u_bc', 'v_bc', 'p_bc', 'boundary_types']:
-            old = getattr(self, attr)
+                     'u_bc', 'v_bc', 'p_bc', 'boundary_types',
+                     'on_boundary', 'on_airfoil', 'segment_id',
+                     'mesh_x_phys', 'mesh_y_phys']:
+            old = getattr(self, attr, None)
             if old is not None:
                 new = torch.cat([old, old[indices]], dim=0)
                 setattr(new_dataset, attr, new)
@@ -359,9 +399,14 @@ class DataHandler:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.mesh_data: Optional[MeshData] = None
+        self.mesh_file = mesh_file
+        self.mesh_domain_coords: Optional[np.ndarray] = None
+        self.mesh_airfoil_coords: Optional[np.ndarray] = None
 
         self.dataset = PINNDataset(points_file)
         self.load_metadata()
+        self._load_sampler_point_metadata()
+        self.load_mesh_geometry_from_geom_config()
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
         self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
@@ -380,6 +425,8 @@ class DataHandler:
         if not os.path.exists(meta_path):
             raise FileNotFoundError(f"Файл метаданных {meta_path} не найден")
         meta = np.load(meta_path, allow_pickle=True).item()
+        self.fluid_name = meta.get('fluid_name')
+        self.conditions_name = meta.get('conditions_name')
         self.chord = meta.get('chord', 1.0)
         self.U_inf = meta.get('U_inf', 1.0)
         self.p_ref = meta.get('p_ref', 0.0)
@@ -395,6 +442,135 @@ class DataHandler:
         self.y_max = self.dataset.y.max().item()
         logger.info(f"Метаданные: chord={self.chord:.4f} м, U_inf={self.U_inf:.4f} м/с, Re={self.Re:.2e}")
         logger.info(f"Вход: u_norm={self.inlet_u_norm:.3f}, v_norm={self.inlet_v_norm:.3f}")
+        self.dataset.mesh_x_phys = (self.dataset.x.double().flatten() * float(self.chord)).clone()
+        self.dataset.mesh_y_phys = (self.dataset.y.double().flatten() * float(self.chord)).clone()
+
+    def _load_sampler_point_metadata(self) -> None:
+        """
+        Дополняет initial.npy геометрическими флагами из Sampler/Data/collocation_points.npy.
+
+        Initial/Data/initial.npy хранит нормированные поля, но обычно не хранит
+        on_airfoil/segment_id. Эти флаги нужны только для корректной перестройки
+        boundary-fitted Mesh2D после adaptive RAR.
+        """
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(project_dir, "Sampler", "Data", "collocation_points.npy"),
+        ]
+
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                arr = np.load(path, allow_pickle=True)
+            except Exception as exc:
+                logger.debug("Не удалось прочитать %s: %s", path, exc)
+                continue
+
+            names = arr.dtype.names or ()
+            required = {'x', 'y', 'on_boundary', 'on_airfoil', 'segment_id'}
+            if not required.issubset(names) or len(arr) != self.dataset.n_points:
+                continue
+
+            x_norm = np.asarray(arr['x'], dtype=np.float64) / float(self.chord)
+            y_norm = np.asarray(arr['y'], dtype=np.float64) / float(self.chord)
+            ds_x = self.dataset.x.numpy().reshape(-1)
+            ds_y = self.dataset.y.numpy().reshape(-1)
+            if not (np.allclose(x_norm, ds_x, rtol=1e-6, atol=1e-8)
+                    and np.allclose(y_norm, ds_y, rtol=1e-6, atol=1e-8)):
+                logger.debug("Sampler metadata skipped: coordinates do not match %s", path)
+                continue
+
+            self.dataset.on_boundary = torch.tensor(
+                np.ascontiguousarray(arr['on_boundary']),
+                dtype=torch.bool
+            )
+            self.dataset.on_airfoil = torch.tensor(
+                np.ascontiguousarray(arr['on_airfoil']),
+                dtype=torch.bool
+            )
+            self.dataset.segment_id = torch.tensor(
+                np.ascontiguousarray(arr['segment_id']),
+                dtype=torch.long
+            )
+            self.dataset.mesh_x_phys = torch.tensor(
+                np.ascontiguousarray(arr['x']),
+                dtype=torch.float64
+            )
+            self.dataset.mesh_y_phys = torch.tensor(
+                np.ascontiguousarray(arr['y']),
+                dtype=torch.float64
+            )
+            logger.info("Геометрические флаги точек загружены из %s", path)
+            return
+
+        if self.dataset.boundary_types is not None and 'wall' in self.dataset.type_to_idx:
+            wall_idx = self.dataset.type_to_idx['wall']
+            self.dataset.on_airfoil = self.dataset.boundary_types[:, wall_idx] > 0.5
+            logger.info(
+                "on_airfoil восстановлен эвристически по boundary_type='wall' "
+                "(Sampler/Data/collocation_points.npy не найден или не совпал)."
+            )
+
+    def load_mesh_geometry_from_geom_config(self, config_path: str = "geom_config.yaml") -> bool:
+        """
+        Загружает контуры домена/профиля для последующих rebuild Mesh2D.
+
+        Новые mesh2d.npz сохраняют эти контуры прямо в файле. Для старых сеток
+        остаётся fallback через geom_config.yaml и Geometry/Data|Metadata.
+        """
+        if self.mesh_domain_coords is not None:
+            return True
+
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        cfg_path = config_path
+        if not os.path.isabs(cfg_path):
+            cfg_path = os.path.join(project_dir, cfg_path)
+        if not os.path.exists(cfg_path):
+            return False
+
+        try:
+            import yaml
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception as exc:
+            logger.debug("Не удалось прочитать geom_config.yaml: %s", exc)
+            return False
+
+        geom_name = cfg.get('geom_name')
+        if not geom_name:
+            return False
+
+        def _load_coords(path_base: str) -> Optional[np.ndarray]:
+            for ext in (".npy", ".txt", ".csv"):
+                path = path_base + ext
+                if not os.path.exists(path):
+                    continue
+                if ext == ".npy":
+                    return np.asarray(np.load(path), dtype=np.float64)
+                return np.asarray(np.loadtxt(path, delimiter=',' if ext == ".csv" else None), dtype=np.float64)
+            return None
+
+        data_dir = os.path.join(project_dir, "Geometry", "Data")
+        meta_dir = os.path.join(project_dir, "Geometry", "Metadata")
+        domain = _load_coords(os.path.join(data_dir, f"{geom_name}_domain"))
+        foil = _load_coords(os.path.join(meta_dir, f"{geom_name}_foil"))
+        if foil is None:
+            foil = _load_coords(os.path.join(data_dir, f"{geom_name}_foil"))
+
+        if domain is None or len(domain) < 2:
+            return False
+        if len(domain) > 2 and not np.allclose(domain[0], domain[-1], atol=1e-9):
+            domain = np.vstack([domain, domain[0]])
+
+        self.mesh_domain_coords = domain
+        self.mesh_airfoil_coords = foil if foil is not None and len(foil) >= 2 else None
+        logger.info(
+            "Геометрия для FVM rebuild загружена: domain=%d, foil=%s",
+            len(domain),
+            len(self.mesh_airfoil_coords) if self.mesh_airfoil_coords is not None else "нет",
+        )
+        return True
 
     def load_mesh(self, mesh_file: str) -> None:
         """
@@ -412,6 +588,10 @@ class DataHandler:
         if not os.path.exists(mesh_file):
             raise FileNotFoundError(f"Файл сетки не найден: {mesh_file}")
         with np.load(mesh_file, allow_pickle=True) as data:
+            if 'domain_coords' in data.files and len(data['domain_coords']) >= 2:
+                self.mesh_domain_coords = np.asarray(data['domain_coords'], dtype=np.float64)
+            if 'airfoil_coords' in data.files and len(data['airfoil_coords']) >= 2:
+                self.mesh_airfoil_coords = np.asarray(data['airfoil_coords'], dtype=np.float64)
             self.mesh_data = MeshData(
                 coords=np.array(data['coords']),
                 triangles=np.array(data['triangles']),
@@ -432,6 +612,83 @@ class DataHandler:
             self.mesh_data.n_int_faces, self.mesh_data.n_bnd_faces,
         )
         self._prepare_fvm_tensors()
+
+    def set_mesh_from_mesh2d(self, mesh) -> None:
+        """Обновляет MeshData и FVM-тензоры из уже построенного Mesh2D."""
+        ifaces = mesh.internal_faces
+        bfaces = mesh.boundary_faces
+        self.mesh_data = MeshData(
+            coords=np.asarray(mesh.coords, dtype=np.float64),
+            triangles=np.asarray(mesh.triangles, dtype=np.int32),
+            cv_volumes=np.asarray(mesh.cv_volumes, dtype=np.float64),
+            int_face_node_i=np.array([f.node_i for f in ifaces], dtype=np.int32),
+            int_face_node_j=np.array([f.node_j for f in ifaces], dtype=np.int32),
+            int_face_area=np.array([f.area_vector for f in ifaces], dtype=np.float64)
+            if ifaces else np.empty((0, 2), dtype=np.float64),
+            bnd_face_node=np.array([f.node for f in bfaces], dtype=np.int32),
+            bnd_face_neighbor=np.array([f.neighbor_node for f in bfaces], dtype=np.int32),
+            bnd_face_type=np.array([f.boundary_type for f in bfaces], dtype=object),
+            bnd_face_area=np.array([f.area_vector for f in bfaces], dtype=np.float64)
+            if bfaces else np.empty((0, 2), dtype=np.float64),
+            node_type=np.array([nd.node_type for nd in mesh.nodes], dtype=object),
+            node_bnd_type=np.array([nd.boundary_type for nd in mesh.nodes], dtype=object),
+        )
+        self._prepare_fvm_tensors()
+
+    def _dataset_boundary_type_strings(self) -> List[str]:
+        ds = self.dataset
+        if ds.boundary_types is None or not ds.boundary_type_names:
+            return ["interior"] * ds.n_points
+        idx = torch.argmax(ds.boundary_types, dim=1).cpu().numpy()
+        names = ds.boundary_type_names
+        return [names[int(i)] if int(i) < len(names) else "interior" for i in idx]
+
+    def mesh_points_from_dataset(self) -> List[MeshPointAdapter]:
+        """Восстанавливает список точек Mesh2D из текущего обучающего датасета."""
+        ds = self.dataset
+        if hasattr(ds, 'mesh_x_phys') and hasattr(ds, 'mesh_y_phys'):
+            x_phys = ds.mesh_x_phys.cpu().numpy().reshape(-1)
+            y_phys = ds.mesh_y_phys.cpu().numpy().reshape(-1)
+        else:
+            x_phys = ds.x.cpu().numpy().reshape(-1).astype(np.float64) * float(self.chord)
+            y_phys = ds.y.cpu().numpy().reshape(-1).astype(np.float64) * float(self.chord)
+        bt = self._dataset_boundary_type_strings()
+        on_boundary = getattr(ds, 'on_boundary', torch.zeros(ds.n_points, dtype=torch.bool)).cpu().numpy()
+        on_airfoil = getattr(ds, 'on_airfoil', torch.zeros(ds.n_points, dtype=torch.bool)).cpu().numpy()
+        segment_id = getattr(ds, 'segment_id', torch.full((ds.n_points,), -1, dtype=torch.long)).cpu().numpy()
+
+        return [
+            MeshPointAdapter(
+                id=i,
+                x=float(x_phys[i]),
+                y=float(y_phys[i]),
+                boundary_type=str(bt[i]),
+                on_airfoil=bool(on_airfoil[i]),
+                on_boundary=bool(on_boundary[i]),
+                segment_id=int(segment_id[i]),
+            )
+            for i in range(ds.n_points)
+        ]
+
+    def build_mesh_from_current_points(self, verbose: bool = False):
+        """Строит новую Mesh2D по текущим точкам датасета без графиков и записи на диск."""
+        if self.mesh_domain_coords is None:
+            self.load_mesh_geometry_from_geom_config()
+        if self.mesh_domain_coords is None:
+            raise RuntimeError(
+                "Нет domain_coords для перестройки FVM-сетки. "
+                "Пересоздайте mesh2d.npz новым mesh2d.py или проверьте geom_config.yaml."
+            )
+
+        from mesh2d import Mesh2D
+
+        mesh = Mesh2D(
+            self.mesh_points_from_dataset(),
+            domain_coords=self.mesh_domain_coords,
+            airfoil_coords=self.mesh_airfoil_coords,
+        )
+        mesh.build(verbose=verbose)
+        return mesh
 
     def _prepare_fvm_tensors(self) -> None:
         """
@@ -560,6 +817,168 @@ class DataHandler:
         self.dataset = self.dataset.extend(indices)
         self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
         logger.info(f"Датасет расширен: добавлено {len(indices)} точек, всего {self.n_points}")
+
+    def add_interior_points(
+        self,
+        x_norm: np.ndarray,
+        y_norm: np.ndarray,
+        sdf_norm: np.ndarray,
+    ) -> int:
+        """
+        Добавляет новые interior-точки с уникальными координатами.
+
+        Целевые p/u/v для справочных полей берутся у ближайшей старой точки,
+        а маски hard-BC остаются выключенными.
+        """
+        x_norm = np.asarray(x_norm, dtype=np.float32).reshape(-1)
+        y_norm = np.asarray(y_norm, dtype=np.float32).reshape(-1)
+        sdf_norm = np.asarray(sdf_norm, dtype=np.float32).reshape(-1)
+        n_new = int(len(x_norm))
+        if n_new == 0:
+            return 0
+        if not (len(y_norm) == n_new and len(sdf_norm) == n_new):
+            raise ValueError("x_norm, y_norm и sdf_norm должны иметь одинаковую длину")
+
+        ds = self.dataset
+        if ds.boundary_types is None or 'interior' not in ds.type_to_idx:
+            raise RuntimeError(
+                "Adaptive RAR требует существующий boundary_type='interior', "
+                "иначе изменится размер входа модели."
+            )
+
+        old_n = ds.n_points
+        old_xy = np.column_stack([
+            ds.x.cpu().numpy().reshape(-1),
+            ds.y.cpu().numpy().reshape(-1),
+        ])
+        _, nn_idx = cKDTree(old_xy).query(np.column_stack([x_norm, y_norm]), workers=-1)
+        nn_idx_t = torch.tensor(nn_idx, dtype=torch.long)
+
+        ds.x = torch.cat([ds.x, torch.tensor(x_norm, dtype=torch.float32).view(-1, 1)], dim=0)
+        ds.y = torch.cat([ds.y, torch.tensor(y_norm, dtype=torch.float32).view(-1, 1)], dim=0)
+        ds.sdf = torch.cat([ds.sdf, torch.tensor(sdf_norm, dtype=torch.float32).view(-1, 1)], dim=0)
+        ds.mesh_x_phys = torch.cat(
+            [ds.mesh_x_phys, torch.tensor(x_norm * float(self.chord), dtype=torch.float64)],
+            dim=0,
+        )
+        ds.mesh_y_phys = torch.cat(
+            [ds.mesh_y_phys, torch.tensor(y_norm * float(self.chord), dtype=torch.float64)],
+            dim=0,
+        )
+
+        ds.p_target = torch.cat([ds.p_target, ds.p_target[nn_idx_t].clone()], dim=0)
+        ds.u_target = torch.cat([ds.u_target, ds.u_target[nn_idx_t].clone()], dim=0)
+        ds.v_target = torch.cat([ds.v_target, ds.v_target[nn_idx_t].clone()], dim=0)
+
+        ds.mask_u_fixed = torch.cat([ds.mask_u_fixed, torch.zeros(n_new, dtype=torch.bool)], dim=0)
+        ds.mask_v_fixed = torch.cat([ds.mask_v_fixed, torch.zeros(n_new, dtype=torch.bool)], dim=0)
+        ds.mask_p_fixed = torch.cat([ds.mask_p_fixed, torch.zeros(n_new, dtype=torch.bool)], dim=0)
+        ds.u_bc = torch.cat([ds.u_bc, torch.zeros(n_new, dtype=torch.float32).view(-1, 1)], dim=0)
+        ds.v_bc = torch.cat([ds.v_bc, torch.zeros(n_new, dtype=torch.float32).view(-1, 1)], dim=0)
+        ds.p_bc = torch.cat([ds.p_bc, torch.zeros(n_new, dtype=torch.float32).view(-1, 1)], dim=0)
+
+        bt_new = torch.zeros(n_new, ds.boundary_types.shape[1], dtype=torch.float32)
+        bt_new[:, ds.type_to_idx['interior']] = 1.0
+        ds.boundary_types = torch.cat([ds.boundary_types, bt_new], dim=0)
+
+        ds.on_boundary = torch.cat([ds.on_boundary, torch.zeros(n_new, dtype=torch.bool)], dim=0)
+        ds.on_airfoil = torch.cat([ds.on_airfoil, torch.zeros(n_new, dtype=torch.bool)], dim=0)
+        ds.segment_id = torch.cat([ds.segment_id, torch.full((n_new,), -1, dtype=torch.long)], dim=0)
+        ds.source_indices = torch.cat(
+            [ds.source_indices, torch.arange(old_n, old_n + n_new, dtype=torch.long)],
+            dim=0,
+        )
+        ds.n_points = old_n + n_new
+
+        self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
+        logger.info("Adaptive RAR: добавлено %d новых interior-точек, всего %d", n_new, self.n_points)
+        return n_new
+
+    def get_state(self) -> Dict[str, Any]:
+        """Возвращает состояние датасета/сетки для корректного resume."""
+        ds = self.dataset
+        tensor_attrs = [
+            'x', 'y', 'sdf', 'p_target', 'u_target', 'v_target',
+            'boundary_types', 'mask_u_fixed', 'mask_v_fixed', 'mask_p_fixed',
+            'u_bc', 'v_bc', 'p_bc', 'on_boundary', 'on_airfoil',
+            'segment_id', 'source_indices', 'mesh_x_phys', 'mesh_y_phys',
+        ]
+        dataset_state = {
+            attr: getattr(ds, attr, None).detach().cpu().clone()
+            if torch.is_tensor(getattr(ds, attr, None)) else None
+            for attr in tensor_attrs
+        }
+        dataset_state.update({
+            'boundary_type_names': list(ds.boundary_type_names),
+            'type_to_idx': dict(ds.type_to_idx),
+            'n_points': int(ds.n_points),
+        })
+
+        mesh_state = None
+        if self.mesh_data is not None:
+            mesh_state = {
+                'coords': self.mesh_data.coords,
+                'triangles': self.mesh_data.triangles,
+                'cv_volumes': self.mesh_data.cv_volumes,
+                'int_face_node_i': self.mesh_data.int_face_node_i,
+                'int_face_node_j': self.mesh_data.int_face_node_j,
+                'int_face_area': self.mesh_data.int_face_area,
+                'bnd_face_node': self.mesh_data.bnd_face_node,
+                'bnd_face_neighbor': self.mesh_data.bnd_face_neighbor,
+                'bnd_face_type': self.mesh_data.bnd_face_type,
+                'bnd_face_area': self.mesh_data.bnd_face_area,
+                'node_type': self.mesh_data.node_type,
+                'node_bnd_type': self.mesh_data.node_bnd_type,
+            }
+
+        return {
+            'dataset': dataset_state,
+            'mesh_data': mesh_state,
+            'mesh_domain_coords': self.mesh_domain_coords,
+            'mesh_airfoil_coords': self.mesh_airfoil_coords,
+        }
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        """Восстанавливает датасет/состояние сетки из чекпоинта."""
+        if not state:
+            return
+
+        ds_state = state.get('dataset') or {}
+        ds = self.dataset
+        for attr, value in ds_state.items():
+            if attr in ('boundary_type_names', 'type_to_idx', 'n_points'):
+                continue
+            if torch.is_tensor(value):
+                setattr(ds, attr, value.detach().cpu().clone())
+            elif value is not None:
+                setattr(ds, attr, value)
+
+        ds.boundary_type_names = list(ds_state.get('boundary_type_names', ds.boundary_type_names))
+        ds.type_to_idx = dict(ds_state.get('type_to_idx', ds.type_to_idx))
+        ds.n_points = int(ds_state.get('n_points', len(ds.x)))
+
+        if getattr(ds, 'source_indices', None) is None:
+            ds.source_indices = torch.arange(ds.n_points, dtype=torch.long)
+        if getattr(ds, 'mesh_x_phys', None) is None:
+            ds.mesh_x_phys = (ds.x.double().flatten() * float(self.chord)).clone()
+        if getattr(ds, 'mesh_y_phys', None) is None:
+            ds.mesh_y_phys = (ds.y.double().flatten() * float(self.chord)).clone()
+
+        self.mesh_domain_coords = state.get('mesh_domain_coords', self.mesh_domain_coords)
+        self.mesh_airfoil_coords = state.get('mesh_airfoil_coords', self.mesh_airfoil_coords)
+
+        mesh_state = state.get('mesh_data')
+        if mesh_state is not None:
+            self.mesh_data = MeshData(**mesh_state)
+            self._prepare_fvm_tensors()
+        else:
+            self.mesh_data = None
+            for attr in ('fvm_x', 'fvm_y', 'fvm_sdf', 'fvm_bt'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
+        self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
+        logger.info("DataHandler восстановлен из чекпоинта: %d точек", self.n_points)
 
     # ------------------------------------------------------------------
     # Методы для диагностики (с фильтрацией по y)

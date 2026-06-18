@@ -10,7 +10,8 @@
 - Добавлен 2D спектр и его настройка в конфигурации
 - Исправлен вызов scheduler.step()
 - Уменьшена частота torch.cuda.empty_cache()
-- Для карты невязки используется point_residual (скользящее среднее)
+- Для карты невязки используется отдельное поле PDE-невязки; RAR использует
+  собственный score (обычно local total loss)
 - Оптимизирована работа RAR с SA-весами
 - В 2D спектре исключены граничные точки (отступ 5% от краёв) для устранения артефактов
 """
@@ -93,6 +94,7 @@ class PINNSolver:
         # Константы PDE (нормированные)
         self.rho_norm = torch.tensor(1.0, device=self.device, dtype=self.dtype)
         self.mu_norm = torch.tensor(1.0 / self.data_handler.Re, device=self.device, dtype=self.dtype)
+        self._validate_physics_metadata()
 
         # Загрузка эталонного решения (если указано)
         self.reference_data = None
@@ -123,25 +125,9 @@ class PINNSolver:
             dtype=self.dtype
         )
 
-        # FVM-невязки (если задана сетка и fvm.enabled=True)
-        _fvm_cfg = config['loss_weights'].get('fvm', {})
-        _fvm_enabled = isinstance(_fvm_cfg, dict) and bool(_fvm_cfg.get('enabled', False))
-        if _fvm_enabled and self.data_handler.mesh_data is None:
-            logger.warning("FVM Mass flow включён (fvm.enabled=True), но mesh_file не задан — FVM-потеря не будет вычисляться")
-        if self.data_handler.mesh_data is not None and _fvm_enabled:
-            try:
-                from fvm_residuals import FVMResiduals
-                fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
-                inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
-                inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
-                fvm.set_inlet_velocity(
-                    torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
-                )
-                fvm.to(self.device)
-                self.loss_computer.fvm = fvm
-                logger.info(f"FVMResiduals подключён: {fvm.N} узлов")
-            except Exception as e:
-                logger.warning(f"Не удалось инициализировать FVMResiduals: {e}")
+        # FVM-геометрия используется не только для FVM-loss, но и для
+        # корректного интегрального баланса массы по граничным граням.
+        self._setup_fvm_residuals()
 
         # SA-веса (если используются)
         self.sa_weights = None
@@ -197,6 +183,7 @@ class PINNSolver:
             using_lbfgs=False,
             diagnostics_config=self.diagnostics_config,
             use_amp=self.use_amp,
+            plots_dir=self._get_plots_dir(),
         )
 
         # MetricsCollector
@@ -336,6 +323,72 @@ class PINNSolver:
             coordinate_scaling=coord_scaling
         )
 
+    def _validate_physics_metadata(self) -> None:
+        """Проверяет, что пользовательские input_params не маскируют старые metadata."""
+        inp = self.config.get('input_params', {})
+        configured_fluid = inp.get('fluid_file')
+        metadata_fluid = getattr(self.data_handler, 'fluid_name', None)
+
+        if configured_fluid and metadata_fluid and str(configured_fluid) != str(metadata_fluid):
+            logger.warning(
+                "fluid_file='%s' в настройках отличается от fluid_name='%s' в initial_metadata.npy. "
+                "PDE использует rho/mu/Re из metadata: rho=%.6g, mu=%.6g, Re=%.6g.",
+                configured_fluid,
+                metadata_fluid,
+                self.data_handler.rho,
+                self.data_handler.mu,
+                self.data_handler.Re,
+            )
+        elif inp.get('density') or inp.get('viscosity'):
+            logger.info(
+                "Физические параметры для входов/PDE взяты из metadata: fluid=%s, rho=%.6g, mu=%.6g, Re=%.6g",
+                metadata_fluid or "unknown",
+                self.data_handler.rho,
+                self.data_handler.mu,
+                self.data_handler.Re,
+            )
+
+    def _setup_fvm_residuals(self) -> None:
+        """Инициализирует FVMResiduals, если они нужны для loss или mass integral."""
+        lw = self.config.get('loss_weights', {})
+        fvm_cfg = lw.get('fvm', {})
+        fvm_enabled = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
+        integral_enabled = bool(lw.get('integral_condition', False))
+        need_fvm_geometry = fvm_enabled or integral_enabled or self.data_handler.mesh_data is not None
+
+        if not need_fvm_geometry:
+            self.loss_computer.fvm = None
+            return
+
+        if self.data_handler.mesh_data is None:
+            if fvm_enabled:
+                logger.warning(
+                    "FVM Mass flow включён (fvm.enabled=True), но mesh_file не задан — "
+                    "FVM-потеря не будет вычисляться"
+                )
+            if integral_enabled:
+                logger.warning(
+                    "Integral condition включён, но FVM-сетки нет — будет использован "
+                    "fallback по boundary-точкам."
+                )
+            self.loss_computer.fvm = None
+            return
+
+        try:
+            from fvm_residuals import FVMResiduals
+            fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
+            inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
+            inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
+            fvm.set_inlet_velocity(
+                torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
+            )
+            fvm.to(self.device)
+            self.loss_computer.fvm = fvm
+            logger.info("FVMResiduals подключён: %d узлов", fvm.N)
+        except Exception as e:
+            self.loss_computer.fvm = None
+            logger.warning("Не удалось инициализировать FVMResiduals: %s", e)
+
     def _init_optimizer(self, optim_type='adam') -> optim.Optimizer:
         opt_params = self.config.get('optimizer_params', {'lr': 1e-3})
         lr = opt_params.get('lr', 1e-3)
@@ -352,6 +405,28 @@ class PINNSolver:
                                max_iter=self.config['training']['lbfgs_max_iter'],
                                history_size=self.config['training']['lbfgs_history_size'],
                                line_search_fn='strong_wolfe')
+
+    def _ensure_sa_weights_shape(self, sa_state: Dict[str, torch.Tensor]) -> None:
+        """Пересоздаёт SA-веса, если чекпоинт сохранён после изменения размера датасета."""
+        if self.sa_weights is None or 'log_weights' not in sa_state:
+            return
+
+        target_shape = tuple(sa_state['log_weights'].shape)
+        current_shape = tuple(self.sa_weights.log_weights.shape)
+        if current_shape == target_shape:
+            return
+
+        n_points, n_eqns = target_shape
+        self.sa_weights = SelfAdaptiveWeights(n_points, n_eqns, init_val=1.0).to(self.device, self.dtype)
+        self.optimizer = self._init_optimizer(optim_type='adam')
+        self.scheduler = self._init_scheduler()
+        self.trainer.sa_weights = self.sa_weights
+        self.trainer.optimizer = self.optimizer
+        logger.info(
+            "SA-веса пересозданы под чекпоинт: %s -> %s",
+            current_shape,
+            target_shape,
+        )
 
     def _init_scheduler(self):
         lr_schedule = self.config['training']['lr_schedule']
@@ -373,6 +448,26 @@ class PINNSolver:
             return
         try:
             checkpoint = torch.load(load_path, map_location=self.device, weights_only=False)
+            # Сначала восстанавливаем данные/RAR-сетку, чтобы размеры SA-весов и
+            # optimizer state соответствовали фактическому датасету.
+            if 'data_handler_state' in checkpoint:
+                self.data_handler.load_state(checkpoint['data_handler_state'])
+                self.x_min = self.data_handler.dataset.x.min().item()
+                self.x_max = self.data_handler.dataset.x.max().item()
+                self.y_min = self.data_handler.dataset.y.min().item()
+                self.y_max = self.data_handler.dataset.y.max().item()
+                self.loss_computer.x_min = self.x_min
+                self.loss_computer.x_max = self.x_max
+                self.loss_computer.y_min = self.y_min
+                self.loss_computer.y_max = self.y_max
+                self._setup_fvm_residuals()
+                self.trainer._fvm_tensor_cache = None
+            elif self.trainer.rar_enable:
+                logger.warning(
+                    "Чекпоинт не содержит data_handler_state. Если он был сохранён после RAR, "
+                    "обучение продолжится на исходном датасете."
+                )
+
             # Загрузка модели (адаптация ключей для DataParallel)
             if 'model_state_dict' in checkpoint:
                 state_dict = checkpoint['model_state_dict']
@@ -384,7 +479,17 @@ class PINNSolver:
                         state_dict = {k[7:]: v for k, v in state_dict.items()}
                 self.model.load_state_dict(state_dict)
                 logger.info("Модель загружена из чекпоинта")
-            # Загрузка оптимизатора
+
+            # Загрузка SA-весов
+            if 'sa_weights_state_dict' in checkpoint and self.sa_weights:
+                self._ensure_sa_weights_shape(checkpoint['sa_weights_state_dict'])
+                self.sa_weights.load_state_dict(checkpoint['sa_weights_state_dict'])
+                self.trainer.sa_weights = self.sa_weights
+
+            if 'trainer_state' in checkpoint:
+                self.trainer.load_state(checkpoint['trainer_state'])
+
+            # Optimizer загружается после возможного resize SA-весов.
             if 'optimizer_state_dict' in checkpoint:
                 try:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -396,9 +501,6 @@ class PINNSolver:
                     self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 except Exception as e:
                     logger.warning(f"Не удалось загрузить scheduler: {e}")
-            # Загрузка SA-весов
-            if 'sa_weights_state_dict' in checkpoint and self.sa_weights:
-                self.sa_weights.load_state_dict(checkpoint['sa_weights_state_dict'])
             # Загрузка истории и эпохи
             if 'history' in checkpoint:
                 self.metrics.history = checkpoint['history']
@@ -439,7 +541,12 @@ class PINNSolver:
             history=self.metrics.history,
             sa_weights=self.sa_weights,
             epoch=identifier if isinstance(identifier, int) else None,
-            config=self.config
+            config=self.config,
+            extra_state={
+                'data_handler_state': self.data_handler.get_state(),
+                'trainer_state': self.trainer.get_state(),
+                'using_lbfgs': self.using_lbfgs,
+            }
         )
 
     # ------------------------------------------------------------------
@@ -456,12 +563,31 @@ class PINNSolver:
         )
         pred_norm = self._get_predictions_norm() if need_predictions else None
 
-        # 1. Карта невязки PDE (используем скользящее среднее point_residual вместо max_residual)
+        # 1. Карта невязки PDE + карта полной ошибки, используемой RAR
         if self.diagnostics_config.get('plot_residual_map', True):
-            residual = self.trainer.point_residual.numpy()  # скользящее среднее невязки
             x_np = self.data_handler.dataset.x.cpu().numpy().flatten() * self.data_handler.chord
             y_np = self.data_handler.dataset.y.cpu().numpy().flatten() * self.data_handler.chord
-            self.visualizer.plot_residual_map(x_np, y_np, residual, plots_dir, epoch)
+            residual_src = getattr(self.trainer, 'point_pde_residual', self.trainer.point_residual)
+            residual = residual_src.numpy()
+            if getattr(self.data_handler, 'mesh_domain_coords', None) is None:
+                self.data_handler.load_mesh_geometry_from_geom_config()
+            clip_polygon = getattr(self.data_handler, 'mesh_domain_coords', None)
+            airfoil_polyline = getattr(self.data_handler, 'mesh_airfoil_coords', None)
+            outline_polylines = [airfoil_polyline] if airfoil_polyline is not None else None
+            self.visualizer.plot_residual_map(
+                x_np, y_np, residual, plots_dir, epoch,
+                clip_polygon=clip_polygon,
+                mask_polygon=airfoil_polyline,
+                outline_polylines=outline_polylines,
+            )
+            if self.diagnostics_config.get('plot_rar_error_map', True):
+                rar_error = self.trainer.point_residual.numpy()
+                self.visualizer.plot_rar_error_map(
+                    x_np, y_np, rar_error, plots_dir, epoch,
+                    clip_polygon=clip_polygon,
+                    mask_polygon=airfoil_polyline,
+                    outline_polylines=outline_polylines,
+                )
 
         # 2. Профили скорости в нескольких сечениях с фильтрацией по y
         if self.diagnostics_config.get('plot_profiles', True) and pred_norm is not None:
@@ -667,10 +793,13 @@ class PINNSolver:
                     epoch,
                     interval=self.mass_metrics_interval
                 )
-                mass_error = abs(avg_u_in - avg_u_out) / (abs(avg_u_in) + 1e-12)
+                mass_metrics = self.metrics.get_mass_flow_metrics(
+                    epoch,
+                    interval=self.mass_metrics_interval
+                )
                 extra_diag['avg_u_in'] = avg_u_in
                 extra_diag['avg_u_out'] = avg_u_out
-                extra_diag['mass_balance_error'] = mass_error
+                extra_diag.update(mass_metrics)
 
                 # Обновление метрик
                 self.metrics.update_history(
@@ -696,8 +825,13 @@ class PINNSolver:
 
                 # RAR
                 if self.trainer.rar_enable and not self.using_lbfgs and epoch % self.trainer.rar_interval == 0:
-                    self.trainer.apply_rar()
-                    if hasattr(self.trainer, 'sa_weights_changed') and self.trainer.sa_weights_changed:
+                    added_rar_points = self.trainer.apply_rar()
+                    if added_rar_points:
+                        self.metrics.invalidate_boundary_cache()
+                    if (
+                        added_rar_points
+                        or (hasattr(self.trainer, 'sa_weights_changed') and self.trainer.sa_weights_changed)
+                    ):
                         self._recreate_optimizer()
                         self.trainer.sa_weights_changed = False
 
@@ -732,7 +866,11 @@ class PINNSolver:
                     epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time,
                     fvm_loss=self.trainer._last_fvm_loss
                 )
-                line2 = f"   avg u_inlet = {avg_u_in:.4f} (норм.), avg u_outlet = {avg_u_out:.4f} (норм.)"
+                line2 = (
+                    f"   avg u_inlet = {avg_u_in:.4f} (норм.), "
+                    f"avg u_outlet = {avg_u_out:.4f} (норм.), "
+                    f"mass err = {mass_metrics['mass_balance_error']:.3e}"
+                )
                 print(line2)
                 self.metrics.save_log(f"Epoch {epoch}: loss={loss:.2e}, " +
                                       ", ".join([f"{k}={v:.2e}" for k, v in pde_raw.items()]))

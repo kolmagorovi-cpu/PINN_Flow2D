@@ -33,6 +33,7 @@ diagnostics:
   compute_grad_cosine: false
   compute_ntk_condition: false
   interval: 50
+  mass_metrics_interval: 1
   plot_2d_spectrum: false
   plot_profiles: true
   plot_residual_map: true
@@ -104,7 +105,7 @@ training:
     patience: 100
     restore_best: true
   epochs: 1500
-  grad_clip: 1.0
+  grad_clip: null
   gradient_accumulation_steps: 1
   lbfgs_history_size: 100
   lbfgs_max_iter: 20
@@ -114,9 +115,19 @@ training:
   lr_detector_patience: 10
   lr_detector_recovery: 50
   lr_schedule: constant
-  rar_enable: false
+  rar_candidate_multiplier: 12
+  rar_enable: true
+  rar_error_quantile: 0.75
+  rar_fvm_min_new_points: 1
+  rar_fvm_rebuild_every: 1
   rar_interval: 100
-  rar_num_points: 200
+  rar_jitter_scale: 0.85
+  rar_min_boundary_distance_factor: 0.05
+  rar_min_distance_factor: 0.35
+  rar_mode: adaptive
+  rar_num_points: 1000
+  rar_rebuild_fvm: true
+  rar_residual_power: 1.0
   reset_interval: 0
   reset_noise: 0.01
   stage1_epochs: 100

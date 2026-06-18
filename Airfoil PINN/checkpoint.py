@@ -46,7 +46,8 @@ class CheckpointManager:
              history: Dict,
              sa_weights: Optional[SelfAdaptiveWeights] = None,
              epoch: Optional[int] = None,
-             config: Optional[Dict] = None) -> None:
+             config: Optional[Dict] = None,
+             extra_state: Optional[Dict[str, Any]] = None) -> None:
         """
         Сохраняет чекпоинт.
 
@@ -77,6 +78,8 @@ class CheckpointManager:
             'epoch': epoch,
             'config': config,
         }
+        if extra_state:
+            checkpoint.update(extra_state)
         if sa_weights is not None:
             checkpoint['sa_weights_state_dict'] = sa_weights.state_dict()
 

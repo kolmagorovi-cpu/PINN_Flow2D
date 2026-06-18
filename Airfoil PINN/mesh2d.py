@@ -973,6 +973,10 @@ class Mesh2D:
             bnd_face_area=bnd_area,
             node_type=np.array([nd.node_type for nd in self._nodes], dtype=object),
             node_bnd_type=np.array([nd.boundary_type for nd in self._nodes], dtype=object),
+            domain_coords=(self._domain_coords if self._domain_coords is not None
+                           else np.empty((0, 2), dtype=np.float64)),
+            airfoil_coords=(self._airfoil_coords if self._airfoil_coords is not None
+                            else np.empty((0, 2), dtype=np.float64)),
         )
         logger.info(
             "Mesh2D сохранена: %s  (%d узлов, %d треуг., %d вн. граней, %d гран. граней)",

@@ -12,7 +12,8 @@
     - добавлена возможность выбора начального поля скорости (constant, linear_x, perturbed)
     - добавлена возможность добавления шума к давлению
 
-Визуализация полей выполняется методом scatter, для SDF отображается физическое расстояние (умножением на chord).
+Визуализация полей выполняется гладкой интерполяционной заливкой, для SDF
+отображается физическое расстояние (умножением на chord).
 
 Example:
     >>> init = Initializer()
@@ -37,6 +38,7 @@ from functools import partial
 
 try:
     from scipy.spatial import cKDTree
+    from scipy.interpolate import griddata
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
@@ -181,6 +183,7 @@ class Initializer:
         self.velocity_perturbation_amplitude: float = 0.01
         self.pressure_perturbation_amplitude: float = 0.0
 
+        self.domain_coords: Optional[np.ndarray] = None
         self.foil_coords: Optional[np.ndarray] = None
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
@@ -251,23 +254,79 @@ class Initializer:
                 self.wall_tree = cKDTree(self.wall_points)
                 logger.info("KDTree построен (будет использован в однопоточном режиме).")
 
-    def load_foil_coords(self) -> None:
-        """
-        Загружает координаты профиля для визуализации.
-
-        Ищет файлы профиля в директории Geometry/Data.
-        """
-        foil_files = glob.glob(os.path.join(self.geometry_dir, "*foil*.npy"))
-        if not foil_files:
-            foil_files = glob.glob(os.path.join(self.geometry_dir, "*foil*.txt"))
-        if foil_files:
+    @staticmethod
+    def _load_coords(path_base: str) -> Optional[np.ndarray]:
+        for ext in (".npy", ".txt", ".csv"):
+            path = path_base + ext
+            if not os.path.exists(path):
+                continue
             try:
-                data = np.load(foil_files[0])
-                if data.ndim == 2 and data.shape[1] == 2:
-                    self.foil_coords = data
-                    logger.info(f"Загружены координаты профиля из {os.path.basename(foil_files[0])}")
-            except Exception:
-                pass
+                if ext == ".npy":
+                    data = np.asarray(np.load(path), dtype=np.float64)
+                else:
+                    data = np.asarray(
+                        np.loadtxt(path, delimiter=',' if ext == ".csv" else None),
+                        dtype=np.float64,
+                    )
+                data = data.reshape(-1, 2)
+                if len(data) >= 2:
+                    return data
+            except Exception as exc:
+                logger.debug("Не удалось загрузить координаты из %s: %s", path, exc)
+        return None
+
+    @staticmethod
+    def _current_geom_name() -> Optional[str]:
+        cfg_path = os.path.join(PROJECT_ROOT, "geom_config.yaml")
+        if not os.path.exists(cfg_path):
+            return None
+        try:
+            import yaml
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f) or {}
+            geom_name = cfg.get('geom_name')
+            return str(geom_name) if geom_name else None
+        except Exception as exc:
+            logger.debug("Не удалось прочитать geom_config.yaml: %s", exc)
+            return None
+
+    def _load_geometry_coords(self, suffix: str) -> Optional[np.ndarray]:
+        geom_name = self._current_geom_name()
+        search_dirs = [self.geometry_dir]
+        metadata_dir = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
+        if suffix == "foil":
+            search_dirs.append(metadata_dir)
+
+        if geom_name:
+            for directory in search_dirs:
+                coords = self._load_coords(os.path.join(directory, f"{geom_name}_{suffix}"))
+                if coords is not None:
+                    return coords
+
+        pattern = os.path.join(self.geometry_dir, f"*_{suffix}.*")
+        files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        for path in files:
+            base, _ = os.path.splitext(path)
+            coords = self._load_coords(base)
+            if coords is not None:
+                return coords
+        return None
+
+    def load_domain_coords(self) -> None:
+        """Загружает контур расчётного домена для маски визуализации."""
+        data = self._load_geometry_coords("domain")
+        if data is not None:
+            if len(data) > 2 and not np.allclose(data[0], data[-1], atol=1e-12):
+                data = np.vstack([data, data[0]])
+            self.domain_coords = data
+            logger.info("Загружены координаты домена для визуализации.")
+
+    def load_foil_coords(self) -> None:
+        """Загружает координаты профиля/пластины для визуализации."""
+        data = self._load_geometry_coords("foil")
+        if data is not None:
+            self.foil_coords = data
+            logger.info("Загружены координаты профиля для визуализации.")
 
     def _load_chord_from_metadata(self) -> float:
         """Определяет хорду из метаданных геометрии или оценивает по разбросу x."""
@@ -584,6 +643,168 @@ class Initializer:
         np.save(meta_path, meta)
         logger.info(f"Метаданные сохранены: {meta_path}")
 
+    @staticmethod
+    def _deduplicate_field_points(
+        x: np.ndarray,
+        y: np.ndarray,
+        values: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        xy = np.column_stack([x, y])
+        rounded = np.round(xy, decimals=12)
+        uniq, inverse = np.unique(rounded, axis=0, return_inverse=True)
+        counts = np.bincount(inverse).astype(np.float64)
+        val_sum = np.bincount(inverse, weights=values.astype(np.float64))
+        return uniq[:, 0], uniq[:, 1], val_sum / np.maximum(counts, 1.0)
+
+    @staticmethod
+    def _clean_polyline(polyline: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if polyline is None:
+            return None
+        line = np.asarray(polyline, dtype=np.float64).reshape(-1, 2)
+        finite = np.isfinite(line).all(axis=1)
+        line = line[finite]
+        if len(line) < 2:
+            return None
+        keep = np.ones(len(line), dtype=bool)
+        keep[1:] = np.linalg.norm(np.diff(line, axis=0), axis=1) > 1e-12
+        line = line[keep]
+        return line if len(line) >= 2 else None
+
+    @classmethod
+    def _clip_polygon(cls, clip_polygon: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        poly = cls._clean_polyline(clip_polygon)
+        if poly is None or len(poly) < 3:
+            return None
+        if not np.allclose(poly[0], poly[-1], atol=1e-12):
+            poly = np.vstack([poly, poly[0]])
+        return poly
+
+    @classmethod
+    def _closed_mask_polygon(cls, mask_polygon: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        poly = cls._clean_polyline(mask_polygon)
+        if poly is None or len(poly) < 3:
+            return None
+        if not np.allclose(poly[0], poly[-1], atol=1e-12):
+            return None
+        return poly
+
+    @classmethod
+    def _polyline(cls, polyline: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        return cls._clean_polyline(polyline)
+
+    @staticmethod
+    def _points_inside_polygon(x: np.ndarray, y: np.ndarray, poly: np.ndarray) -> np.ndarray:
+        pts = np.column_stack([np.asarray(x).ravel(), np.asarray(y).ravel()])
+        try:
+            from matplotlib.path import Path
+            return Path(poly).contains_points(pts).reshape(np.shape(x))
+        except Exception:
+            return np.zeros(np.shape(x), dtype=bool)
+
+    @classmethod
+    def _apply_grid_masks(
+        cls,
+        Xi: np.ndarray,
+        Yi: np.ndarray,
+        Zi: np.ndarray,
+        clip_poly: Optional[np.ndarray],
+        mask_poly: Optional[np.ndarray],
+    ) -> np.ndarray:
+        masked = np.array(Zi, copy=True)
+        if clip_poly is not None:
+            masked[~cls._points_inside_polygon(Xi, Yi, clip_poly)] = np.nan
+        if mask_poly is not None:
+            masked[cls._points_inside_polygon(Xi, Yi, mask_poly)] = np.nan
+        return masked
+
+    @staticmethod
+    def _plot_smooth_field(
+        x: np.ndarray,
+        y: np.ndarray,
+        values: np.ndarray,
+        label: str,
+        title: str,
+        cmap: str = 'jet',
+        clip_polygon: Optional[np.ndarray] = None,
+        mask_polygon: Optional[np.ndarray] = None,
+        outline_polylines: Optional[List[np.ndarray]] = None,
+        grid_size: int = 420,
+        levels: int = 96,
+    ) -> None:
+        """Рисует гладкую карту поля вместо точечной карты."""
+        x = np.asarray(x, dtype=np.float64).flatten()
+        y = np.asarray(y, dtype=np.float64).flatten()
+        values = np.asarray(values, dtype=np.float64).flatten()
+        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(values)
+        x, y, values = x[finite], y[finite], values[finite]
+        if len(values) == 0:
+            raise ValueError("нет конечных значений поля")
+
+        x, y, values = Initializer._deduplicate_field_points(x, y, values)
+        vmin = float(np.nanmin(values))
+        vmax = float(np.nanmax(values))
+        if abs(vmax - vmin) < 1e-30:
+            pad = max(abs(vmax), 1.0) * 1e-6
+            vmin -= pad
+            vmax += pad
+        level_values = np.linspace(vmin, vmax, levels)
+
+        artist = None
+        clip_poly = Initializer._clip_polygon(clip_polygon)
+        mask_poly = Initializer._closed_mask_polygon(mask_polygon)
+        if SCIPY_AVAILABLE and len(values) >= 4:
+            xi = np.linspace(float(x.min()), float(x.max()), grid_size)
+            yi = np.linspace(float(y.min()), float(y.max()), grid_size)
+            Xi, Yi = np.meshgrid(xi, yi)
+            method = 'cubic' if len(values) >= 16 else 'linear'
+            try:
+                Zi = griddata((x, y), values, (Xi, Yi), method=method)
+                if np.all(~np.isfinite(Zi)):
+                    Zi = griddata((x, y), values, (Xi, Yi), method='linear')
+                if np.any(np.isfinite(Zi)):
+                    Zi = Initializer._apply_grid_masks(Xi, Yi, Zi, clip_poly, mask_poly)
+                    artist = plt.contourf(Xi, Yi, Zi, levels=level_values,
+                                          cmap=cmap, extend='both')
+            except Exception as exc:
+                logger.debug("griddata не сработал для %s: %s", title, exc)
+
+        if artist is None:
+            try:
+                import matplotlib.tri as mtri
+                triang = mtri.Triangulation(x, y)
+                if clip_poly is not None or mask_poly is not None:
+                    tri_mask = np.zeros(len(triang.triangles), dtype=bool)
+                    centroids_x = x[triang.triangles].mean(axis=1)
+                    centroids_y = y[triang.triangles].mean(axis=1)
+                    if clip_poly is not None:
+                        tri_mask |= ~Initializer._points_inside_polygon(centroids_x, centroids_y, clip_poly)
+                    if mask_poly is not None:
+                        tri_mask |= Initializer._points_inside_polygon(centroids_x, centroids_y, mask_poly)
+                    triang.set_mask(tri_mask)
+                artist = plt.tricontourf(triang, values, levels=level_values,
+                                         cmap=cmap, extend='both')
+            except Exception as exc:
+                raise RuntimeError(f"Не удалось построить гладкую заливку для поля {title}") from exc
+
+        if clip_poly is not None:
+            plt.plot(clip_poly[:, 0], clip_poly[:, 1], color='black', linewidth=0.9)
+        if outline_polylines:
+            for line in outline_polylines:
+                line_arr = Initializer._polyline(line)
+                if line_arr is not None:
+                    plt.plot(line_arr[:, 0], line_arr[:, 1], color='black', linewidth=1.2)
+        elif mask_polygon is not None:
+            line_arr = Initializer._polyline(mask_polygon)
+            if line_arr is not None:
+                plt.plot(line_arr[:, 0], line_arr[:, 1], color='black', linewidth=1.2)
+
+        plt.colorbar(artist, label=label)
+        plt.title(title)
+        plt.xlabel('x, м')
+        plt.ylabel('y, м')
+        plt.axis('equal')
+        plt.grid(alpha=0.15)
+
     def plot_field(
         self,
         field_name: str,
@@ -592,7 +813,7 @@ class Initializer:
         show: bool = False
     ) -> None:
         """
-        Строит scatter-график указанного поля.
+        Строит гладкую карту указанного поля.
 
         Args:
             field_name: Имя поля для визуализации
@@ -613,18 +834,17 @@ class Initializer:
             values = self.points_norm[field_name]
             label = field_name
 
-        plt.scatter(x, y, c=values, s=1, cmap='jet', alpha=0.6)
-        plt.colorbar(label=label)
-        plt.title(title or f"Поле {field_name}")
-        plt.xlabel('x, м')
-        plt.ylabel('y, м')
-        plt.axis('equal')
-        plt.grid(alpha=0.3)
-
-        if self.foil_coords is not None:
-            plt.plot(self.foil_coords[:, 0], self.foil_coords[:, 1],
-                     'k-', linewidth=1.5, label='Профиль')
-            plt.legend()
+        self._plot_smooth_field(
+            x,
+            y,
+            values,
+            label=label,
+            title=title or f"Поле {field_name}",
+            cmap='jet',
+            clip_polygon=self.domain_coords,
+            mask_polygon=self.foil_coords,
+            outline_polylines=[self.foil_coords] if self.foil_coords is not None else None,
+        )
 
         if save:
             filename = os.path.join(self.plots_dir, f"{field_name}.png")
@@ -641,6 +861,7 @@ class Initializer:
 
         Визуализирует: p_norm, u_norm, v_norm, sdf_norm.
         """
+        self.load_domain_coords()
         self.load_foil_coords()
         fields = [
             ('p_norm', 'Нормализованное давление'),

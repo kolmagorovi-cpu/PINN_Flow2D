@@ -18,6 +18,7 @@
 """
 
 import logging
+import os
 from collections import deque
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -27,6 +28,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler
 import numpy as np
+from scipy.spatial import cKDTree
 
 from utils import safe_grad
 
@@ -53,6 +55,7 @@ class Trainer:
         using_lbfgs: bool = False,
         diagnostics_config: Optional[Dict] = None,
         use_amp: Optional[bool] = None,
+        plots_dir: Optional[str] = None,
     ):
         """
         Args:
@@ -67,6 +70,7 @@ class Trainer:
             scaler: скалер для AMP (опционально)
             using_lbfgs: флаг, указывающий, что используется L-BFGS
             diagnostics_config: словарь с настройками диагностики (интервалы, флаги и т.п.)
+            plots_dir: директория для сохранения диагностических графиков
         """
         self.model = model
         self.optimizer = optimizer
@@ -78,6 +82,7 @@ class Trainer:
         self.sa_weights = sa_weights
         self.scaler = scaler
         self.using_lbfgs = using_lbfgs
+        self.plots_dir = plots_dir
 
         # Параметры обучения
         tr = config
@@ -88,6 +93,21 @@ class Trainer:
         self.rar_enable = tr.get('rar_enable', False)
         self.rar_interval = tr.get('rar_interval', 100)
         self.rar_num_points = tr.get('rar_num_points', 200)
+        self.rar_mode = str(tr.get('rar_mode', 'adaptive')).lower()
+        self.rar_score_mode = str(tr.get('rar_score_mode', 'total_loss')).lower()
+        self.rar_error_quantile = float(tr.get('rar_error_quantile', 0.75))
+        self.rar_residual_power = float(tr.get('rar_residual_power', 1.0))
+        self.rar_candidate_multiplier = max(4, int(tr.get('rar_candidate_multiplier', 12)))
+        self.rar_jitter_scale = float(tr.get('rar_jitter_scale', 0.85))
+        self.rar_min_distance_factor = float(tr.get('rar_min_distance_factor', 0.35))
+        self.rar_min_boundary_distance_factor = float(
+            tr.get('rar_min_boundary_distance_factor', 0.05)
+        )
+        self.rar_rebuild_fvm = bool(tr.get('rar_rebuild_fvm', True))
+        self.rar_fvm_rebuild_every = max(1, int(tr.get('rar_fvm_rebuild_every', 1)))
+        self.rar_fvm_min_new_points = max(1, int(tr.get('rar_fvm_min_new_points', 1)))
+        self.rar_save_mesh_volume_plot = bool(tr.get('rar_save_mesh_volume_plot', True))
+        self.rar_mesh_plot_dpi = int(tr.get('rar_mesh_plot_dpi', 150))
         self.use_amp = bool(use_amp) if use_amp is not None else tr.get('use_amp', False)
 
         # Адаптивная балансировка весов BC (только для soft граничных условий)
@@ -102,14 +122,18 @@ class Trainer:
             for name in self.data_handler.boundary_type_names:
                 self.loss_ma[name] = deque(maxlen=self.adapt_window)
 
-        # Хранилище невязок для RAR и диагностики (на CPU)
+        # Хранилище score для RAR и диагностики (на CPU).
+        # point_residual сейчас означает именно RAR score: local total-loss
+        # при rar_score_mode='total_loss' или PDE-score при rar_score_mode='pde'.
         self.point_residual = torch.zeros(
             self.data_handler.n_points,
             device='cpu',
             dtype=self.dtype
         )
-        # Для хранения максимальных невязок по точкам (для карты)
         self.max_residual = torch.zeros_like(self.point_residual)
+        # Отдельная карта чистой PDE-невязки для привычного residual_map.
+        self.point_pde_residual = torch.zeros_like(self.point_residual)
+        self.max_pde_residual = torch.zeros_like(self.point_residual)
 
         # История RAR (для статистики)
         self.rar_history = []  # список словарей с типами границ добавленных точек
@@ -122,6 +146,10 @@ class Trainer:
         self.fvm_batch_interval: int = getattr(loss_computer, 'fvm_batch_interval', 1)
         self._fvm_epoch_counter = 0
         self._last_fvm_loss = 0.0
+        self._last_integral_loss = 0.0
+        self._rar_fvm_rebuild_counter = 0
+        self._rar_new_points_since_fvm = 0
+        self._rar_step_counter = 0
 
         # Параметры диагностики
         self.diag_config = diagnostics_config or {}
@@ -139,7 +167,15 @@ class Trainer:
     # ------------------------------------------------------------------
     # Прямой проход (вычисление всех компонент потерь)
     # ------------------------------------------------------------------
-    def forward_pass(self, batch: Tuple, pde_mult: float = 1.0, add_fvm: bool = False) -> Dict[str, Any]:
+    def forward_pass(
+        self,
+        batch: Tuple,
+        pde_mult: float = 1.0,
+        add_fvm: bool = False,
+        fvm_scale: float = 1.0,
+        add_integral: bool = False,
+        integral_scale: float = 1.0,
+    ) -> Dict[str, Any]:
         """
         Выполняет прямой проход для одного батча, вычисляет все компоненты потерь
         и возвращает словарь с результатами, включая отдельные тензоры потерь.
@@ -183,18 +219,7 @@ class Trainer:
         cont = res['cont']
         mom1 = res[self.loss_computer.pde_components[1]]
         mom2 = res[self.loss_computer.pde_components[2]]
-
-        # Сохраняем невязки для RAR (открепляем от графа)
-        cont_res = cont.detach().cpu()
-        mom1_res = mom1.detach().cpu()
-        mom2_res = mom2.detach().cpu()
-        total_res = cont_res + mom1_res + mom2_res
-
-        # Обновляем скользящее среднее невязки для RAR
-        alpha = 0.9
-        self.point_residual[idx.cpu()] = alpha * self.point_residual[idx.cpu()] + (1 - alpha) * total_res.flatten()
-        # Обновляем максимальную невязку (для карты)
-        self.max_residual[idx.cpu()] = torch.max(self.max_residual[idx.cpu()], total_res.flatten())
+        self._update_pde_point_residual(idx, cont + mom1 + mom2)
 
         # Средние и максимальные значения для отчёта
         pde_raw = {
@@ -209,6 +234,8 @@ class Trainer:
         }
 
         # Взвешивание PDE с учётом SA-весов (если используются)
+        w_pde = None
+        w_bc = None
         if self.sa_weights is not None:
             w = self.sa_weights()[idx]
             if self.loss_computer.sa_apply_to_bc:
@@ -253,25 +280,70 @@ class Trainer:
             # Создаём нулевой тензор, который требует градиент (чтобы избежать ошибок в диагностике)
             bc_loss = torch.zeros(1, device=self.device, dtype=self.dtype, requires_grad=True).squeeze()
 
-        # Интегральная потеря
-        integral_loss = self.loss_computer.compute_integral_loss(u, v, bt, x, y) * self.loss_computer.integral_weight
+        # RAR использует локальный аналог Total Loss: взвешенная PDE-часть
+        # плюс точечные BC-вклады. Глобальные integral/FVM не имеют координатной
+        # локализации и не влияют на ранжирование точек.
+        rar_point_score = self._compute_rar_point_score(
+            cont=cont,
+            mom1=mom1,
+            mom2=mom2,
+            u=u,
+            v=v,
+            p=p,
+            x=x,
+            y=y,
+            boundary_types=bt,
+            pde_mult=pde_mult,
+            w_pde=w_pde,
+            w_bc=w_bc,
+        )
+        self._update_rar_point_score(idx, rar_point_score)
 
-        # FVM-потеря (полный проход по всей сетке, добавляется к тому же графу)
+        # Глобальные интегральные/FVM потери не считаются по случайному mini-batch.
+        # Trainer включает их только на запланированных batch-ах и нормирует
+        # вклад так, чтобы пользовательский вес не умножался на число запусков.
+        integral_raw_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
+        integral_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
         fvm_loss_val = 0.0
-        if add_fvm and self.loss_computer.fvm is not None and self.loss_computer.fvm_weight > 0.0:
+        fvm_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
+
+        needs_fvm_forward = (
+            self.loss_computer.fvm is not None
+            and (
+                (add_fvm and self.loss_computer.fvm_weight > 0.0)
+                or (add_integral and self.loss_computer.integral_condition)
+            )
+        )
+        out_fvm = None
+        x_fvm = None
+        if needs_fvm_forward:
             if hasattr(self.data_handler, 'fvm_x'):
                 x_fvm, y_fvm, sdf_fvm, bt_fvm = self._get_fvm_tensors()
                 inp_fvm  = self.loss_computer.build_input_tensor(x_fvm, y_fvm, sdf_fvm, bt_fvm)
                 out_fvm  = self.model(inp_fvm)
-                fvm_t    = self.loss_computer.compute_fvm_loss(out_fvm[:, :2])
-                fvm_loss_val = fvm_t.item()
             else:
-                fvm_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
-        else:
-            fvm_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
+                logger.warning("FVM/integral: fvm-тензоры не подготовлены, глобальный сеточный проход пропущен.")
+
+        if add_integral and self.loss_computer.integral_condition:
+            if out_fvm is not None and self.loss_computer.fvm is not None:
+                integral_raw_t = self.loss_computer.compute_mesh_integral_loss(
+                    out_fvm[:, :2],
+                    self.loss_computer.fvm.bnd_node,
+                    self.loss_computer.fvm.bnd_S,
+                    self.loss_computer.fvm.bnd_type,
+                    node_x=x_fvm,
+                )
+            else:
+                integral_raw_t = self._compute_global_integral_loss_from_dataset()
+            integral_t = integral_raw_t * self.loss_computer.integral_weight * float(integral_scale)
+
+        if add_fvm and out_fvm is not None and self.loss_computer.fvm_weight > 0.0:
+            fvm_weighted_t = self.loss_computer.compute_fvm_loss(out_fvm[:, :2])
+            fvm_loss_val = fvm_weighted_t.item()
+            fvm_t = fvm_weighted_t * float(fvm_scale)
 
         # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют
-        total_loss = pde_loss + bc_loss + integral_loss + fvm_t
+        total_loss = pde_loss + bc_loss + integral_t + fvm_t
 
         # Средняя скорость на стенке (для мониторинга)
         wall_speed = None
@@ -288,7 +360,7 @@ class Trainer:
             'pde_max': pde_max,
             'bc_comp': {k: v.item() for k, v in bc_comp.items()} if self.loss_computer.bc_type == 'soft' else {},
             'extra_grad': extra_grad.item() if self.loss_computer.bc_type == 'soft' else 0.0,
-            'integral_loss': integral_loss.item() if torch.is_tensor(integral_loss) else integral_loss,
+            'integral_loss': integral_raw_t.item() if torch.is_tensor(integral_raw_t) else integral_raw_t,
             'fvm_loss': fvm_loss_val,
             'wall_speed': wall_speed,
             # Возвращаем отдельные тензоры потерь для градиентного анализа
@@ -297,7 +369,7 @@ class Trainer:
                 'mom1': loss_1,
                 'mom2': loss_2,
                 'bc': bc_loss,          # теперь всегда тензор
-                'integral': integral_loss
+                'integral': integral_t
             },
             'u': u.detach(),  # для профилей и спектров
             'v': v.detach(),
@@ -305,6 +377,133 @@ class Trainer:
             'y': y.detach(),
             'idx': idx.cpu()
         }
+
+    def _compute_rar_point_score(
+        self,
+        cont: torch.Tensor,
+        mom1: torch.Tensor,
+        mom2: torch.Tensor,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        p: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+        pde_mult: float,
+        w_pde: Optional[torch.Tensor],
+        w_bc: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Возвращает локальный score для RAR.
+
+        rar_score_mode='total_loss' приближает batch total_loss на уровне
+        отдельных точек: weighted PDE + pointwise BC. Глобальные integral/FVM
+        части не добавляются, так как они не задают место вставки новой точки.
+        rar_score_mode='pde' оставляет прежнее поведение.
+        """
+        if self.rar_score_mode in ('pde', 'residual', 'pde_residual'):
+            score = cont + mom1 + mom2
+            return torch.nan_to_num(score.flatten(), nan=0.0, posinf=0.0, neginf=0.0)
+
+        lw = self.loss_computer.loss_weights
+        pde_terms = [
+            lw['cont'] * cont,
+            lw[self.loss_computer.pde_components[1]] * mom1,
+            lw[self.loss_computer.pde_components[2]] * mom2,
+        ]
+        if w_pde is not None:
+            pde_terms = [
+                pde_terms[0] * w_pde[:, 0].view(-1, 1),
+                pde_terms[1] * w_pde[:, 1].view(-1, 1),
+                pde_terms[2] * w_pde[:, 2].view(-1, 1),
+            ]
+        score = pde_mult * (pde_terms[0] + pde_terms[1] + pde_terms[2])
+
+        if self.loss_computer.bc_type == 'soft' and boundary_types is not None:
+            score = score + self._compute_bc_point_score(
+                u=u,
+                v=v,
+                p=p,
+                x=x,
+                y=y,
+                boundary_types=boundary_types,
+                w_bc=w_bc,
+            ).view(-1, 1)
+
+        return torch.nan_to_num(score.flatten(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compute_bc_point_score(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        p: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        boundary_types: torch.Tensor,
+        w_bc: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Точечный вклад BC-loss для RAR total_loss score."""
+        score = torch.zeros_like(u).flatten()
+        if boundary_types.shape[1] == 0:
+            return score
+
+        for i, name in enumerate(self.data_handler.boundary_type_names):
+            if i >= boundary_types.shape[1]:
+                continue
+            mask = (boundary_types[:, i].view(-1, 1) > 0.5)
+            if not bool(mask.any()):
+                continue
+
+            point_loss = torch.zeros_like(u)
+            extra_point_loss = torch.zeros_like(u)
+            if name == 'inlet':
+                point_loss = (
+                    (u - self.data_handler.inlet_u_norm) ** 2
+                    + (v - self.data_handler.inlet_v_norm) ** 2
+                )
+            elif name == 'outlet':
+                point_loss = p ** 2
+            elif name == 'wall':
+                point_loss = u ** 2 + v ** 2
+            elif name == 'symmetry':
+                # create_graph=True keeps the training graph intact for the
+                # subsequent total_loss.backward().
+                du_dy = safe_grad(u, y, create_graph=True, silent=True)
+                point_loss = v ** 2
+                extra_point_loss = self.loss_computer.loss_weights.get('symmetry_grad', 10.0) * du_dy ** 2
+            elif name == 'axis_symmetry':
+                # create_graph=True keeps the training graph intact for the
+                # subsequent total_loss.backward().
+                dv_dr = safe_grad(v, x, create_graph=True, silent=True)
+                point_loss = u ** 2
+                extra_point_loss = self.loss_computer.loss_weights.get('axis_symmetry_grad', 10.0) * dv_dr ** 2
+            else:
+                continue
+
+            if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
+                weighted = point_loss.flatten() * w_bc[:, i]
+            else:
+                weighted = point_loss.flatten() * self.loss_computer.loss_weights.get(name, 0.0)
+            weighted = weighted + extra_point_loss.flatten()
+            score = torch.where(mask.flatten(), score + weighted, score)
+
+        return score
+
+    def _update_rar_point_score(self, idx: torch.Tensor, point_score: torch.Tensor) -> None:
+        """Обновляет EMA и максимум score, по которому adaptive RAR выбирает области."""
+        score_cpu = point_score.detach().cpu().flatten()
+        idx_cpu = idx.detach().cpu()
+        alpha = 0.9
+        self.point_residual[idx_cpu] = alpha * self.point_residual[idx_cpu] + (1 - alpha) * score_cpu
+        self.max_residual[idx_cpu] = torch.max(self.max_residual[idx_cpu], score_cpu)
+
+    def _update_pde_point_residual(self, idx: torch.Tensor, pde_score: torch.Tensor) -> None:
+        """Обновляет EMA и максимум чистой PDE-невязки для residual_map."""
+        score_cpu = pde_score.detach().cpu().flatten()
+        idx_cpu = idx.detach().cpu()
+        alpha = 0.9
+        self.point_pde_residual[idx_cpu] = alpha * self.point_pde_residual[idx_cpu] + (1 - alpha) * score_cpu
+        self.max_pde_residual[idx_cpu] = torch.max(self.max_pde_residual[idx_cpu], score_cpu)
 
     # ------------------------------------------------------------------
     # Вычисление градиентов PDE и BC отдельно
@@ -409,6 +608,7 @@ class Trainer:
         Учитывает hard constraints, если они используются.
         Возвращает словарь с ключами 'x', 'y', 'u', 'v', 'p' (физические единицы).
         """
+        was_training = self.model.training
         self.model.eval()
         dataloader = self.data_handler.get_eval_dataloader()
         all_u = []
@@ -574,20 +774,112 @@ class Trainer:
         self.model.zero_grad()
         return mean_grad
 
+    def get_state(self) -> Dict[str, Any]:
+        """Состояние Trainer, необходимое для корректного resume после RAR."""
+        return {
+            'point_residual': self.point_residual,
+            'max_residual': self.max_residual,
+            'point_pde_residual': self.point_pde_residual,
+            'max_pde_residual': self.max_pde_residual,
+            'rar_history': self.rar_history,
+            'rar_used_sources': sorted(getattr(self, '_rar_used_sources', set())),
+            'fvm_epoch_counter': self._fvm_epoch_counter,
+            'last_fvm_loss': self._last_fvm_loss,
+            'last_integral_loss': self._last_integral_loss,
+            'rar_fvm_rebuild_counter': self._rar_fvm_rebuild_counter,
+            'rar_new_points_since_fvm': self._rar_new_points_since_fvm,
+            'rar_step_counter': self._rar_step_counter,
+        }
+
+    def load_state(self, state: Optional[Dict[str, Any]]) -> None:
+        """Восстанавливает состояние Trainer из чекпоинта."""
+        if not state:
+            return
+
+        n_points = self.data_handler.n_points
+
+        def restore_tensor(name: str, current: torch.Tensor) -> torch.Tensor:
+            value = state.get(name)
+            if value is None:
+                return current
+            tensor = value.detach().cpu().to(dtype=self.dtype).flatten()
+            if tensor.numel() == n_points:
+                return tensor
+            restored = torch.zeros(n_points, device='cpu', dtype=self.dtype)
+            n = min(n_points, tensor.numel())
+            restored[:n] = tensor[:n]
+            logger.warning(
+                "Trainer state '%s' имеет длину %d, а датасет %d; состояние усечено/дополнено.",
+                name,
+                tensor.numel(),
+                n_points,
+            )
+            return restored
+
+        self.point_residual = restore_tensor('point_residual', self.point_residual)
+        self.max_residual = restore_tensor('max_residual', self.max_residual)
+        self.point_pde_residual = restore_tensor('point_pde_residual', self.point_pde_residual)
+        self.max_pde_residual = restore_tensor('max_pde_residual', self.max_pde_residual)
+        self.rar_history = list(state.get('rar_history', self.rar_history) or [])
+        self._rar_used_sources = set(int(v) for v in state.get('rar_used_sources', []))
+        self._fvm_epoch_counter = int(state.get('fvm_epoch_counter', self._fvm_epoch_counter))
+        self._last_fvm_loss = float(state.get('last_fvm_loss', self._last_fvm_loss))
+        self._last_integral_loss = float(state.get('last_integral_loss', self._last_integral_loss))
+        self._rar_fvm_rebuild_counter = int(state.get('rar_fvm_rebuild_counter', self._rar_fvm_rebuild_counter))
+        self._rar_new_points_since_fvm = int(state.get('rar_new_points_since_fvm', self._rar_new_points_since_fvm))
+        self._rar_step_counter = int(state.get('rar_step_counter', self._rar_step_counter))
+        self._fvm_tensor_cache = None
+
     # ------------------------------------------------------------------
     # RAR с сохранением статистики и корректным расширением данных/весов
     # ------------------------------------------------------------------
     def apply_rar(self):
         """
-        Добавляет точки с наибольшей невязкой в датасет, обновляет связанные структуры
-        и сохраняет статистику по типам границ добавленных точек.
-        Если используются SA-веса, они также расширяются, и выставляется флаг sa_weights_changed.
-        ИСПРАВЛЕНО: новые точки инициализируются нулевой невязкой (вместо копирования старых значений),
-        чтобы избежать дублирования высоких невязок.
+        Adaptive RAR добавляет новые координаты в областях высокой PDE-невязки.
+
+        Старый режим дублирования сохранён как rar_mode='legacy'. Он полезен
+        только как перевзвешивание датасета и не меняет FVM-сетку.
         """
         if not self.rar_enable:
-            return
-        logger.info("Применение RAR: добавление точек с наибольшей невязкой...")
+            return 0
+
+        if self.rar_mode == 'legacy':
+            return self._apply_rar_legacy()
+
+        logger.info("Adaptive RAR: генерация новых точек по карте RAR-score...")
+        generated = self._generate_adaptive_rar_points(self.rar_num_points)
+        if generated is None:
+            logger.info("Adaptive RAR: новые точки не добавлены.")
+            return 0
+
+        x_new, y_new, sdf_new = generated
+        added = self.data_handler.add_interior_points(x_new, y_new, sdf_new)
+        if added == 0:
+            logger.info("Adaptive RAR: DataHandler не добавил новых точек.")
+            return 0
+
+        new_residual = torch.zeros(added, device='cpu', dtype=self.dtype)
+        self.point_residual = torch.cat([self.point_residual, new_residual], dim=0)
+        self.max_residual = torch.cat([self.max_residual, torch.zeros_like(new_residual)], dim=0)
+        self.point_pde_residual = torch.cat([self.point_pde_residual, torch.zeros_like(new_residual)], dim=0)
+        self.max_pde_residual = torch.cat([self.max_pde_residual, torch.zeros_like(new_residual)], dim=0)
+        self._extend_sa_weights(added)
+
+        self.rar_history.append({'interior': added})
+        self._rar_step_counter += 1
+        self._rar_new_points_since_fvm += added
+        self._maybe_rebuild_fvm_after_rar()
+
+        logger.info(
+            "Adaptive RAR: добавлено %d новых точек. Теперь всего точек: %d",
+            added,
+            self.data_handler.n_points,
+        )
+        return added
+
+    def _apply_rar_legacy(self) -> int:
+        """Старый RAR: дублирует точки с высокой невязкой без изменения координат."""
+        logger.info("Legacy RAR: дублирование точек с наибольшей невязкой...")
         dataset = self.data_handler.dataset
         source_indices = getattr(dataset, 'source_indices', torch.arange(len(self.point_residual)))
         used_sources = getattr(self, '_rar_used_sources', set())
@@ -600,45 +892,294 @@ class Trainer:
         candidate_count = int(candidate_mask.sum().item())
         top_k = min(self.rar_num_points, candidate_count)
         if top_k == 0:
-            logger.info("RAR: нет новых исходных точек для перевзвешивания.")
-            return
+            logger.info("Legacy RAR: нет новых исходных точек для перевзвешивания.")
+            return 0
+
         candidate_residual = self.point_residual.clone()
         candidate_residual[~candidate_mask] = -torch.inf
-        values, indices = torch.topk(candidate_residual, top_k)
-        indices = indices.numpy()
-        selected_sources = source_indices[torch.tensor(indices, dtype=torch.long)].cpu().tolist()
+        _, indices = torch.topk(candidate_residual, top_k)
+        indices_np = indices.numpy()
+        selected_sources = source_indices[indices].cpu().tolist()
         self._rar_used_sources = used_sources | set(int(s) for s in selected_sources)
 
-        # Сохраняем статистику по типам границ добавленных точек
         if dataset.boundary_types is not None:
-            bt = dataset.boundary_types[indices].cpu().numpy()
+            bt = dataset.boundary_types[indices_np].cpu().numpy()
             counts = bt.sum(axis=0)
             stat = dict(zip(self.data_handler.boundary_type_names, counts))
             self.rar_history.append(stat)
 
-        # Расширяем датасет через DataHandler
-        self.data_handler.add_points(torch.tensor(indices, dtype=torch.long))
+        self.data_handler.add_points(indices.long())
 
-        # Обновляем point_residual и max_residual:
-        # новые точки получают нулевую невязку (можно также вычислить заново, но это дорого)
         new_residual = torch.zeros(top_k, device='cpu', dtype=self.dtype)
-        new_max = torch.zeros(top_k, device='cpu', dtype=self.dtype)
         self.point_residual = torch.cat([self.point_residual, new_residual], dim=0)
-        self.max_residual = torch.cat([self.max_residual, new_max], dim=0)
+        self.max_residual = torch.cat([self.max_residual, torch.zeros_like(new_residual)], dim=0)
+        self.point_pde_residual = torch.cat([self.point_pde_residual, torch.zeros_like(new_residual)], dim=0)
+        self.max_pde_residual = torch.cat([self.max_pde_residual, torch.zeros_like(new_residual)], dim=0)
+        self._extend_sa_weights(top_k)
+        logger.info("Legacy RAR: добавлено %d копий. FVM-сетка не перестраивается.", top_k)
+        return top_k
 
-        # Если используются SA-веса, расширяем их и устанавливаем флаг
-        if self.sa_weights is not None:
-            old_weights = self.sa_weights.log_weights.detach().cpu()
-            # Для новых точек используем тот же raw-параметр, что и при начальной инициализации.
-            init_raw = float(getattr(self.sa_weights, 'initial_raw_value', 0.0))
-            new_weights = torch.full((top_k, old_weights.shape[1]), init_raw, device='cpu')
-            combined_weights = torch.cat([old_weights, new_weights], dim=0)
-            # Заменяем параметр (это допустимо, так как оптимизатор будет пересоздан)
-            self.sa_weights.log_weights = nn.Parameter(combined_weights.to(self.device))
-            self.sa_weights_changed = True
-            logger.warning("RAR: SA-веса расширены. Требуется пересоздание оптимизатора в solver.")
+    def _extend_sa_weights(self, n_new: int) -> None:
+        """Расширяет SA-веса после добавления новых точек."""
+        if self.sa_weights is None or n_new <= 0:
+            return
+        old_weights = self.sa_weights.log_weights.detach().cpu()
+        init_raw = float(getattr(self.sa_weights, 'initial_raw_value', 0.0))
+        new_weights = torch.full((n_new, old_weights.shape[1]), init_raw, device='cpu')
+        combined_weights = torch.cat([old_weights, new_weights], dim=0)
+        self.sa_weights.log_weights = nn.Parameter(combined_weights.to(self.device))
+        self.sa_weights_changed = True
+        logger.warning("RAR: SA-веса расширены. Требуется пересоздание оптимизатора в solver.")
 
-        logger.info(f"RAR: добавлено {top_k} точек. Теперь всего точек: {self.data_handler.n_points}")
+    def _generate_adaptive_rar_points(
+        self,
+        n_points: int,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """
+        Генерирует новые interior-точки около областей с высокой point_residual.
+
+        Плотность задаётся вероятностью выбора source-точки:
+        P(source_i) ∝ residual_i ** rar_residual_power.
+        """
+        if n_points <= 0 or len(self.point_residual) == 0:
+            return None
+
+        dh = self.data_handler
+        ds = dh.dataset
+        coords = np.column_stack([
+            ds.x.cpu().numpy().reshape(-1),
+            ds.y.cpu().numpy().reshape(-1),
+        ]).astype(np.float64)
+        residual = self.point_residual.detach().cpu().numpy().reshape(-1).astype(np.float64)
+
+        if len(residual) != len(coords):
+            logger.warning(
+                "Adaptive RAR: размер residual (%d) не совпадает с датасетом (%d)",
+                len(residual), len(coords),
+            )
+            return None
+
+        if ds.boundary_types is not None and 'interior' in ds.type_to_idx:
+            interior_mask = (ds.boundary_types[:, ds.type_to_idx['interior']] > 0.5).cpu().numpy()
+        else:
+            interior_mask = ~getattr(ds, 'on_boundary', torch.zeros(ds.n_points, dtype=torch.bool)).cpu().numpy()
+
+        finite = np.isfinite(residual) & (residual > 0.0) & interior_mask
+        if not np.any(finite):
+            logger.info("Adaptive RAR: пока нет положительной PDE-невязки на interior-точках.")
+            return None
+
+        source_idx_all = np.where(finite)[0]
+        source_res_all = residual[source_idx_all]
+        q = min(max(self.rar_error_quantile, 0.0), 0.99)
+        threshold = float(np.quantile(source_res_all, q))
+        source_idx = source_idx_all[source_res_all >= threshold]
+        source_res = residual[source_idx]
+        if len(source_idx) == 0:
+            return None
+
+        weights = np.maximum(source_res, 0.0) + 1e-30
+        weights = np.power(weights, max(self.rar_residual_power, 1e-6))
+        weights = weights / weights.sum()
+
+        existing_tree = cKDTree(coords)
+        k = min(2, len(coords))
+        nn_dist, _ = existing_tree.query(coords, k=k)
+        if np.ndim(nn_dist) > 1:
+            local_h = nn_dist[:, 1]
+        else:
+            local_h = np.full(len(coords), float(np.median(nn_dist)))
+        positive_h = local_h[local_h > 1e-12]
+        median_h = float(np.median(positive_h)) if len(positive_h) else 1e-3
+        local_h = np.where(local_h > 1e-12, local_h, median_h)
+
+        domain_norm = None
+        if dh.mesh_domain_coords is not None:
+            domain_norm = np.asarray(dh.mesh_domain_coords, dtype=np.float64) / float(dh.chord)
+        foil_norm = None
+        if dh.mesh_airfoil_coords is not None:
+            foil_norm = np.asarray(dh.mesh_airfoil_coords, dtype=np.float64) / float(dh.chord)
+
+        wall_tree = self._build_wall_tree(coords, ds)
+        accepted: List[np.ndarray] = []
+        accepted_sdf: List[float] = []
+        max_attempts = max(n_points * self.rar_candidate_multiplier * 20, n_points)
+        attempts = 0
+
+        while len(accepted) < n_points and attempts < max_attempts:
+            need = n_points - len(accepted)
+            batch_n = min(max(need * self.rar_candidate_multiplier, 64), 4096)
+            attempts += batch_n
+
+            src = np.random.choice(source_idx, size=batch_n, replace=True, p=weights)
+            radius = self.rar_jitter_scale * local_h[src] * np.sqrt(np.random.random(batch_n))
+            theta = 2.0 * np.pi * np.random.random(batch_n)
+            cand = coords[src] + np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
+
+            valid = self._valid_interior_mask(cand, domain_norm, foil_norm)
+            if not np.any(valid):
+                continue
+            cand = cand[valid]
+            src = src[valid]
+
+            for xy, src_i in zip(cand, src):
+                if len(accepted) >= n_points:
+                    break
+                min_dist = self.rar_min_distance_factor * local_h[src_i]
+                if float(existing_tree.query(xy, k=1)[0]) < min_dist:
+                    continue
+                if accepted:
+                    acc_arr = np.vstack(accepted)
+                    if float(np.linalg.norm(acc_arr - xy, axis=1).min()) < min_dist:
+                        continue
+
+                if wall_tree is not None:
+                    sdf = float(wall_tree.query(xy, k=1)[0])
+                    min_sdf = self.rar_min_boundary_distance_factor * median_h
+                    if sdf < min_sdf:
+                        continue
+                else:
+                    sdf = 0.0
+
+                accepted.append(np.asarray(xy, dtype=np.float64))
+                accepted_sdf.append(sdf)
+
+        if not accepted:
+            logger.warning("Adaptive RAR: не удалось сгенерировать допустимые новые точки.")
+            return None
+
+        pts = np.vstack(accepted)
+        sdf = np.asarray(accepted_sdf, dtype=np.float64)
+        if len(pts) < n_points:
+            logger.warning(
+                "Adaptive RAR: принято %d/%d точек (фильтры дубликатов/домена слишком строгие).",
+                len(pts), n_points,
+            )
+
+        logger.info(
+            "Adaptive RAR: source=%d точек выше %.0f%% квантиля, residual=[%.3e, %.3e], accepted=%d",
+            len(source_idx),
+            q * 100.0,
+            float(source_res.min()),
+            float(source_res.max()),
+            len(pts),
+        )
+        return pts[:, 0], pts[:, 1], sdf
+
+    @staticmethod
+    def _build_wall_tree(coords: np.ndarray, dataset) -> Optional[cKDTree]:
+        """KDTree по wall-точкам для быстрого SDF новых RAR-точек."""
+        if dataset.boundary_types is None or 'wall' not in dataset.type_to_idx:
+            return None
+        wall_mask = (dataset.boundary_types[:, dataset.type_to_idx['wall']] > 0.5).cpu().numpy()
+        if not np.any(wall_mask):
+            return None
+        return cKDTree(coords[wall_mask])
+
+    @staticmethod
+    def _valid_interior_mask(
+        xy: np.ndarray,
+        domain_norm: Optional[np.ndarray],
+        foil_norm: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Фильтр: внутри домена и вне замкнутого профиля."""
+        valid = np.isfinite(xy).all(axis=1)
+        if domain_norm is not None and len(domain_norm) >= 3:
+            try:
+                from shapely.geometry import Point, Polygon
+                domain_poly = Polygon(domain_norm)
+                if not domain_poly.is_valid:
+                    domain_poly = domain_poly.buffer(0)
+                valid &= np.array(
+                    [domain_poly.contains(Point(float(p[0]), float(p[1]))) for p in xy],
+                    dtype=bool,
+                )
+            except Exception:
+                from matplotlib.path import Path
+                valid &= Path(domain_norm).contains_points(xy)
+
+        if foil_norm is not None and len(foil_norm) >= 4 and np.allclose(foil_norm[0], foil_norm[-1]):
+            try:
+                from shapely.geometry import Point, Polygon
+                foil_poly = Polygon(foil_norm)
+                if not foil_poly.is_valid:
+                    foil_poly = foil_poly.buffer(0)
+                valid &= ~np.array(
+                    [foil_poly.contains(Point(float(p[0]), float(p[1]))) for p in xy],
+                    dtype=bool,
+                )
+            except Exception:
+                from matplotlib.path import Path
+                valid &= ~Path(foil_norm).contains_points(xy)
+        return valid
+
+    def _maybe_rebuild_fvm_after_rar(self) -> None:
+        """Лениво перестраивает FVM-сетку после накопления новых RAR-точек."""
+        if (
+            not self.rar_rebuild_fvm
+            or self.loss_computer.fvm is None
+            or self._rar_new_points_since_fvm < self.rar_fvm_min_new_points
+        ):
+            return
+
+        self._rar_fvm_rebuild_counter += 1
+        if self._rar_fvm_rebuild_counter % self.rar_fvm_rebuild_every != 0:
+            logger.info(
+                "Adaptive RAR: FVM rebuild отложен (%d новых точек накоплено).",
+                self._rar_new_points_since_fvm,
+            )
+            return
+
+        try:
+            logger.info(
+                "Adaptive RAR: перестройка FVM-сетки по %d точкам...",
+                self.data_handler.n_points,
+            )
+            mesh = self.data_handler.build_mesh_from_current_points(verbose=False)
+            self.data_handler.set_mesh_from_mesh2d(mesh)
+            self.loss_computer.fvm.rebuild_from_mesh(mesh)
+            self.loss_computer.fvm.set_inlet_velocity(
+                torch.tensor(
+                    [
+                        getattr(self.data_handler, 'inlet_u_norm', 1.0),
+                        getattr(self.data_handler, 'inlet_v_norm', 0.0),
+                    ],
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+            self._fvm_tensor_cache = None
+            self._rar_new_points_since_fvm = 0
+            self._save_rar_mesh_volume_plot(mesh)
+            logger.info("Adaptive RAR: FVM-сетка перестроена.")
+        except Exception as exc:
+            logger.warning("Adaptive RAR: не удалось перестроить FVM-сетку: %s", exc, exc_info=True)
+
+    def _save_rar_mesh_volume_plot(self, mesh) -> None:
+        """Сохраняет карту объёмов контрольных объёмов после RAR rebuild."""
+        if not self.rar_save_mesh_volume_plot:
+            return
+
+        base_dir = self.plots_dir or os.path.join(os.getcwd(), "Pictures")
+        out_dir = os.path.join(base_dir, "rar_mesh")
+        os.makedirs(out_dir, exist_ok=True)
+
+        step = max(1, self._rar_step_counter)
+        path = os.path.join(out_dir, f"rar_{step:04d}_mesh_cv_volume.png")
+        try:
+            mesh.plot_cv_volume_map(
+                save_path=path,
+                dpi=self.rar_mesh_plot_dpi,
+                show=False,
+                log_scale=True,
+            )
+            logger.info("Adaptive RAR: график CV-объёмов сетки сохранён: %s", path)
+        except Exception as exc:
+            logger.warning(
+                "Adaptive RAR: не удалось сохранить график CV-объёмов сетки: %s",
+                exc,
+                exc_info=True,
+            )
 
     def _get_fvm_tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Возвращает FVM-тензоры на рабочем device/dtype, кэшируя перенос."""
@@ -657,6 +1198,54 @@ class Trainer:
             )
         _, x_fvm, y_fvm, sdf_fvm, bt_fvm = self._fvm_tensor_cache
         return x_fvm, y_fvm, sdf_fvm, bt_fvm
+
+    def _compute_global_integral_loss_from_dataset(self) -> torch.Tensor:
+        """Fallback integral loss по полной выборке inlet/outlet, если FVM-сетки нет."""
+        if not self.loss_computer.integral_condition:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        ds = self.data_handler.dataset
+        if ds.boundary_types is None:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        names = self.data_handler.boundary_type_names
+        if 'inlet' not in names or 'outlet' not in names:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        inlet_idx = ds.type_to_idx.get('inlet')
+        outlet_idx = ds.type_to_idx.get('outlet')
+        if inlet_idx is None or outlet_idx is None:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        mask = (ds.boundary_types[:, inlet_idx] > 0.5) | (ds.boundary_types[:, outlet_idx] > 0.5)
+        if not bool(mask.any()):
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        x = ds.x[mask].to(self.device, dtype=self.dtype)
+        y = ds.y[mask].to(self.device, dtype=self.dtype)
+        sdf = ds.sdf[mask].to(self.device, dtype=self.dtype)
+        bt = ds.boundary_types[mask].to(self.device, dtype=self.dtype)
+
+        inp = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        out = self.model(inp)
+        u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+
+        if self.loss_computer.bc_type == 'hard':
+            u, v, _ = self.loss_computer.apply_hard_constraints(
+                u_raw,
+                v_raw,
+                p_raw,
+                ds.mask_u_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
+                ds.mask_v_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
+                ds.mask_p_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
+                ds.u_bc[mask].to(self.device, dtype=self.dtype).view(-1, 1),
+                ds.v_bc[mask].to(self.device, dtype=self.dtype).view(-1, 1),
+                ds.p_bc[mask].to(self.device, dtype=self.dtype).view(-1, 1),
+            )
+        else:
+            u, v = u_raw, v_raw
+
+        return self.loss_computer.compute_integral_loss(u, v, bt, x, y)
 
     # ------------------------------------------------------------------
     # FVM-шаг (полный датасет, отдельный от батч-цикла)
@@ -706,10 +1295,36 @@ class Trainer:
         logger.debug("FVM step: loss=%.4e", val)
         return val
 
+    def _scheduled_fvm_batches(self, n_batches: int, enabled: bool) -> set:
+        """
+        Возвращает индексы batch-ей, где запускается полный FVM-проход.
+
+        batch_interval остаётся пользовательской настройкой, но каждый запуск
+        потом масштабируется так, чтобы суммарный FVM-вклад за эпоху не
+        становился в n_batches раз больше заданного веса.
+        """
+        if not enabled or n_batches <= 0:
+            return set()
+        interval = max(1, int(self.fvm_batch_interval))
+        if interval <= 1:
+            return {n_batches - 1}
+        indices = set(range(interval - 1, n_batches, interval))
+        indices.add(n_batches - 1)
+        return indices
+
     # ------------------------------------------------------------------
     # Шаг обучения (Adam)
     # ------------------------------------------------------------------
-    def train_batch_adam(self, batch: Tuple, accum_step: bool, pde_mult: float = 1.0, add_fvm: bool = False) -> Dict[str, Any]:
+    def train_batch_adam(
+        self,
+        batch: Tuple,
+        accum_step: bool,
+        pde_mult: float = 1.0,
+        add_fvm: bool = False,
+        fvm_scale: float = 1.0,
+        add_integral: bool = False,
+        integral_scale: float = 1.0,
+    ) -> Dict[str, Any]:
         """
         Выполняет один прямой проход и накопление градиентов для батча (Adam).
         Если accum_step=True, выполняет шаг оптимизации.
@@ -724,7 +1339,14 @@ class Trainer:
             словарь с результатами (те же поля, что и в forward_pass, плюс grad_norm)
         """
         with self._autocast_context():
-            fwd = self.forward_pass(batch, pde_mult, add_fvm=add_fvm)
+            fwd = self.forward_pass(
+                batch,
+                pde_mult,
+                add_fvm=add_fvm,
+                fvm_scale=fvm_scale,
+                add_integral=add_integral,
+                integral_scale=integral_scale,
+            )
             total_loss = fwd['total'] / self.accum_steps
 
         # Обратное распространение
@@ -821,25 +1443,46 @@ class Trainer:
             'wall_speed_sum': 0.0,
             'n_wall_batches': 0,
             'grad_norm_sum': 0.0,
-            'grad_norm_count': 0
+            'grad_norm_count': 0,
+            'fvm_loss_sum': 0.0,
+            'fvm_loss_count': 0,
         }
         n_batches = 0
         n_total_batches = len(dataloader)
 
-        # FVM добавляется к последнему батчу эпохи (единый backward с PDE/BC)
+        # FVM добавляется по пользовательскому batch_interval, но нормируется
+        # по числу запусков, чтобы эффективный вес за эпоху оставался тем же.
         self._fvm_epoch_counter += 1
         fvm_this_epoch = (
             self.loss_computer.fvm is not None
             and self.loss_computer.fvm_weight > 0.0
             and self._fvm_epoch_counter % self.fvm_interval == 0
         )
+        fvm_batches = self._scheduled_fvm_batches(n_total_batches, fvm_this_epoch)
+        fvm_scale = (float(self.accum_steps) / len(fvm_batches)) if fvm_batches else 1.0
+
+        integral_this_epoch = (
+            self.loss_computer.integral_condition
+            and self.loss_computer.integral_weight != 0.0
+        )
+        integral_batches = {n_total_batches - 1} if integral_this_epoch and n_total_batches > 0 else set()
+        integral_scale = float(self.accum_steps) if integral_batches else 1.0
+        self._last_integral_loss = 0.0
 
         for i, batch in enumerate(dataloader):
             is_last_batch = (i == n_total_batches - 1)
             accum_step = ((i + 1) % self.accum_steps == 0) or is_last_batch
-            # FVM добавляется каждые fvm_batch_interval батчей (и всегда на последнем)
-            add_fvm = fvm_this_epoch and (i % self.fvm_batch_interval == 0 or is_last_batch)
-            batch_losses = self.train_batch_adam(batch, accum_step, pde_mult, add_fvm=add_fvm)
+            add_fvm = i in fvm_batches
+            add_integral = i in integral_batches
+            batch_losses = self.train_batch_adam(
+                batch,
+                accum_step,
+                pde_mult,
+                add_fvm=add_fvm,
+                fvm_scale=fvm_scale,
+                add_integral=add_integral,
+                integral_scale=integral_scale,
+            )
 
             epoch_losses['total'] += batch_losses['total']
             for k, v in batch_losses['pde_raw'].items():
@@ -858,7 +1501,10 @@ class Trainer:
                 epoch_losses['grad_norm_sum'] += batch_losses['grad_norm']
                 epoch_losses['grad_norm_count'] += 1
             if add_fvm:
-                self._last_fvm_loss = batch_losses.get('fvm_loss', 0.0)
+                epoch_losses['fvm_loss_sum'] += batch_losses.get('fvm_loss', 0.0)
+                epoch_losses['fvm_loss_count'] += 1
+            if add_integral:
+                self._last_integral_loss = batch_losses.get('integral_loss', 0.0)
             n_batches += 1
 
             if (i + 1) % 100 == 0:
@@ -874,7 +1520,7 @@ class Trainer:
         else:
             avg_bc = {}
             avg_extra_grad = 0.0
-        avg_integral = epoch_losses['integral_loss'] / n_batches
+        avg_integral = self._last_integral_loss if self.loss_computer.integral_condition else 0.0
         avg_wall_speed = (epoch_losses['wall_speed_sum'] / epoch_losses['n_wall_batches']
                           if epoch_losses['n_wall_batches'] > 0 else 0.0)
         avg_grad_norm = epoch_losses['grad_norm_sum'] / epoch_losses['grad_norm_count'] if epoch_losses['grad_norm_count'] > 0 else 0.0
@@ -889,9 +1535,9 @@ class Trainer:
         # Вычисление rate (отношение к предыдущему значению) – для отчёта
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
 
-        # _last_fvm_loss уже установлен внутри цикла батчей (add_fvm=True на последнем батче).
-        # Если FVM не запускался в эту эпоху — обнуляем.
-        if not fvm_this_epoch:
+        if epoch_losses['fvm_loss_count'] > 0:
+            self._last_fvm_loss = epoch_losses['fvm_loss_sum'] / epoch_losses['fvm_loss_count']
+        else:
             self._last_fvm_loss = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, avg_grad_norm
@@ -923,6 +1569,7 @@ class Trainer:
         pde_max_list = []
         bc_comp_list = []
         integral_loss_list = []
+        fvm_loss_list = []
         wall_speed_list = []
         n_batches = 0
 
@@ -942,24 +1589,44 @@ class Trainer:
             pde_max_list.clear()
             bc_comp_list.clear()
             integral_loss_list.clear()
+            fvm_loss_list.clear()
             wall_speed_list.clear()
             n_batches = 0
             batches_list = list(dataloader)
+            fvm_batches = self._scheduled_fvm_batches(len(batches_list), fvm_this_epoch)
+            fvm_scale = (1.0 / len(fvm_batches)) if fvm_batches else 1.0
+            integral_batches = (
+                {len(batches_list) - 1}
+                if self.loss_computer.integral_condition
+                and self.loss_computer.integral_weight != 0.0
+                and len(batches_list) > 0
+                else set()
+            )
+            self._last_integral_loss = 0.0
             for k, batch in enumerate(batches_list):
-                is_last = (k == len(batches_list) - 1)
-                add_fvm_b = fvm_this_epoch and (k % self.fvm_batch_interval == 0 or is_last)
-                fwd = self.forward_pass(batch, pde_mult=1.0, add_fvm=add_fvm_b)
+                add_fvm_b = k in fvm_batches
+                add_integral_b = k in integral_batches
+                fwd = self.forward_pass(
+                    batch,
+                    pde_mult=1.0,
+                    add_fvm=add_fvm_b,
+                    fvm_scale=fvm_scale,
+                    add_integral=add_integral_b,
+                    integral_scale=1.0,
+                )
                 total_loss += fwd['total']
 
                 pde_raw_list.append(fwd['pde_raw'])
                 pde_max_list.append(fwd['pde_max'])
                 if self.loss_computer.bc_type == 'soft':
                     bc_comp_list.append(fwd['bc_comp'])
-                integral_loss_list.append(fwd['integral_loss'])
+                if add_integral_b:
+                    integral_loss_list.append(fwd['integral_loss'])
+                    self._last_integral_loss = fwd['integral_loss']
                 if fwd['wall_speed'] is not None:
                     wall_speed_list.append(fwd['wall_speed'])
                 if add_fvm_b and fwd.get('fvm_loss', 0.0) > 0:
-                    self._last_fvm_loss = fwd.get('fvm_loss', 0.0)
+                    fvm_loss_list.append(fwd.get('fvm_loss', 0.0))
                 n_batches += 1
 
             total_loss.backward()
@@ -990,8 +1657,9 @@ class Trainer:
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
         avg_extra_grad = 0.0  # не вычисляется для L-BFGS
 
-        # _last_fvm_loss установлен внутри closure (последний батч с add_fvm=True).
-        if not fvm_this_epoch:
+        if fvm_loss_list:
+            self._last_fvm_loss = float(np.mean(fvm_loss_list))
+        else:
             self._last_fvm_loss = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, 0.0

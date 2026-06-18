@@ -28,6 +28,24 @@ import os as _os
 import sys as _sys
 
 
+def _configure_text_output() -> None:
+    """Настраивает UTF-8 вывод, чтобы Windows-консоль не падала на Unicode UI."""
+    if _sys.platform == 'win32':
+        _os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+        if _sys.stdout.isatty():
+            _os.system('chcp 65001 > nul')
+
+    for stream in (_sys.stdout, _sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
+
+
+_configure_text_output()
+del _configure_text_output
+
+
 def _bootstrap_environment() -> None:
     """Проверяет и при необходимости создаёт виртуальное окружение с зависимостями."""
     import importlib.util as _ilu

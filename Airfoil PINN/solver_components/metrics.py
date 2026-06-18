@@ -85,6 +85,8 @@ class MetricsCollector:
             'grad_norm_bc': [],
             'grad_cosine': [],
             'mass_balance_error': [],
+            'mass_flux_in': [],
+            'mass_flux_out': [],
             'max_v_top': [],
             'avg_u_out': [],
             'avg_u_in': [],
@@ -96,6 +98,12 @@ class MetricsCollector:
         self._last_avg_epoch = -1
         self._cached_u_in_norm = 0.0
         self._cached_u_out_norm = 0.0
+        self._last_mass_epoch = -1
+        self._cached_mass_metrics = {
+            'mass_flux_in': 0.0,
+            'mass_flux_out': 0.0,
+            'mass_balance_error': 0.0,
+        }
 
         # Файл лога
         self.log_file = None
@@ -131,6 +139,7 @@ class MetricsCollector:
             grad_norm: норма градиентов
             extra_diag: словарь с дополнительными диагностическими метриками (опционально)
         """
+        self._ensure_history_schema()
         self.history['loss'].append(loss)
         for k, v in pde_raw.items():
             self.history['pde'][k].append(v)
@@ -167,6 +176,10 @@ class MetricsCollector:
                 self.history['grad_cosine'].append(extra_diag['grad_cosine'])
             if 'mass_balance_error' in extra_diag:
                 self.history['mass_balance_error'].append(extra_diag['mass_balance_error'])
+            if 'mass_flux_in' in extra_diag:
+                self.history['mass_flux_in'].append(extra_diag['mass_flux_in'])
+            if 'mass_flux_out' in extra_diag:
+                self.history['mass_flux_out'].append(extra_diag['mass_flux_out'])
             if 'max_v_top' in extra_diag:
                 self.history['max_v_top'].append(extra_diag['max_v_top'])
             if 'avg_u_in' in extra_diag:
@@ -177,6 +190,38 @@ class MetricsCollector:
                 self.history['wall_gradient'].append(extra_diag['wall_gradient'])
             if 'ntk_condition' in extra_diag:
                 self.history['ntk_condition'].append(extra_diag['ntk_condition'])
+
+    def _ensure_history_schema(self) -> None:
+        """Добавляет новые ключи при resume из старых чекпоинтов."""
+        defaults = {
+            'fvm_loss': [],
+            'grad_norm_pde': [],
+            'grad_norm_bc': [],
+            'grad_cosine': [],
+            'mass_balance_error': [],
+            'mass_flux_in': [],
+            'mass_flux_out': [],
+            'max_v_top': [],
+            'avg_u_out': [],
+            'avg_u_in': [],
+            'wall_gradient': [],
+            'ntk_condition': [],
+            'grad_norm': [],
+            'total_pde': [],
+            'max_res': {c: [] for c in self.loss_computer.pde_components},
+            'rate': {c: [] for c in self.loss_computer.pde_components},
+        }
+        for key, value in defaults.items():
+            if key not in self.history:
+                self.history[key] = value
+        if self.loss_computer.bc_type == 'soft' and 'bc' not in self.history:
+            self.history['bc'] = {b: [] for b in self.data_handler.boundary_type_names}
+        if self.loss_computer.bc_type == 'soft' and 'total_bc' not in self.history:
+            self.history['total_bc'] = []
+        if 'integral_loss' not in self.history:
+            self.history['integral_loss'] = [] if self.loss_computer.integral_condition else None
+        elif self.loss_computer.integral_condition and self.history.get('integral_loss') is None:
+            self.history['integral_loss'] = []
 
     # ------------------------------------------------------------------
     # Вычисление средней скорости на входе/выходе (с кэшированием)
@@ -204,6 +249,188 @@ class MetricsCollector:
         """
         u_in_norm, u_out_norm = self.get_boundary_avg_velocities(epoch, interval)
         return u_in_norm * self.data_handler.U_inf, u_out_norm * self.data_handler.U_inf
+
+    def invalidate_boundary_cache(self) -> None:
+        """Сбрасывает кэши boundary diagnostics после изменения датасета/RAR."""
+        self._last_avg_epoch = -1
+        self._last_mass_epoch = -1
+
+    def get_mass_flow_metrics(self, epoch: int, interval: int = 1) -> Dict[str, float]:
+        """
+        Возвращает интегральный баланс массы через inlet/outlet.
+
+        В приоритете используются FVM boundary faces с векторами площадей.
+        Если сетки нет, используется fallback-интеграл по полному набору
+        boundary-точек, а не среднее u.
+        """
+        if epoch % interval == 0 and epoch != self._last_mass_epoch:
+            self._cached_mass_metrics = self._compute_mass_flow_metrics()
+            self._last_mass_epoch = epoch
+        return dict(self._cached_mass_metrics)
+
+    def _compute_mass_flow_metrics(self) -> Dict[str, float]:
+        result = self._compute_mass_flow_from_fvm_faces()
+        if result is None:
+            result = self._compute_mass_flow_from_boundary_points()
+        return result
+
+    def _predict_velocity_on_fvm_nodes(self) -> Optional[torch.Tensor]:
+        if self.loss_computer.fvm is None or not hasattr(self.data_handler, 'fvm_x'):
+            return None
+
+        x = self.data_handler.fvm_x.to(self.device, dtype=self.dtype)
+        y = self.data_handler.fvm_y.to(self.device, dtype=self.dtype)
+        sdf = self.data_handler.fvm_sdf.to(self.device, dtype=self.dtype)
+        bt = (
+            self.data_handler.fvm_bt.to(self.device, dtype=self.dtype)
+            if self.data_handler.fvm_bt is not None
+            else None
+        )
+
+        inp = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        out = self.model(inp)
+        u = out[:, 0:1]
+        v = out[:, 1:2]
+
+        if self.loss_computer.bc_type == 'hard' and bt is not None:
+            u, v = self._apply_hard_velocity_constraints(u, v, bt)
+        return torch.cat([u, v], dim=1)
+
+    def _apply_hard_velocity_constraints(
+        self,
+        u_raw: torch.Tensor,
+        v_raw: torch.Tensor,
+        bt: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        u = u_raw
+        v = v_raw
+        names = self.data_handler.boundary_type_names
+        for idx, name in enumerate(names):
+            if idx >= bt.shape[1]:
+                continue
+            mask = bt[:, idx].view(-1, 1) > 0.5
+            if not bool(mask.any()):
+                continue
+            if name == 'inlet':
+                u = torch.where(mask, torch.ones_like(u) * self.data_handler.inlet_u_norm, u)
+                v = torch.where(mask, torch.ones_like(v) * self.data_handler.inlet_v_norm, v)
+            elif name == 'wall':
+                u = torch.where(mask, torch.zeros_like(u), u)
+                v = torch.where(mask, torch.zeros_like(v), v)
+            elif name == 'symmetry':
+                v = torch.where(mask, torch.zeros_like(v), v)
+            elif name == 'axis_symmetry':
+                u = torch.where(mask, torch.zeros_like(u), u)
+        return u, v
+
+    def _compute_mass_flow_from_fvm_faces(self) -> Optional[Dict[str, float]]:
+        fvm = self.loss_computer.fvm
+        if fvm is None:
+            return None
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            from fvm_residuals import BC_CODES
+            inlet_code = BC_CODES['inlet']
+            outlet_code = BC_CODES['outlet']
+
+            with torch.no_grad():
+                velocity = self._predict_velocity_on_fvm_nodes()
+                if velocity is None or fvm.bnd_node.numel() == 0:
+                    return None
+
+                bnd_node = fvm.bnd_node.to(self.device)
+                bnd_area = fvm.bnd_S.to(self.device, dtype=self.dtype)
+                bnd_type = fvm.bnd_type.to(self.device)
+                flux = (velocity[bnd_node] * bnd_area).sum(dim=1)
+
+                if self.loss_computer.flow_type == 'axisymmetric':
+                    x = self.data_handler.fvm_x.to(self.device, dtype=self.dtype).flatten()
+                    two_pi = torch.as_tensor(2.0 * np.pi, device=self.device, dtype=self.dtype)
+                    flux = flux * two_pi * torch.clamp(x[bnd_node], min=0.0)
+
+                inlet_mask = bnd_type == inlet_code
+                outlet_mask = bnd_type == outlet_code
+                q_in = -flux[inlet_mask].sum().item() if bool(inlet_mask.any()) else 0.0
+                q_out = flux[outlet_mask].sum().item() if bool(outlet_mask.any()) else 0.0
+        finally:
+            if was_training:
+                self.model.train()
+
+        denom = abs(q_in) + 1e-12
+        return {
+            'mass_flux_in': q_in,
+            'mass_flux_out': q_out,
+            'mass_balance_error': abs(q_in - q_out) / denom if denom > 0 else 0.0,
+        }
+
+    @staticmethod
+    def _trapz_integral(values: np.ndarray, tangent: np.ndarray) -> float:
+        if values.size == 0:
+            return 0.0
+        order = np.argsort(tangent)
+        values = values[order]
+        tangent = tangent[order]
+        if values.size == 1:
+            return float(values[0])
+        trapezoid = getattr(np, 'trapezoid', np.trapz)
+        return float(trapezoid(values, tangent))
+
+    def _compute_mass_flow_from_boundary_points(self) -> Dict[str, float]:
+        was_training = self.model.training
+        self.model.eval()
+        inlet_u, inlet_y = [], []
+        outlet_u, outlet_y = [], []
+
+        with torch.no_grad():
+            dataloader = self.data_handler.get_boundary_eval_dataloader(('inlet', 'outlet'))
+            for batch in dataloader:
+                idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+                x = x.to(self.device, dtype=self.dtype)
+                y = y.to(self.device, dtype=self.dtype)
+                sdf = sdf.to(self.device, dtype=self.dtype)
+                bt = bt.to(self.device, dtype=self.dtype) if bt.shape[1] > 0 else None
+                if bt is None:
+                    continue
+
+                inp = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                out = self.model(inp)
+                u = out[:, 0:1]
+                v = out[:, 1:2]
+                if self.loss_computer.bc_type == 'hard':
+                    u, v = self._apply_hard_velocity_constraints(u, v, bt)
+
+                if 'inlet' in self.data_handler.boundary_type_names:
+                    inlet_idx = self.data_handler.boundary_type_names.index('inlet')
+                    mask = bt[:, inlet_idx] > 0.5
+                    if bool(mask.any()):
+                        inlet_u.append(u[mask].detach().cpu().numpy().reshape(-1))
+                        inlet_y.append(y[mask].detach().cpu().numpy().reshape(-1))
+                if 'outlet' in self.data_handler.boundary_type_names:
+                    outlet_idx = self.data_handler.boundary_type_names.index('outlet')
+                    mask = bt[:, outlet_idx] > 0.5
+                    if bool(mask.any()):
+                        outlet_u.append(u[mask].detach().cpu().numpy().reshape(-1))
+                        outlet_y.append(y[mask].detach().cpu().numpy().reshape(-1))
+
+        if was_training:
+            self.model.train()
+
+        q_in = self._trapz_integral(
+            np.concatenate(inlet_u) if inlet_u else np.array([], dtype=np.float64),
+            np.concatenate(inlet_y) if inlet_y else np.array([], dtype=np.float64),
+        )
+        q_out = self._trapz_integral(
+            np.concatenate(outlet_u) if outlet_u else np.array([], dtype=np.float64),
+            np.concatenate(outlet_y) if outlet_y else np.array([], dtype=np.float64),
+        )
+        denom = abs(q_in) + 1e-12
+        return {
+            'mass_flux_in': q_in,
+            'mass_flux_out': q_out,
+            'mass_balance_error': abs(q_in - q_out) / denom if denom > 0 else 0.0,
+        }
 
     def _update_boundary_avg_velocities(self) -> None:
         """Вычисляет средние скорости на inlet/outlet с помощью модели (нормированные)."""
@@ -485,10 +712,10 @@ class MetricsCollector:
         avg_u_in_phys = avg_u_in_norm * self.data_handler.U_inf
         avg_u_out_phys = avg_u_out_norm * self.data_handler.U_inf
 
-        # Ошибка баланса масс (по нормализованным значениям)
-        Qin = avg_u_in_norm
-        Qout = avg_u_out_norm
-        mass_balance_error = abs(Qin - Qout) / (abs(Qin) + 1e-12) if Qin != 0 else 0.0
+        mass_metrics = self._compute_mass_flow_metrics()
+        Qin = mass_metrics['mass_flux_in']
+        Qout = mass_metrics['mass_flux_out']
+        mass_balance_error = mass_metrics['mass_balance_error']
 
         # Лучшая эпоха
         best_epoch = np.argmin(self.history['loss']) + 1 if self.history['loss'] else 0
@@ -506,6 +733,8 @@ class MetricsCollector:
             'final_u_in_phys': avg_u_in_phys,
             'final_u_out_norm': avg_u_out_norm,
             'final_u_in_norm': avg_u_in_norm,
+            'mass_flux_in': Qin,
+            'mass_flux_out': Qout,
             'mass_balance_error': mass_balance_error,
             'final_pde_loss': final_pde_loss,
             'final_bc_loss': final_bc_loss,

@@ -258,6 +258,55 @@ class LossComputer:
     # ------------------------------------------------------------------
     # Интегральное условие (баланс масс) – ИСПРАВЛЕННАЯ ВЕРСИЯ
     # ------------------------------------------------------------------
+    def compute_mesh_integral_loss(
+        self,
+        velocity_nodes: torch.Tensor,
+        bnd_node: torch.Tensor,
+        bnd_area: torch.Tensor,
+        bnd_type: torch.Tensor,
+        node_x: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Интегральный баланс массы по FVM-граням.
+
+        bnd_area хранит внешние векторы площадей/длин граней, поэтому сумма
+        flux = u · S по inlet+outlet является signed outflow. Для корректного
+        баланса целевое значение по умолчанию равно 0.
+        """
+        if not self.integral_condition:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        if velocity_nodes.numel() == 0 or bnd_node.numel() == 0:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        try:
+            from fvm_residuals import BC_CODES
+            inlet_code = BC_CODES['inlet']
+            outlet_code = BC_CODES['outlet']
+        except Exception:
+            inlet_code = 1
+            outlet_code = 2
+
+        device = velocity_nodes.device
+        dtype = velocity_nodes.dtype
+        bnd_node = bnd_node.to(device=device, dtype=torch.long)
+        bnd_area = bnd_area.to(device=device, dtype=dtype)
+        bnd_type = bnd_type.to(device=device, dtype=torch.long)
+
+        mask = (bnd_type == inlet_code) | (bnd_type == outlet_code)
+        if not bool(mask.any()):
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        flux = (velocity_nodes[bnd_node] * bnd_area).sum(dim=1)
+        if self.flow_type == 'axisymmetric' and node_x is not None:
+            r = node_x.to(device=device, dtype=dtype).flatten()[bnd_node]
+            two_pi = torch.as_tensor(self.two_pi, device=device, dtype=dtype)
+            flux = flux * two_pi * torch.clamp(r, min=0.0)
+
+        total_flux = flux[mask].sum()
+        target = torch.as_tensor(self.integral_target, device=device, dtype=dtype)
+        return (total_flux - target) ** 2
+
     def compute_integral_loss(
         self,
         u: torch.Tensor,
@@ -267,10 +316,10 @@ class LossComputer:
         y: torch.Tensor
     ) -> torch.Tensor:
         """
-        Вычисляет интегральную потерю (баланс масс) с учётом всех границ,
-        помеченных как 'inlet' или 'outlet'. Для каждой грани определяется
-        внешняя нормаль, длина стороны и вес точки. В осесимметричном случае
-        добавляется множитель 2πr.
+        Вычисляет point-based интегральную потерю (баланс масс) по полному
+        набору точек inlet/outlet. Метод не предназначен для случайного
+        mini-batch: его вызывает Trainer только на полной boundary-выборке,
+        если FVM-граней нет.
 
         Args:
             u, v: поля скорости
@@ -309,69 +358,53 @@ class LossComputer:
         bottom_mask = mask_all & (y < y_min + tol)
         top_mask = mask_all & (y > y_max - tol)
 
-        # Длины сторон
-        L_x = x_max - x_min
-        L_y = y_max - y_min
-
-        # Подсчёт количества точек на каждой стороне
-        N_left = left_mask.sum().item()
-        N_right = right_mask.sum().item()
-        N_bottom = bottom_mask.sum().item()
-        N_top = top_mask.sum().item()
-
-        # Если точек на какой-то стороне нет, обнуляем длину, чтобы избежать деления на ноль
-        ds_left = L_y / N_left if N_left > 0 else 0.0
-        ds_right = L_y / N_right if N_right > 0 else 0.0
-        ds_bottom = L_x / N_bottom if N_bottom > 0 else 0.0
-        ds_top = L_x / N_top if N_top > 0 else 0.0
-
-        # Нормали (внешние)
-        # left:   nx = -1, ny = 0
-        # right:  nx =  1, ny = 0
-        # bottom: nx =  0, ny = -1
-        # top:    nx =  0, ny =  1
-
+        x_flat = x.flatten()
+        y_flat = y.flatten()
+        u_flat = u.flatten()
+        v_flat = v.flatten()
         total_flux = torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
-        # Левая грань
-        if N_left > 0:
-            u_left = u[left_mask].squeeze()
-            # Вклад: (u * (-1) + v * 0) * ds_left
-            flux_left = -u_left * ds_left
-            if self.flow_type == 'axisymmetric':
-                r_left = x[left_mask].squeeze()
-                flux_left = flux_left * self.two_pi * r_left
-            total_flux = total_flux + flux_left.sum()
+        def side_flux(mask: torch.Tensor, normal_velocity: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
+            flat_mask = mask.flatten()
+            n = int(flat_mask.sum().item())
+            if n == 0:
+                return torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
-        # Правая грань
-        if N_right > 0:
-            u_right = u[right_mask].squeeze()
-            flux_right = u_right * ds_right
-            if self.flow_type == 'axisymmetric':
-                r_right = x[right_mask].squeeze()
-                flux_right = flux_right * self.two_pi * r_right
-            total_flux = total_flux + flux_right.sum()
+            vel = normal_velocity[flat_mask]
+            tau = tangent[flat_mask]
+            order = torch.argsort(tau)
+            vel = vel[order]
+            tau = tau[order]
 
-        # Нижняя грань
-        if N_bottom > 0:
-            v_bottom = v[bottom_mask].squeeze()
-            flux_bottom = -v_bottom * ds_bottom
-            if self.flow_type == 'axisymmetric':
-                r_bottom = x[bottom_mask].squeeze()
-                flux_bottom = flux_bottom * self.two_pi * r_bottom
-            total_flux = total_flux + flux_bottom.sum()
+            if n == 1:
+                length = torch.as_tensor(
+                    max(x_max - x_min, y_max - y_min),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                weights = torch.ones_like(vel) * length
+            else:
+                dt = torch.clamp(tau[1:] - tau[:-1], min=0.0)
+                weights = torch.zeros_like(vel)
+                weights[0] = 0.5 * dt[0]
+                weights[-1] = 0.5 * dt[-1]
+                if n > 2:
+                    weights[1:-1] = 0.5 * (dt[:-1] + dt[1:])
 
-        # Верхняя грань
-        if N_top > 0:
-            v_top = v[top_mask].squeeze()
-            flux_top = v_top * ds_top
             if self.flow_type == 'axisymmetric':
-                r_top = x[top_mask].squeeze()
-                flux_top = flux_top * self.two_pi * r_top
-            total_flux = total_flux + flux_top.sum()
+                r = x_flat[flat_mask][order]
+                two_pi = torch.as_tensor(self.two_pi, device=self.device, dtype=self.dtype)
+                weights = weights * two_pi * torch.clamp(r, min=0.0)
+            return torch.sum(vel * weights)
+
+        total_flux = total_flux + side_flux(left_mask, -u_flat, y_flat)
+        total_flux = total_flux + side_flux(right_mask, u_flat, y_flat)
+        total_flux = total_flux + side_flux(bottom_mask, -v_flat, x_flat)
+        total_flux = total_flux + side_flux(top_mask, v_flat, x_flat)
 
         # Потеря = (суммарный поток - целевой поток)^2
-        loss = (total_flux - self.integral_target) ** 2
+        target = torch.as_tensor(self.integral_target, device=self.device, dtype=self.dtype)
+        loss = (total_flux - target) ** 2
         return loss
 
     # ------------------------------------------------------------------

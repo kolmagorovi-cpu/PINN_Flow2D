@@ -104,8 +104,21 @@ class ConfigManager:
                 'reset_noise': 0.01,
                 'grad_clip': None,
                 'rar_enable': False,
+                'rar_mode': 'adaptive',
+                'rar_score_mode': 'total_loss',
                 'rar_interval': 100,
                 'rar_num_points': 200,
+                'rar_error_quantile': 0.75,
+                'rar_residual_power': 1.0,
+                'rar_candidate_multiplier': 12,
+                'rar_jitter_scale': 0.85,
+                'rar_min_distance_factor': 0.35,
+                'rar_min_boundary_distance_factor': 0.05,
+                'rar_rebuild_fvm': True,
+                'rar_fvm_rebuild_every': 1,
+                'rar_fvm_min_new_points': 1,
+                'rar_save_mesh_volume_plot': True,
+                'rar_mesh_plot_dpi': 150,
                 'switch_to_lbfgs_epoch': 0,
                 'lbfgs_max_iter': 20,
                 'lbfgs_history_size': 100,
@@ -152,6 +165,7 @@ class ConfigManager:
             'diagnostics': {
                 'interval': 50,
                 'plot_residual_map': True,
+                'plot_rar_error_map': True,
                 'plot_profiles': True,
                 'profile_sections': [0.2, 0.5, 0.8],
                 'plot_spectrum': True,
@@ -319,6 +333,13 @@ class ConfigManager:
         if tr['rar_enable']:
             print(f"    rar_interval          : {tr['rar_interval']}")
             print(f"    rar_num_points        : {tr['rar_num_points']}")
+            print(f"    rar_mode              : {tr.get('rar_mode', 'adaptive')}")
+            print(f"    rar_score_mode        : {tr.get('rar_score_mode', 'total_loss')}")
+            if tr.get('rar_mode', 'adaptive') == 'adaptive':
+                print(f"    rar_error_quantile    : {tr.get('rar_error_quantile', 0.75)}")
+                print(f"    rar_rebuild_fvm       : {tr.get('rar_rebuild_fvm', True)}")
+                print(f"    rar_fvm_rebuild_every : {tr.get('rar_fvm_rebuild_every', 1)}")
+                print(f"    rar_save_mesh_volume_plot: {tr.get('rar_save_mesh_volume_plot', True)}")
         print(f"  switch_to_lbfgs_epoch   : {tr['switch_to_lbfgs_epoch']}")
         if tr['switch_to_lbfgs_epoch'] > 0:
             print(f"    lbfgs_max_iter        : {tr['lbfgs_max_iter']}")
@@ -363,6 +384,7 @@ class ConfigManager:
         print("ДИАГНОСТИКА:")
         print(f"  interval                 : {diag.get('interval', 50)}")
         print(f"  plot_residual_map        : {diag.get('plot_residual_map', True)}")
+        print(f"  plot_rar_error_map       : {diag.get('plot_rar_error_map', True)}")
         print(f"  plot_profiles            : {diag.get('plot_profiles', True)}")
         print(f"  profile_sections         : {diag.get('profile_sections', [0.2, 0.5, 0.8])}")
         print(f"  plot_spectrum (1D)       : {diag.get('plot_spectrum', True)}")

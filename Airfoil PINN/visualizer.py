@@ -303,9 +303,215 @@ class Visualizer:
             writer.writerow(metrics)
         logger.debug(f"Метрики добавлены в {csv_path}")
 
+    @staticmethod
+    def _deduplicate_field_points(
+        x_np: np.ndarray,
+        y_np: np.ndarray,
+        values: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Убирает совпадающие координаты, усредняя значения поля."""
+        xy = np.column_stack([x_np, y_np])
+        rounded = np.round(xy, decimals=12)
+        uniq, inverse = np.unique(rounded, axis=0, return_inverse=True)
+        counts = np.bincount(inverse).astype(np.float64)
+        val_sum = np.bincount(inverse, weights=values.astype(np.float64))
+        return uniq[:, 0], uniq[:, 1], val_sum / np.maximum(counts, 1.0)
+
+    def _plot_smooth_field_map(
+        self,
+        x_np: np.ndarray,
+        y_np: np.ndarray,
+        values: np.ndarray,
+        savedir: str,
+        filename: str,
+        title: str,
+        colorbar_label: str,
+        cmap: str = 'jet',
+        x_label: str = 'x, м',
+        y_label: str = 'y, м',
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+        boundary_masks: Optional[Dict[str, np.ndarray]] = None,
+        clip_polygon: Optional[np.ndarray] = None,
+        mask_polygon: Optional[np.ndarray] = None,
+        outline_polylines: Optional[List[np.ndarray]] = None,
+        grid_size: int = 420,
+        levels: int = 96,
+    ) -> None:
+        """Рисует гладкое поле вместо точечной карты.
+
+        boundary_masks оставлен для обратной совместимости, но сами точки
+        границ здесь не рисуются: они закрывают поле при плотных сетках.
+        """
+        os.makedirs(savedir, exist_ok=True)
+
+        x0 = np.asarray(x_np, dtype=np.float64).flatten()
+        y0 = np.asarray(y_np, dtype=np.float64).flatten()
+        z0 = np.asarray(values, dtype=np.float64).flatten()
+        finite = np.isfinite(x0) & np.isfinite(y0) & np.isfinite(z0)
+        x0, y0, z0 = x0[finite], y0[finite], z0[finite]
+        if len(z0) == 0:
+            logger.warning("Нет конечных значений для построения поля %s", filename)
+            return
+
+        x, y, z = self._deduplicate_field_points(x0, y0, z0)
+        if len(z) < 3:
+            logger.warning("Недостаточно точек для гладкой карты %s", filename)
+            return
+
+        data_min = float(np.nanmin(z))
+        data_max = float(np.nanmax(z))
+        if vmin is None:
+            vmin = data_min
+        if vmax is None:
+            vmax = data_max
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or abs(vmax - vmin) < 1e-30:
+            pad = max(abs(data_max), 1.0) * 1e-6
+            vmin = data_min - pad
+            vmax = data_max + pad
+        level_values = np.linspace(float(vmin), float(vmax), levels)
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        artist = None
+        clip_poly = self._clip_polygon(clip_polygon)
+        mask_poly = self._closed_mask_polygon(mask_polygon)
+
+        if SCIPY_AVAILABLE and len(z) >= 4:
+            xi = np.linspace(float(x.min()), float(x.max()), grid_size)
+            yi = np.linspace(float(y.min()), float(y.max()), grid_size)
+            Xi, Yi = np.meshgrid(xi, yi)
+            method = 'cubic' if len(z) >= 16 else 'linear'
+            try:
+                Zi = griddata((x, y), z, (Xi, Yi), method=method)
+                if np.all(~np.isfinite(Zi)):
+                    Zi = griddata((x, y), z, (Xi, Yi), method='linear')
+                if np.any(np.isfinite(Zi)):
+                    Zi = self._apply_grid_masks(Xi, Yi, Zi, clip_poly, mask_poly)
+                    artist = ax.contourf(Xi, Yi, Zi, levels=level_values,
+                                         cmap=cmap, extend='both')
+            except Exception as exc:
+                logger.debug("griddata для %s не сработал: %s", filename, exc)
+
+        if artist is None:
+            try:
+                import matplotlib.tri as mtri
+                triang = mtri.Triangulation(x, y)
+                tri_mask = np.zeros(len(triang.triangles), dtype=bool)
+                if clip_poly is not None or mask_poly is not None:
+                    centroids_x = x[triang.triangles].mean(axis=1)
+                    centroids_y = y[triang.triangles].mean(axis=1)
+                    if clip_poly is not None:
+                        tri_mask |= ~self._points_inside_polygon(centroids_x, centroids_y, clip_poly)
+                    if mask_poly is not None:
+                        tri_mask |= self._points_inside_polygon(centroids_x, centroids_y, mask_poly)
+                    triang.set_mask(tri_mask)
+                artist = ax.tricontourf(triang, z, levels=level_values,
+                                        cmap=cmap, extend='both')
+            except Exception as exc:
+                logger.warning("Не удалось построить гладкое поле %s: %s", filename, exc)
+                plt.close(fig)
+                return
+
+        if clip_poly is not None:
+            ax.plot(clip_poly[:, 0], clip_poly[:, 1], color='black', linewidth=0.9)
+        if outline_polylines:
+            for line in outline_polylines:
+                line_arr = self._polyline(line)
+                if line_arr is not None:
+                    ax.plot(line_arr[:, 0], line_arr[:, 1], color='black', linewidth=1.2)
+        elif mask_polygon is not None:
+            line_arr = self._polyline(mask_polygon)
+            if line_arr is not None:
+                ax.plot(line_arr[:, 0], line_arr[:, 1], color='black', linewidth=1.2)
+
+        fig.colorbar(artist, ax=ax, label=colorbar_label)
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(alpha=0.15)
+        fig.tight_layout()
+        fig.savefig(os.path.join(savedir, filename), dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    @staticmethod
+    def _clean_polyline(polyline: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if polyline is None:
+            return None
+        line = np.asarray(polyline, dtype=np.float64).reshape(-1, 2)
+        finite = np.isfinite(line).all(axis=1)
+        line = line[finite]
+        if len(line) < 2:
+            return None
+        keep = np.ones(len(line), dtype=bool)
+        keep[1:] = np.linalg.norm(np.diff(line, axis=0), axis=1) > 1e-12
+        line = line[keep]
+        return line if len(line) >= 2 else None
+
+    @classmethod
+    def _clip_polygon(cls, clip_polygon: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Возвращает замкнутый полигон расчётного домена или None."""
+        poly = cls._clean_polyline(clip_polygon)
+        if poly is None or len(poly) < 3:
+            return None
+        if not np.allclose(poly[0], poly[-1], atol=1e-12):
+            poly = np.vstack([poly, poly[0]])
+        return poly
+
+    @classmethod
+    def _closed_mask_polygon(cls, mask_polygon: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Возвращает замкнутый полигон тела или None."""
+        poly = cls._clean_polyline(mask_polygon)
+        if poly is None or len(poly) < 3:
+            return None
+        if not np.allclose(poly[0], poly[-1], atol=1e-12):
+            return None
+        return poly
+
+    @classmethod
+    def _polyline(cls, polyline: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        return cls._clean_polyline(polyline)
+
+    @staticmethod
+    def _scale_geometry_for_plot(polyline: Optional[np.ndarray], scale: float) -> Optional[np.ndarray]:
+        if polyline is None:
+            return None
+        arr = np.asarray(polyline, dtype=np.float64).reshape(-1, 2)
+        return arr * float(scale)
+
+    @staticmethod
+    def _points_inside_polygon(x: np.ndarray, y: np.ndarray, poly: np.ndarray) -> np.ndarray:
+        pts = np.column_stack([np.asarray(x).ravel(), np.asarray(y).ravel()])
+        try:
+            from matplotlib.path import Path
+            return Path(poly).contains_points(pts).reshape(np.shape(x))
+        except Exception:
+            return np.zeros(np.shape(x), dtype=bool)
+
+    @classmethod
+    def _apply_grid_masks(
+        cls,
+        Xi: np.ndarray,
+        Yi: np.ndarray,
+        Zi: np.ndarray,
+        clip_poly: Optional[np.ndarray],
+        mask_poly: Optional[np.ndarray],
+    ) -> np.ndarray:
+        masked = np.array(Zi, copy=True)
+        if clip_poly is not None:
+            outside_domain = ~cls._points_inside_polygon(Xi, Yi, clip_poly)
+            masked[outside_domain] = np.nan
+        if mask_poly is not None:
+            inside_body = cls._points_inside_polygon(Xi, Yi, mask_poly)
+            masked[inside_body] = np.nan
+        return masked
+
     def plot_residual_map(self, x_np: np.ndarray, y_np: np.ndarray,
                           residual: np.ndarray, savedir: str,
-                          epoch: Optional[Union[int, str]] = None) -> None:
+                          epoch: Optional[Union[int, str]] = None,
+                          clip_polygon: Optional[np.ndarray] = None,
+                          mask_polygon: Optional[np.ndarray] = None,
+                          outline_polylines: Optional[List[np.ndarray]] = None) -> None:
         """
         Строит карту невязки PDE по области (координаты в физических единицах).
 
@@ -318,16 +524,43 @@ class Visualizer:
         os.makedirs(savedir, exist_ok=True)
         suffix = f"_epoch_{epoch}" if epoch is not None else "_final"
 
-        plt.figure(figsize=(10, 8))
-        plt.scatter(x_np, y_np, c=residual, s=1, cmap='hot', alpha=0.6)
-        plt.colorbar(label='Невязка')
-        plt.title(f'Карта невязки PDE - {self.config_name}')
-        plt.xlabel('x, м')
-        plt.ylabel('y, м')
-        plt.axis('equal')
-        plt.savefig(os.path.join(savedir, f"residual_map{suffix}.png"), dpi=150)
-        plt.close()
+        self._plot_smooth_field_map(
+            x_np, y_np, residual, savedir,
+            filename=f"residual_map{suffix}.png",
+            title=f'Карта невязки PDE - {self.config_name}',
+            colorbar_label='Невязка',
+            cmap='hot',
+            clip_polygon=clip_polygon,
+            mask_polygon=mask_polygon,
+            outline_polylines=outline_polylines,
+        )
         logger.info(f"Карта невязки сохранена: residual_map{suffix}.png")
+
+    def plot_rar_error_map(self, x_np: np.ndarray, y_np: np.ndarray,
+                           error: np.ndarray, savedir: str,
+                           epoch: Optional[Union[int, str]] = None,
+                           clip_polygon: Optional[np.ndarray] = None,
+                           mask_polygon: Optional[np.ndarray] = None,
+                           outline_polylines: Optional[List[np.ndarray]] = None) -> None:
+        """
+        Строит карту полной локальной ошибки, которую использует adaptive RAR.
+
+        Обычно это local total-loss score: взвешенная PDE-часть + точечные BC.
+        """
+        os.makedirs(savedir, exist_ok=True)
+        suffix = f"_epoch_{epoch}" if epoch is not None else "_final"
+
+        self._plot_smooth_field_map(
+            x_np, y_np, error, savedir,
+            filename=f"rar_error_map{suffix}.png",
+            title=f'Поле полной ошибки RAR - {self.config_name}',
+            colorbar_label='RAR score / local total loss',
+            cmap='magma',
+            clip_polygon=clip_polygon,
+            mask_polygon=mask_polygon,
+            outline_polylines=outline_polylines,
+        )
+        logger.info(f"Карта полной ошибки RAR сохранена: rar_error_map{suffix}.png")
 
     def plot_gradient_norm_history(self, grad_norm_history: List[float],
                                    savedir: str, epoch: Optional[Union[int, str]] = None) -> None:
@@ -525,6 +758,22 @@ class Visualizer:
         v_np = v_plot.cpu().numpy().flatten()
         p_np = p_plot.cpu().numpy().flatten()
 
+        if (
+            getattr(data_handler, 'mesh_domain_coords', None) is None
+            and hasattr(data_handler, 'load_mesh_geometry_from_geom_config')
+        ):
+            data_handler.load_mesh_geometry_from_geom_config()
+        geom_scale = 1.0 if plot_physical else 1.0 / float(getattr(data_handler, 'chord', 1.0) or 1.0)
+        clip_polygon = self._scale_geometry_for_plot(
+            getattr(data_handler, 'mesh_domain_coords', None),
+            geom_scale,
+        )
+        airfoil_polyline = self._scale_geometry_for_plot(
+            getattr(data_handler, 'mesh_airfoil_coords', None),
+            geom_scale,
+        )
+        outline_polylines = [airfoil_polyline] if airfoil_polyline is not None else None
+
         # Создаём маски для граничных точек
         boundary_masks = {}
         if boundary_types is not None and boundary_type_names is not None:
@@ -548,33 +797,27 @@ class Visualizer:
 
         for name, val, label, vmin, vmax in fields:
             try:
-                plt.figure(figsize=(10, 8))
-                # Основные точки (все) – полупрозрачные, мелкие
-                scatter_kwargs = {'c': val, 's': 1, 'cmap': 'jet', 'alpha': 0.3}
-                if vmin is not None and vmax is not None:
-                    scatter_kwargs['vmin'] = vmin
-                    scatter_kwargs['vmax'] = vmax
-                plt.scatter(x_np, y_np, **scatter_kwargs, label='Все точки')
-
-                # Выделяем граничные точки – крупнее, непрозрачные, с обводкой
-                if boundary_masks:
-                    for bt_name, mask in boundary_masks.items():
-                        if np.any(mask):
-                            plt.scatter(x_np[mask], y_np[mask], c=val[mask], s=2,
-                                        cmap='jet', edgecolors='none', linewidth=0.3,
-                                        vmin=vmin, vmax=vmax,
-                                        label=f'{bt_name} ({np.sum(mask)})')
-
-                plt.colorbar(label=label)
-                plt.title(f'Predicted {name} (epoch {epoch}){title_suffix} - {self.config_name}' if epoch else f'Predicted {name}{title_suffix} - {self.config_name}')
-                plt.xlabel(x_label)
-                plt.ylabel(y_label)
-                plt.axis('equal')
-                if boundary_masks:
-                    plt.legend(loc='upper right', fontsize=8)
-                plt.savefig(os.path.join(savedir, f'field_{name}{suffix}.png'), dpi=150)
+                title = (
+                    f'Predicted {name} (epoch {epoch}){title_suffix} - {self.config_name}'
+                    if epoch else
+                    f'Predicted {name}{title_suffix} - {self.config_name}'
+                )
+                self._plot_smooth_field_map(
+                    x_np, y_np, val, savedir,
+                    filename=f'field_{name}{suffix}.png',
+                    title=title,
+                    colorbar_label=label,
+                    cmap='jet',
+                    x_label=x_label,
+                    y_label=y_label,
+                    vmin=vmin,
+                    vmax=vmax,
+                    boundary_masks=boundary_masks,
+                    clip_polygon=clip_polygon,
+                    mask_polygon=airfoil_polyline,
+                    outline_polylines=outline_polylines,
+                )
                 logger.info(f"Поле сохранено: field_{name}{suffix}.png")
-                plt.close()
             except Exception as e:
                 logger.warning(f"Не удалось построить график для {name}: {e}")
 

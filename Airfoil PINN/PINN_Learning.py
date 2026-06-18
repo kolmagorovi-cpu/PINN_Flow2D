@@ -701,8 +701,52 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
         elif sub == '5':
             tr['rar_enable'] = yes_no("RAR", tr['rar_enable'])
             if tr['rar_enable']:
+                tr.setdefault('rar_mode', 'adaptive')
+                tr.setdefault('rar_score_mode', 'total_loss')
+                tr.setdefault('rar_error_quantile', 0.75)
+                tr.setdefault('rar_jitter_scale', 0.85)
+                tr.setdefault('rar_min_distance_factor', 0.35)
+                tr.setdefault('rar_rebuild_fvm', True)
+                tr.setdefault('rar_fvm_rebuild_every', 1)
+                tr.setdefault('rar_fvm_min_new_points', 1)
+                tr.setdefault('rar_save_mesh_volume_plot', True)
+                tr.setdefault('rar_mesh_plot_dpi', 150)
                 tr['rar_interval'] = int(input(f"Интервал RAR [{tr['rar_interval']}]: ") or tr['rar_interval'])
                 tr['rar_num_points'] = int(input(f"Количество точек [{tr['rar_num_points']}]: ") or tr['rar_num_points'])
+                mode = input(f"Режим RAR (adaptive/legacy) [{tr['rar_mode']}]: ").strip().lower()
+                if mode in ('adaptive', 'legacy'):
+                    tr['rar_mode'] = mode
+                if tr['rar_mode'] == 'adaptive':
+                    score_mode = input(
+                        f"Score для выбора RAR-точек (total_loss/pde) [{tr['rar_score_mode']}]: "
+                    ).strip().lower()
+                    if score_mode in ('total_loss', 'pde'):
+                        tr['rar_score_mode'] = score_mode
+                    tr['rar_error_quantile'] = float(input(
+                        f"Квантиль ошибки для источников [{tr['rar_error_quantile']}]: "
+                    ) or tr['rar_error_quantile'])
+                    tr['rar_jitter_scale'] = float(input(
+                        f"Радиус генерации в локальных шагах [{tr['rar_jitter_scale']}]: "
+                    ) or tr['rar_jitter_scale'])
+                    tr['rar_min_distance_factor'] = float(input(
+                        f"Мин. расстояние до соседей в локальных шагах [{tr['rar_min_distance_factor']}]: "
+                    ) or tr['rar_min_distance_factor'])
+                    tr['rar_rebuild_fvm'] = yes_no("Перестраивать FVM после adaptive RAR", tr['rar_rebuild_fvm'])
+                    if tr['rar_rebuild_fvm']:
+                        tr['rar_fvm_rebuild_every'] = int(input(
+                            f"FVM rebuild раз в N срабатываний RAR [{tr['rar_fvm_rebuild_every']}]: "
+                        ) or tr['rar_fvm_rebuild_every'])
+                        tr['rar_fvm_min_new_points'] = int(input(
+                            f"Мин. новых точек для FVM rebuild [{tr['rar_fvm_min_new_points']}]: "
+                        ) or tr['rar_fvm_min_new_points'])
+                    tr['rar_save_mesh_volume_plot'] = yes_no(
+                        "Сохранять график CV-объёмов сетки после RAR",
+                        tr['rar_save_mesh_volume_plot'],
+                    )
+                    if tr['rar_save_mesh_volume_plot']:
+                        tr['rar_mesh_plot_dpi'] = int(input(
+                            f"DPI графика CV-объёмов [{tr['rar_mesh_plot_dpi']}]: "
+                        ) or tr['rar_mesh_plot_dpi'])
         elif sub == '6':
             tr['switch_to_lbfgs_epoch'] = int(input(f"Переключение на L-BFGS (эпоха, 0 - выкл) [{tr['switch_to_lbfgs_epoch']}]: ") or tr['switch_to_lbfgs_epoch'])
             if tr['switch_to_lbfgs_epoch'] > 0:
@@ -735,6 +779,15 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
             print(f"Интервал сброса: {tr['reset_interval']} (шум {tr['reset_noise']})")
             print(f"Градиентное отсечение: {tr['grad_clip']}")
             print(f"RAR: {tr['rar_enable']}")
+            if tr['rar_enable']:
+                print(f"  режим: {tr.get('rar_mode', 'adaptive')}, "
+                      f"интервал: {tr['rar_interval']}, точек: {tr['rar_num_points']}")
+                if tr.get('rar_mode', 'adaptive') == 'adaptive':
+                    print(f"  score: {tr.get('rar_score_mode', 'total_loss')}, "
+                          f"error_quantile: {tr.get('rar_error_quantile', 0.75)}, "
+                          f"FVM rebuild: {tr.get('rar_rebuild_fvm', True)}")
+                    print(f"  mesh CV plot: {tr.get('rar_save_mesh_volume_plot', True)}, "
+                          f"dpi={tr.get('rar_mesh_plot_dpi', 150)}")
             print(f"Переключение на L-BFGS: эпоха {tr['switch_to_lbfgs_epoch']}")
             print(f"Батч: {tr['batch_size']}, накопление: {tr['gradient_accumulation_steps']}")
             print(f"Эпох: {tr['epochs']}")
@@ -823,17 +876,18 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
             diag = cfg.config['diagnostics'] = {}
         print("1. Интервал диагностики (эпох)")
         print("2. Построение карты невязки")
-        print("3. Построение профилей скорости")
-        print("4. Сечения для профилей (через запятую)")
-        print("5. Построение спектра (1D)")
-        print("6. Координата X для спектра (1D)")
-        print("7. Построение 2D спектра")
-        print("8. Разрешение 2D спектра")
-        print("9. Вычисление раздельных градиентов")
-        print("10. Вычисление NTK")
-        print("11. Сохранение истории RAR")
-        print("12. Интервал inlet/outlet метрик")
-        print("13. Показать текущие настройки")
+        print("3. Построение карты полной ошибки RAR")
+        print("4. Построение профилей скорости")
+        print("5. Сечения для профилей (через запятую)")
+        print("6. Построение спектра (1D)")
+        print("7. Координата X для спектра (1D)")
+        print("8. Построение 2D спектра")
+        print("9. Разрешение 2D спектра")
+        print("10. Вычисление раздельных градиентов")
+        print("11. Вычисление NTK")
+        print("12. Сохранение истории RAR")
+        print("13. Интервал inlet/outlet метрик")
+        print("14. Показать текущие настройки")
         print("0. Выход")
         sub = input("Выберите пункт: ").strip()
 
@@ -842,8 +896,10 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
         elif sub == '2':
             diag['plot_residual_map'] = yes_no("Строить карту невязки", diag.get('plot_residual_map', True))
         elif sub == '3':
-            diag['plot_profiles'] = yes_no("Строить профили скорости", diag.get('plot_profiles', True))
+            diag['plot_rar_error_map'] = yes_no("Строить карту полной ошибки RAR", diag.get('plot_rar_error_map', True))
         elif sub == '4':
+            diag['plot_profiles'] = yes_no("Строить профили скорости", diag.get('plot_profiles', True))
+        elif sub == '5':
             current = diag.get('profile_sections', [0.2, 0.5, 0.8])
             sections_str = input(f"Сечения (x, м) через запятую [{', '.join(map(str, current))}]: ").strip()
             if sections_str:
@@ -851,30 +907,31 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
                     diag['profile_sections'] = [float(x.strip()) for x in sections_str.split(',')]
                 except ValueError:
                     print("Неверный формат, оставлено текущее значение.")
-        elif sub == '5':
-            diag['plot_spectrum'] = yes_no("Строить 1D спектр", diag.get('plot_spectrum', True))
         elif sub == '6':
-            diag['spectrum_section_x'] = float(input(f"X для 1D спектра (м) [{diag.get('spectrum_section_x', 0.5)}]: ") or diag.get('spectrum_section_x', 0.5))
+            diag['plot_spectrum'] = yes_no("Строить 1D спектр", diag.get('plot_spectrum', True))
         elif sub == '7':
-            diag['plot_2d_spectrum'] = yes_no("Строить 2D спектр", diag.get('plot_2d_spectrum', False))
+            diag['spectrum_section_x'] = float(input(f"X для 1D спектра (м) [{diag.get('spectrum_section_x', 0.5)}]: ") or diag.get('spectrum_section_x', 0.5))
         elif sub == '8':
-            diag['spectrum_2d_resolution'] = int(input(f"Разрешение 2D спектра [{diag.get('spectrum_2d_resolution', 256)}]: ") or diag.get('spectrum_2d_resolution', 256))
+            diag['plot_2d_spectrum'] = yes_no("Строить 2D спектр", diag.get('plot_2d_spectrum', False))
         elif sub == '9':
-            diag['compute_grad_cosine'] = yes_no("Вычислять раздельные градиенты", diag.get('compute_grad_cosine', False))
+            diag['spectrum_2d_resolution'] = int(input(f"Разрешение 2D спектра [{diag.get('spectrum_2d_resolution', 256)}]: ") or diag.get('spectrum_2d_resolution', 256))
         elif sub == '10':
-            diag['compute_ntk_condition'] = yes_no("Вычислять NTK", diag.get('compute_ntk_condition', False))
+            diag['compute_grad_cosine'] = yes_no("Вычислять раздельные градиенты", diag.get('compute_grad_cosine', False))
         elif sub == '11':
-            diag['save_rar_history'] = yes_no("Сохранять историю RAR", diag.get('save_rar_history', True))
+            diag['compute_ntk_condition'] = yes_no("Вычислять NTK", diag.get('compute_ntk_condition', False))
         elif sub == '12':
+            diag['save_rar_history'] = yes_no("Сохранять историю RAR", diag.get('save_rar_history', True))
+        elif sub == '13':
             diag['mass_metrics_interval'] = int(
                 input(f"Интервал inlet/outlet метрик [{diag.get('mass_metrics_interval', 1)}]: ")
                 or diag.get('mass_metrics_interval', 1)
             )
             diag['mass_metrics_interval'] = max(1, diag['mass_metrics_interval'])
-        elif sub == '13':
+        elif sub == '14':
             print("\n--- ТЕКУЩИЕ НАСТРОЙКИ ДИАГНОСТИКИ ---")
             print(f"Интервал: {diag.get('interval', 50)}")
             print(f"Карта невязки: {diag.get('plot_residual_map', True)}")
+            print(f"Карта полной ошибки RAR: {diag.get('plot_rar_error_map', True)}")
             print(f"Профили: {diag.get('plot_profiles', True)}")
             print(f"Сечения: {diag.get('profile_sections', [0.2, 0.5, 0.8])}")
             print(f"1D спектр: {diag.get('plot_spectrum', True)}")
