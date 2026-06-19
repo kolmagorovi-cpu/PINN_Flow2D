@@ -8,7 +8,7 @@ try:
     from PySide6.QtWidgets import QApplication
 except ImportError as exc:  # pragma: no cover - depends on local environment
     raise SystemExit(
-        "PySide6 is not installed. Run: python -m pip install -r ui/requirements.txt"
+        "PySide6 is not installed. Run: python -m pip install -r requirements_ui.txt"
     ) from exc
 
 from ui.main_window import MainWindow
@@ -17,6 +17,7 @@ from ui.theme import app_stylesheet
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setOrganizationName("AirfoilPINN")
     app.setApplicationName("Airfoil PINN UI")
     app.setStyleSheet(app_stylesheet())
 

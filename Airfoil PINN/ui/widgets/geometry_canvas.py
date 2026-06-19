@@ -18,6 +18,7 @@ class GeometryCanvas(QWidget):
 
     cursorChanged = Signal(float, float)
     selectionChanged = Signal(str)
+    geometryEdited = Signal(list)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -42,6 +43,7 @@ class GeometryCanvas(QWidget):
         self._pan = QPointF(0.0, 0.0)
         self._last_mouse: Optional[QPointF] = None
         self._dragging_vertex: Optional[int] = None
+        self._geometry_changed_by_drag = False
         self._phase = 0.0
 
         self._timer = QTimer(self)
@@ -145,7 +147,8 @@ class GeometryCanvas(QWidget):
         self.cursorChanged.emit(world.x(), world.y())
 
         if self._dragging_vertex is not None:
-            self.foil_points[self._dragging_vertex] = world
+            self._set_foil_vertex(self._dragging_vertex, world)
+            self._geometry_changed_by_drag = True
             self._view_rect_cache = self._compute_view_rect()
             self.update()
         elif self._last_mouse is not None:
@@ -156,8 +159,11 @@ class GeometryCanvas(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._geometry_changed_by_drag:
+            self.geometryEdited.emit([(point.x(), point.y()) for point in self.foil_points])
         self._last_mouse = None
         self._dragging_vertex = None
+        self._geometry_changed_by_drag = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(event)
 
@@ -336,6 +342,14 @@ class GeometryCanvas(QWidget):
                 best_idx = idx
                 best_dist = dist
         return best_idx
+
+    def _set_foil_vertex(self, index: int, point: QPointF) -> None:
+        self.foil_points[index] = point
+        if self.is_closed and len(self.foil_points) > 2:
+            if index == 0:
+                self.foil_points[-1] = point
+            elif index == len(self.foil_points) - 1:
+                self.foil_points[0] = point
 
     def _domain_polygon_from_rect(self) -> list[QPointF]:
         rect = self.domain.rect

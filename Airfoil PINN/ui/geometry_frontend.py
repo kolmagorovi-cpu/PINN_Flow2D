@@ -101,9 +101,15 @@ class GeometryFrontendSession:
         if sample == "open_plate":
             points = [Point(x / 80.0, 0.0) for x in range(81)]
             self.name = "mock_open_plate"
+        elif sample in {"naca2412", "NACA 2412"}:
+            points = self._make_naca4(max_camber=0.02, camber_position=0.4, thickness=0.12)
+            self.name = "NACA_2412"
+        elif sample in {"rae2822", "RAE 2822"}:
+            points = self._make_rae2822()
+            self.name = "RAE_2822"
         else:
             points = self._make_naca0012()
-            self.name = "mock_naca0012"
+            self.name = "NACA_0012"
 
         self.source = "mock"
         self.foil_points = points
@@ -201,6 +207,33 @@ class GeometryFrontendSession:
         self.foil_points = points
         self.domain_points = []
         self.stats = self._compute_stats(points)
+
+    def replace_foil_points(
+        self,
+        points: Iterable[Point | Sequence[object]],
+        name: str | None = None,
+        source: str = "canvas edit",
+    ) -> None:
+        normalized: list[Point] = []
+        for point in points:
+            if isinstance(point, Point):
+                normalized.append(point)
+                continue
+            if len(point) < 2:
+                continue
+            try:
+                normalized.append(Point(float(point[0]), float(point[1])))
+            except (TypeError, ValueError):
+                continue
+
+        if len(normalized) < 2:
+            raise GeometryReadError("Edited geometry must contain at least two valid points")
+
+        self.name = self._clean_name(name or self.name)
+        self.source = source
+        self.foil_points = normalized
+        self.domain_points = []
+        self.stats = self._compute_stats(normalized)
 
     def create_domain(self, front: float, top: float, rear: float | None = None, bottom: float | None = None) -> None:
         if not self.stats:
@@ -403,8 +436,16 @@ class GeometryFrontendSession:
             return fallback
 
     def _make_naca0012(self, count: int = 96) -> list[Point]:
+        return self._make_naca4(max_camber=0.0, camber_position=0.0, thickness=0.12, count=count)
+
+    def _make_naca4(
+        self,
+        max_camber: float,
+        camber_position: float,
+        thickness: float,
+        count: int = 96,
+    ) -> list[Point]:
         half = max(12, count // 2)
-        thickness = 0.12
         upper: list[Point] = []
         lower: list[Point] = []
 
@@ -418,12 +459,37 @@ class GeometryFrontendSession:
                 + 0.2843 * x**3
                 - 0.1015 * x**4
             )
-            upper.append(Point(x, yt))
-            lower.append(Point(x, -yt))
+            if max_camber > 0.0 and camber_position > 0.0:
+                if x < camber_position:
+                    yc = max_camber / camber_position**2 * (2 * camber_position * x - x**2)
+                    dyc = 2 * max_camber / camber_position**2 * (camber_position - x)
+                else:
+                    denom = (1 - camber_position) ** 2
+                    yc = max_camber / denom * ((1 - 2 * camber_position) + 2 * camber_position * x - x**2)
+                    dyc = 2 * max_camber / denom * (camber_position - x)
+            else:
+                yc = 0.0
+                dyc = 0.0
+            theta = math.atan(dyc)
+            upper.append(Point(x - yt * math.sin(theta), yc + yt * math.cos(theta)))
+            lower.append(Point(x + yt * math.sin(theta), yc - yt * math.cos(theta)))
 
         points = upper + list(reversed(lower))
         points.append(points[0])
         return points
+
+    def _make_rae2822(self, count: int = 112) -> list[Point]:
+        points = self._make_naca4(max_camber=0.018, camber_position=0.55, thickness=0.12, count=count)
+        shaped: list[Point] = []
+        for point in points:
+            x = point.x
+            if point.y >= 0:
+                y = point.y * (1.0 - 0.22 * x) + 0.010 * x * (1.0 - x)
+            else:
+                y = point.y * (1.0 + 0.10 * x) - 0.004 * x * (1.0 - x)
+            shaped.append(Point(x, y))
+        shaped[-1] = shaped[0]
+        return shaped
 
     def _clean_name(self, value: str) -> str:
         allowed = []

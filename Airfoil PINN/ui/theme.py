@@ -180,7 +180,7 @@ def app_stylesheet() -> str:
         selection-background-color: #d9ecff;
     }}
 
-    QTextEdit {{
+    QTextEdit, QPlainTextEdit {{
         background: #101822;
         color: #dbe7f2;
         border: none;
