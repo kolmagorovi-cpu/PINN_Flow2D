@@ -110,6 +110,13 @@ def app_stylesheet() -> str:
         border-color: #b7c5d2;
     }}
 
+    QToolButton#ModuleButton:checked {{
+        background: #e2f0fb;
+        color: {PALETTE.accent_dark};
+        border-color: {PALETTE.accent};
+        font-weight: 700;
+    }}
+
     QPushButton#PrimaryButton {{
         background: {PALETTE.accent};
         color: #ffffff;
@@ -182,4 +189,3 @@ def app_stylesheet() -> str:
         font-size: 9pt;
     }}
     """
-

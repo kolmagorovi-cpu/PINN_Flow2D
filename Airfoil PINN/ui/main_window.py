@@ -11,6 +11,7 @@ from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -67,6 +69,15 @@ class MainWindow(QMainWindow):
     """Autonomous GUI prototype; no imports from project backend modules."""
 
     GEOMETRY_FILE_EXTENSIONS = {".txt", ".dat", ".csv", ".npy"}
+    MODULES = (
+        ("geometry", "Geometry", QStyle.StandardPixmap.SP_FileDialogDetailedView),
+        ("collocation", "Collocation", QStyle.StandardPixmap.SP_DriveHDIcon),
+        ("fluid", "Fluid", QStyle.StandardPixmap.SP_ComputerIcon),
+        ("boundaries", "Boundaries", QStyle.StandardPixmap.SP_DirLinkIcon),
+        ("initialization", "Initialization", QStyle.StandardPixmap.SP_BrowserReload),
+        ("training", "Training", QStyle.StandardPixmap.SP_MediaPlay),
+        ("results", "Results", QStyle.StandardPixmap.SP_DialogSaveButton),
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -87,6 +98,7 @@ class MainWindow(QMainWindow):
         self._apply_domain_params_to_controls()
         self._apply_save_format_to_controls()
         self._sync_geometry_ui(reset_view=True, update_name=True)
+        self._set_active_module("geometry")
 
         self.training_timer = QTimer(self)
         self.training_timer.setInterval(220)
@@ -151,40 +163,355 @@ class MainWindow(QMainWindow):
 
     def _build_layout(self) -> None:
         central = QWidget()
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(10)
 
-        self.sidebar = self._build_sidebar()
-        root.addWidget(self.sidebar)
+        root.addWidget(self._build_module_nav())
 
-        self.stack = QStackedWidget()
-        self.geometry_page = self._build_geometry_page()
-        self.collocation_page = self._build_collocation_page()
-        self.fluid_page = self._build_fluid_page()
-        self.boundary_page = self._build_boundary_page()
-        self.initialization_page = self._build_initialization_page()
-        self.training_page = self._build_training_page()
-        self.results_page = self._build_results_page()
+        body = QSplitter(Qt.Orientation.Horizontal)
+        self.left_module_stack = QStackedWidget()
+        self.right_module_stack = QStackedWidget()
+        self.module_index: dict[str, int] = {}
 
-        for page in (
-            self.geometry_page,
-            self.collocation_page,
-            self.fluid_page,
-            self.boundary_page,
-            self.initialization_page,
-            self.training_page,
-            self.results_page,
+        for module_key, left_panel, right_panel in (
+            ("geometry", self._build_geometry_left_panel(), self._build_geometry_right_panel()),
+            ("collocation", self._build_collocation_left_panel(), self._build_collocation_right_panel()),
+            ("fluid", self._build_fluid_left_panel(), self._build_fluid_right_panel()),
+            ("boundaries", self._build_boundary_left_panel(), self._build_boundary_right_panel()),
+            ("initialization", self._build_initialization_left_panel(), self._build_initialization_right_panel()),
+            ("training", self._build_training_left_panel(), self._build_training_right_panel()),
+            ("results", self._build_results_left_panel(), self._build_results_right_panel()),
         ):
-            self.stack.addWidget(page)
+            self.module_index[module_key] = self.left_module_stack.addWidget(left_panel)
+            self.right_module_stack.addWidget(right_panel)
+
+        body.addWidget(self.left_module_stack)
+        body.addWidget(self._build_geometry_center())
+        body.addWidget(self.right_module_stack)
+        body.setSizes([310, 780, 330])
+        body.setCollapsible(1, False)
 
         workspace = QSplitter(Qt.Orientation.Vertical)
-        workspace.addWidget(self.stack)
+        workspace.addWidget(body)
         self.log_panel = LogPanel()
         workspace.addWidget(self.log_panel)
-        workspace.setSizes([640, 150])
+        workspace.setSizes([690, 140])
         root.addWidget(workspace, 1)
         self.setCentralWidget(central)
+
+    def _build_module_nav(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("Panel")
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        title = QLabel("AEROPINN")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+
+        self.module_button_group = QButtonGroup(self)
+        self.module_button_group.setExclusive(True)
+        self.module_buttons: dict[str, QToolButton] = {}
+        style = QApplication.style()
+
+        for module_key, label, icon_id in self.MODULES:
+            button = QToolButton()
+            button.setObjectName("ModuleButton")
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setIcon(style.standardIcon(icon_id))
+            button.setText(label)
+            button.setMinimumWidth(118)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda checked=False, key=module_key: self._set_active_module(key))
+            self.module_button_group.addButton(button)
+            self.module_buttons[module_key] = button
+            layout.addWidget(button, 1)
+
+        return frame
+
+    def _set_active_module(self, module_key: str) -> None:
+        index = self.module_index[module_key]
+        self.left_module_stack.setCurrentIndex(index)
+        self.right_module_stack.setCurrentIndex(index)
+        self.module_buttons[module_key].setChecked(True)
+        self.statusBar().showMessage(f"{self.module_buttons[module_key].text()} settings")
+
+    def _build_geometry_center(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(self._build_geometry_header())
+        self.geometry_canvas = GeometryCanvas()
+        layout.addWidget(self.geometry_canvas, 1)
+        return page
+
+    def _new_side_panel(self):
+        panel = QScrollArea()
+        panel.setWidgetResizable(True)
+        panel.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content.setObjectName("Panel")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+        panel.setWidget(content)
+        panel.setMinimumWidth(285)
+        return panel, layout
+
+    def _build_geometry_left_panel(self) -> QWidget:
+        panel, layout = self._new_side_panel()
+
+        domain_box = QGroupBox("Domain")
+        form = QFormLayout(domain_box)
+        self.domain_mode_label = QLabel("Detected: closed airfoil")
+        self.domain_mode_label.setObjectName("Muted")
+        self.front_spin = self._double_spin(0.2, 8.0, 1.5, 0.1)
+        self.rear_spin = self._double_spin(0.2, 10.0, 3.0, 0.1)
+        self.top_spin = self._double_spin(0.2, 5.0, 1.2, 0.1)
+        self.bottom_spin = self._double_spin(0.2, 5.0, 1.2, 0.1)
+        form.addRow("Profile", self.domain_mode_label)
+        form.addRow("Front, m", self.front_spin)
+        form.addRow("Rear, m", self.rear_spin)
+        form.addRow("Top, m", self.top_spin)
+        form.addRow("Bottom, m", self.bottom_spin)
+        layout.addWidget(domain_box)
+
+        display_box = QGroupBox("Display")
+        display_layout = QVBoxLayout(display_box)
+        self.points_check = QCheckBox("Collocation points")
+        self.points_check.setChecked(False)
+        self.flow_check = QCheckBox("Flow animation")
+        self.flow_check.setChecked(False)
+        self.grid_check = QCheckBox("Grid")
+        self.grid_check.setChecked(True)
+        display_layout.addWidget(self.points_check)
+        display_layout.addWidget(self.flow_check)
+        display_layout.addWidget(self.grid_check)
+        layout.addWidget(display_box)
+
+        points_box = QGroupBox("Preview Points")
+        points_form = QFormLayout(points_box)
+        self.points_spin = QSpinBox()
+        self.points_spin.setRange(100, 6000)
+        self.points_spin.setSingleStep(100)
+        self.points_spin.setValue(850)
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(["Uniform", "Boundary focused", "RAR preview"])
+        points_form.addRow("Points", self.points_spin)
+        points_form.addRow("Method", self.method_combo)
+        layout.addWidget(points_box)
+
+        button_row = QHBoxLayout()
+        self.rebuild_button = QPushButton("Build Domain")
+        self.rebuild_button.setObjectName("PrimaryButton")
+        self.sample_button = QPushButton("Sample")
+        self.rebuild_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.sample_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        button_row.addWidget(self.rebuild_button)
+        button_row.addWidget(self.sample_button)
+        layout.addLayout(button_row)
+
+        self.geometry_info = QLabel("x: 0.000, y: 0.000")
+        self.geometry_info.setObjectName("Muted")
+        layout.addWidget(self.geometry_info)
+        layout.addStretch(1)
+        return panel
+
+    def _build_geometry_right_panel(self) -> QWidget:
+        panel, layout = self._new_side_panel()
+
+        self.stats_table = QTableWidget(8, 2)
+        self.stats_table.setHorizontalHeaderLabels(["Metric", "Value"])
+        self._setup_compact_table(self.stats_table, height=236)
+        layout.addWidget(self._wrap_group("Airfoil Stats", self.stats_table))
+
+        self.vertices_table = QTableWidget(0, 2)
+        self.vertices_table.setHorizontalHeaderLabels(["x, m", "y, m"])
+        self._setup_compact_table(self.vertices_table, height=180)
+        layout.addWidget(self._wrap_group("Domain Vertices", self.vertices_table))
+
+        export_box = QGroupBox("Export")
+        export_form = QFormLayout(export_box)
+        self.geometry_name_edit = QLineEdit(self.geometry_session.name)
+        self.save_format_combo = QComboBox()
+        self.save_format_combo.addItems(["npy", "csv", "txt"])
+        self.export_geometry_button = QPushButton("Save")
+        self.export_geometry_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.export_geometry_button.setObjectName("PrimaryButton")
+        self.output_dir_label = QLabel(f"Output: {self._short_path(self.geometry_session.output_dir)}")
+        self.output_dir_label.setObjectName("Muted")
+        self.output_dir_label.setWordWrap(True)
+        export_form.addRow("Name", self.geometry_name_edit)
+        export_form.addRow("Format", self.save_format_combo)
+        export_form.addRow("Folder", self.output_dir_label)
+        export_form.addRow("", self.export_geometry_button)
+        layout.addWidget(export_box)
+        layout.addStretch(1)
+        return panel
+
+    def _build_form_side_panel(self, title: str, fields: list[tuple[str, QWidget]], note: str = "") -> QWidget:
+        panel, layout = self._new_side_panel()
+        box = QGroupBox(title)
+        form = QFormLayout(box)
+        for label, widget in fields:
+            form.addRow(label, widget)
+        layout.addWidget(box)
+        if note:
+            note_label = QLabel(note)
+            note_label.setObjectName("Muted")
+            note_label.setWordWrap(True)
+            layout.addWidget(note_label)
+        layout.addStretch(1)
+        return panel
+
+    def _build_status_side_panel(self, title: str, lines: list[str]) -> QWidget:
+        panel, layout = self._new_side_panel()
+        box = QGroupBox(title)
+        box_layout = QVBoxLayout(box)
+        for line in lines:
+            label = QLabel(line)
+            label.setObjectName("Muted")
+            label.setWordWrap(True)
+            box_layout.addWidget(label)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return panel
+
+    def _build_collocation_left_panel(self) -> QWidget:
+        return self._build_form_side_panel(
+            "Collocation",
+            [
+                ("Grid step, m", self._double_spin(0.001, 1.0, 0.04, 0.005)),
+                ("Boundary density", self._double_spin(0.1, 10.0, 2.5, 0.1)),
+                ("Boundary mode", self._combo(["inlet/outlet/wall/symmetry", "axisymmetric", "custom labels"])),
+                ("Multiprocessing", self._combo(["auto", "1 process", "4 processes", "8 processes"])),
+            ],
+        )
+
+    def _build_collocation_right_panel(self) -> QWidget:
+        return self._build_status_side_panel(
+            "Collocation Preview",
+            ["Geometry remains visible in the center.", "Sampler settings will be connected to backend later."],
+        )
+
+    def _build_fluid_left_panel(self) -> QWidget:
+        return self._build_form_side_panel(
+            "Fluid",
+            [
+                ("Preset", self._combo(["Air 20C", "Water 20C", "Custom"])),
+                ("Density, kg/m3", self._double_spin(0.1, 5000.0, 1.204, 0.01)),
+                ("Kinematic viscosity, m2/s", self._double_spin(1e-8, 1e-2, 1.5e-5, 1e-6, decimals=8)),
+                ("Dynamic viscosity, Pa*s", self._double_spin(1e-8, 1e-1, 1.8e-5, 1e-6, decimals=8)),
+            ],
+        )
+
+    def _build_fluid_right_panel(self) -> QWidget:
+        return self._build_status_side_panel("Fluid Status", ["Fluid properties panel.", "Geometry view stays active."])
+
+    def _build_boundary_left_panel(self) -> QWidget:
+        return self._build_form_side_panel(
+            "Boundaries",
+            [
+                ("Inlet velocity, m/s", self._double_spin(0.0, 400.0, 30.0, 0.5)),
+                ("Outlet pressure, Pa", self._double_spin(-1e6, 1e6, 0.0, 100.0)),
+                ("Wall", self._combo(["no slip", "slip", "moving wall"])),
+                ("Top boundary", self._combo(["symmetry", "outlet", "wall"])),
+                ("Bottom boundary", self._combo(["wall", "symmetry", "axis symmetry"])),
+            ],
+        )
+
+    def _build_boundary_right_panel(self) -> QWidget:
+        return self._build_status_side_panel("Boundary Summary", ["Boundary labels will map onto the visible geometry domain."])
+
+    def _build_initialization_left_panel(self) -> QWidget:
+        return self._build_form_side_panel(
+            "Initialization",
+            [
+                ("Pressure mode", self._combo(["constant", "dynamic pressure", "linear"])),
+                ("Velocity mode", self._combo(["uniform", "potential preview", "noisy uniform"])),
+                ("Velocity noise", self._double_spin(0.0, 1.0, 0.01, 0.01)),
+                ("Pressure noise", self._double_spin(0.0, 1.0, 0.0, 0.01)),
+                ("Temperature, K", self._double_spin(100.0, 600.0, 293.15, 0.5)),
+            ],
+        )
+
+    def _build_initialization_right_panel(self) -> QWidget:
+        return self._build_status_side_panel("Initialization Status", ["Initial fields will be previewed over the geometry."])
+
+    def _build_training_left_panel(self) -> QWidget:
+        return self._build_form_side_panel(
+            "Training Setup",
+            [
+                ("Epochs", self._spin(1, 100000, 500, 100)),
+                ("Batch size", self._spin(1, 100000, 512, 128)),
+                ("Device", self._combo(["auto", "cuda", "cpu"])),
+            ],
+        )
+
+    def _build_training_right_panel(self) -> QWidget:
+        panel, layout = self._new_side_panel()
+        metrics = QGridLayout()
+        self.epoch_value = self._metric_label("0 / 500")
+        self.loss_value = self._metric_label("2.500e+00")
+        self.pde_value = self._metric_label("9.000e-01")
+        self.bc_value = self._metric_label("4.500e-01")
+        metrics.addWidget(self._metric_card("Epoch", self.epoch_value), 0, 0)
+        metrics.addWidget(self._metric_card("Total loss", self.loss_value), 0, 1)
+        metrics.addWidget(self._metric_card("PDE", self.pde_value), 1, 0)
+        metrics.addWidget(self._metric_card("BC", self.bc_value), 1, 1)
+        layout.addLayout(metrics)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 500)
+        layout.addWidget(self.progress)
+        self.loss_plot = MetricPlot("Total loss", PALETTE.accent)
+        self.pde_plot = MetricPlot("PDE", PALETTE.success)
+        self.bc_plot = MetricPlot("Boundary", PALETTE.warning)
+        layout.addWidget(self.loss_plot)
+        layout.addWidget(self.pde_plot)
+        layout.addWidget(self.bc_plot)
+
+        controls = QHBoxLayout()
+        self.start_button = QPushButton("Start")
+        self.start_button.setObjectName("PrimaryButton")
+        self.pause_button = QPushButton("Pause")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("DangerButton")
+        style = QApplication.style()
+        self.start_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.pause_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        self.stop_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.pause_button)
+        controls.addWidget(self.stop_button)
+        layout.addLayout(controls)
+        layout.addStretch(1)
+        return panel
+
+    def _build_results_left_panel(self) -> QWidget:
+        return self._build_status_side_panel("Results", ["Saved geometry, checkpoints, plots, and logs will be listed here."])
+
+    def _build_results_right_panel(self) -> QWidget:
+        panel, layout = self._new_side_panel()
+        table = QTableWidget(5, 3)
+        table.setHorizontalHeaderLabels(["Artifact", "Status", "Path"])
+        rows = [
+            ("geometry", "ready", "Geometry/Data"),
+            ("metadata", "ready", "Geometry/Metadata"),
+            ("training_metrics.csv", "waiting", "Logs"),
+            ("final_fields.png", "waiting", "Results"),
+            ("checkpoint.pt", "waiting", "Checkpoints"),
+        ]
+        for row, values in enumerate(rows):
+            for col, value in enumerate(values):
+                table.setItem(row, col, QTableWidgetItem(value))
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+        return panel
 
     def _build_sidebar(self) -> QFrame:
         frame = QFrame()
@@ -590,17 +917,23 @@ class MainWindow(QMainWindow):
         spin.setValue(value)
         return spin
 
+    def _spin(self, minimum: int, maximum: int, value: int, step: int = 1) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setSingleStep(step)
+        spin.setValue(value)
+        return spin
+
     def _combo(self, values: list[str]) -> QComboBox:
         combo = QComboBox()
         combo.addItems(values)
         return combo
 
     def _connect_signals(self) -> None:
-        for drop_target in (self.geometry_page, self.geometry_canvas, self.stack):
+        for drop_target in (self.geometry_canvas, self.left_module_stack, self.right_module_stack):
             drop_target.setAcceptDrops(True)
             drop_target.installEventFilter(self)
 
-        self.step_list.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.geometry_canvas.cursorChanged.connect(self._update_cursor_label)
         self.geometry_canvas.selectionChanged.connect(self.statusBar().showMessage)
 
@@ -984,8 +1317,7 @@ class MainWindow(QMainWindow):
             self.pde_plot.set_values([])
             self.bc_plot.set_values([])
         self.training_timer.start()
-        self.stack.setCurrentWidget(self.training_page)
-        self.step_list.setCurrentRow(5)
+        self._set_active_module("training")
         self.log_panel.append_event("Mock training started")
 
     def _pause_training(self) -> None:
