@@ -1,4 +1,4 @@
-"""Main window for the standalone PySide6 UI prototype."""
+"""Main window for the PySide6 UI branch."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -74,19 +76,23 @@ class MainWindow(QMainWindow):
         self.training = MockTrainingState()
         self.geometry_session = GeometryFrontendSession()
         self.external_geometry_path: Path | None = None
+        self.manual_coordinates_text = ""
 
         self._create_actions()
         self._create_toolbar()
         self._build_layout()
         self._connect_signals()
         self._refresh_foil_files()
-        self._sync_geometry_ui(reset_view=True)
+        self._refresh_library_names()
+        self._apply_domain_params_to_controls()
+        self._apply_save_format_to_controls()
+        self._sync_geometry_ui(reset_view=True, update_name=True)
 
         self.training_timer = QTimer(self)
         self.training_timer.setInterval(220)
         self.training_timer.timeout.connect(self._training_tick)
 
-        self.log_panel.append_event("UI prototype started in standalone mode")
+        self.log_panel.append_event("UI branch started")
         self.statusBar().showMessage("Ready")
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
@@ -211,7 +217,7 @@ class MainWindow(QMainWindow):
         self.step_list.setCurrentRow(0)
         layout.addWidget(self.step_list, 1)
 
-        mode = QLabel("Standalone mock mode")
+        mode = QLabel("UI branch")
         mode.setObjectName("AppSubtitle")
         layout.addWidget(mode)
         return frame
@@ -222,7 +228,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 12)
         layout.setSpacing(12)
 
-        header = self._page_header("Geometry", "Standalone airfoil workflow")
+        header = self._build_geometry_header()
         layout.addWidget(header)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -232,6 +238,71 @@ class MainWindow(QMainWindow):
         splitter.setSizes([900, 340])
         layout.addWidget(splitter, 1)
         return page
+
+    def _build_geometry_header(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("Panel")
+        layout = QGridLayout(frame)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(5)
+
+        title_label = QLabel("Geometry")
+        title_label.setObjectName("SectionTitle")
+        source_title = QLabel("Airfoil Source")
+        source_title.setObjectName("Muted")
+
+        self.source_combo = QComboBox()
+        self.source_combo.addItems([
+            "Geometry/Foils file",
+            "External file",
+            "Manual input",
+            "geom_config.yaml",
+            "Foil library",
+            "Built-in closed NACA 0012",
+            "Built-in open plate",
+        ])
+        self.foil_file_combo = QComboBox()
+        self.library_combo = QComboBox()
+        self.browse_geometry_button = QPushButton("Browse")
+        self.manual_geometry_button = QPushButton("Manual Input")
+        self.load_geometry_button = QPushButton("Load")
+        self.load_geometry_button.setObjectName("PrimaryButton")
+        self.manual_geometry_button.setObjectName("PrimaryButton")
+        self.browse_geometry_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.manual_geometry_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.load_geometry_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+
+        self.source_path_label = QLabel("Source: not loaded")
+        self.source_path_label.setObjectName("Muted")
+        self.source_path_label.setWordWrap(True)
+
+        self.source_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.foil_file_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.library_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.source_combo.setMinimumWidth(170)
+        self.foil_file_combo.setMinimumWidth(180)
+        self.library_combo.setMinimumWidth(180)
+        self.browse_geometry_button.setMinimumWidth(96)
+        self.manual_geometry_button.setMinimumWidth(128)
+        self.load_geometry_button.setMinimumWidth(86)
+
+        layout.addWidget(title_label, 0, 0)
+        layout.addWidget(source_title, 0, 1)
+        layout.addWidget(self.source_combo, 0, 2)
+        layout.addWidget(self.foil_file_combo, 0, 3)
+        layout.addWidget(self.library_combo, 0, 3)
+        layout.addWidget(self.browse_geometry_button, 0, 4)
+        layout.addWidget(self.manual_geometry_button, 0, 4)
+        layout.addWidget(self.load_geometry_button, 0, 5)
+        layout.addWidget(self.source_path_label, 1, 2, 1, 4)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 0)
+        layout.setColumnStretch(2, 2)
+        layout.setColumnStretch(3, 3)
+        layout.setColumnStretch(4, 1)
+        layout.setColumnStretch(5, 1)
+        return frame
 
     def _build_geometry_controls(self) -> QWidget:
         panel = QScrollArea()
@@ -243,45 +314,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(12)
-
-        source_box = QGroupBox("Airfoil Source")
-        source_layout = QVBoxLayout(source_box)
-        source_form = QFormLayout()
-        self.source_combo = QComboBox()
-        self.source_combo.addItems(["Mock closed NACA 0012", "Mock open plate", "Geometry/Foils file", "External file", "Manual input"])
-        self.foil_file_combo = QComboBox()
-        source_form.addRow("Mode", self.source_combo)
-        source_form.addRow("File", self.foil_file_combo)
-        source_layout.addLayout(source_form)
-
-        source_buttons = QHBoxLayout()
-        self.browse_geometry_button = QPushButton("Browse")
-        self.load_geometry_button = QPushButton("Load")
-        self.load_geometry_button.setObjectName("PrimaryButton")
-        self.browse_geometry_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
-        self.load_geometry_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
-        source_buttons.addWidget(self.browse_geometry_button)
-        source_buttons.addWidget(self.load_geometry_button)
-        source_layout.addLayout(source_buttons)
-
-        self.source_path_label = QLabel("Source: mock")
-        self.source_path_label.setObjectName("Muted")
-        self.source_path_label.setWordWrap(True)
-        source_layout.addWidget(self.source_path_label)
-        layout.addWidget(source_box)
-
-        manual_box = QGroupBox("Manual Coordinates")
-        manual_layout = QVBoxLayout(manual_box)
-        self.manual_coords_edit = QTextEdit()
-        self.manual_coords_edit.setAcceptRichText(False)
-        self.manual_coords_edit.setPlaceholderText("0.000 0.000\n0.500 0.060\n1.000 0.000")
-        self.manual_coords_edit.setFixedHeight(92)
-        self.load_manual_button = QPushButton("Load Text")
-        self.load_manual_button.setObjectName("PrimaryButton")
-        self.load_manual_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
-        manual_layout.addWidget(self.manual_coords_edit)
-        manual_layout.addWidget(self.load_manual_button)
-        layout.addWidget(manual_box)
 
         domain_box = QGroupBox("Domain")
         form = QFormLayout(domain_box)
@@ -311,7 +343,7 @@ class MainWindow(QMainWindow):
         display_box = QGroupBox("Display")
         display_layout = QVBoxLayout(display_box)
         self.points_check = QCheckBox("Collocation points")
-        self.points_check.setChecked(True)
+        self.points_check.setChecked(False)
         self.flow_check = QCheckBox("Flow animation")
         self.flow_check.setChecked(False)
         self.grid_check = QCheckBox("Grid")
@@ -321,7 +353,7 @@ class MainWindow(QMainWindow):
         display_layout.addWidget(self.grid_check)
         layout.addWidget(display_box)
 
-        points_box = QGroupBox("Mock Sampler")
+        points_box = QGroupBox("Preview Points")
         points_form = QFormLayout(points_box)
         self.points_spin = QSpinBox()
         self.points_spin.setRange(100, 6000)
@@ -341,7 +373,7 @@ class MainWindow(QMainWindow):
         self.export_geometry_button = QPushButton("Save")
         self.export_geometry_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self.export_geometry_button.setObjectName("PrimaryButton")
-        self.output_dir_label = QLabel("Output: ui/mock_outputs/Geometry")
+        self.output_dir_label = QLabel(f"Output: {self._short_path(self.geometry_session.output_dir)}")
         self.output_dir_label.setObjectName("Muted")
         self.output_dir_label.setWordWrap(True)
         export_form.addRow("Name", self.geometry_name_edit)
@@ -564,7 +596,7 @@ class MainWindow(QMainWindow):
         return combo
 
     def _connect_signals(self) -> None:
-        for drop_target in (self.geometry_page, self.geometry_canvas, self.manual_coords_edit, self.stack):
+        for drop_target in (self.geometry_page, self.geometry_canvas, self.stack):
             drop_target.setAcceptDrops(True)
             drop_target.installEventFilter(self)
 
@@ -575,7 +607,7 @@ class MainWindow(QMainWindow):
         self.source_combo.currentIndexChanged.connect(self._update_source_controls)
         self.browse_geometry_button.clicked.connect(self._browse_geometry_file)
         self.load_geometry_button.clicked.connect(self._load_geometry_source)
-        self.load_manual_button.clicked.connect(self._load_manual_coordinates)
+        self.manual_geometry_button.clicked.connect(self._open_manual_coordinates_dialog)
         self.rebuild_button.clicked.connect(self._rebuild_geometry)
         self.sample_button.clicked.connect(self._sample_points)
         self.export_geometry_button.clicked.connect(self._export_geometry)
@@ -616,12 +648,37 @@ class MainWindow(QMainWindow):
             self.foil_file_combo.addItem(path.name, str(path))
         self._update_source_controls()
 
+    def _refresh_library_names(self) -> None:
+        self.library_combo.clear()
+        try:
+            names = self.geometry_session.available_library_names()
+        except GeometryReadError as exc:
+            self.library_combo.addItem(str(exc), "")
+            return
+        if not names:
+            self.library_combo.addItem("No foil_geoms.yaml entries", "")
+        for name in names:
+            self.library_combo.addItem(name, name)
+        self._update_source_controls()
+
     def _update_source_controls(self) -> None:
         mode = self.source_combo.currentText()
-        self.foil_file_combo.setEnabled(mode == "Geometry/Foils file")
-        self.browse_geometry_button.setEnabled(mode == "External file")
-        self.manual_coords_edit.setEnabled(mode == "Manual input")
-        self.load_manual_button.setEnabled(mode == "Manual input")
+        file_mode = mode == "Geometry/Foils file"
+        library_mode = mode == "Foil library"
+        external_mode = mode == "External file"
+        manual_mode = mode == "Manual input"
+
+        self.foil_file_combo.setVisible(file_mode)
+        self.library_combo.setVisible(library_mode)
+        self.browse_geometry_button.setVisible(external_mode)
+        self.manual_geometry_button.setVisible(manual_mode)
+        self.load_geometry_button.setVisible(not manual_mode)
+
+        self.foil_file_combo.setEnabled(file_mode)
+        self.library_combo.setEnabled(library_mode)
+        self.browse_geometry_button.setEnabled(external_mode)
+        self.manual_geometry_button.setEnabled(manual_mode)
+        self.load_geometry_button.setEnabled(not manual_mode)
         if mode != "External file":
             self.external_geometry_path = None
 
@@ -639,9 +696,9 @@ class MainWindow(QMainWindow):
             return True
 
         if mime_data.hasText() and self._looks_like_coordinate_text(mime_data.text()):
-            self.manual_coords_edit.setPlainText(mime_data.text())
+            self.manual_coordinates_text = mime_data.text()
             self.source_combo.setCurrentText("Manual input")
-            self._load_manual_coordinates()
+            self._load_manual_coordinates(self.manual_coordinates_text)
             return True
 
         return False
@@ -677,9 +734,9 @@ class MainWindow(QMainWindow):
     def _load_geometry_source(self) -> None:
         mode = self.source_combo.currentText()
         try:
-            if mode == "Mock closed NACA 0012":
+            if mode == "Built-in closed NACA 0012":
                 self.geometry_session.load_sample("closed_naca")
-            elif mode == "Mock open plate":
+            elif mode == "Built-in open plate":
                 self.geometry_session.load_sample("open_plate")
             elif mode == "Geometry/Foils file":
                 path = self.foil_file_combo.currentData()
@@ -687,8 +744,17 @@ class MainWindow(QMainWindow):
                     raise GeometryReadError("Geometry/Foils does not contain supported files")
                 self.geometry_session.load_file(path)
             elif mode == "Manual input":
-                self._load_manual_coordinates()
+                self._open_manual_coordinates_dialog()
                 return
+            elif mode == "geom_config.yaml":
+                self.geometry_session.load_from_config()
+                self._apply_domain_params_to_controls()
+                self._apply_save_format_to_controls()
+            elif mode == "Foil library":
+                geom_name = self.library_combo.currentData()
+                if not geom_name:
+                    raise GeometryReadError("Geometry/foil_geoms.yaml does not contain profiles")
+                self.geometry_session.load_from_library(geom_name)
             else:
                 if self.external_geometry_path is None:
                     self._browse_geometry_file()
@@ -703,10 +769,35 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Geometry load failed", str(exc))
             self.log_panel.append_event(f"Geometry load failed: {exc}")
 
-    def _load_manual_coordinates(self) -> None:
+    def _open_manual_coordinates_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual Coordinates")
+        dialog.resize(520, 380)
+
+        layout = QVBoxLayout(dialog)
+        hint = QLabel("Enter one point per line: x y, x,y, or x; y")
+        hint.setObjectName("Muted")
+        edit = QTextEdit()
+        edit.setAcceptRichText(False)
+        edit.setPlaceholderText("0.000 0.000\n0.500 0.060\n1.000 0.000")
+        edit.setPlainText(self.manual_coordinates_text)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Load")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        layout.addWidget(hint)
+        layout.addWidget(edit, 1)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.manual_coordinates_text = edit.toPlainText()
+            self._load_manual_coordinates(self.manual_coordinates_text)
+
+    def _load_manual_coordinates(self, text: str) -> None:
         try:
             self.geometry_session.load_text_block(
-                text=self.manual_coords_edit.toPlainText(),
+                text=text,
                 name=self.geometry_name_edit.text() or "manual_profile",
             )
             self._create_domain_from_controls()
@@ -751,6 +842,19 @@ class MainWindow(QMainWindow):
             bottom=self.bottom_spin.value(),
         )
 
+    def _apply_domain_params_to_controls(self) -> None:
+        params = self.geometry_session.last_domain_params
+        self.front_spin.setValue(params.get("front", self.front_spin.value()))
+        self.rear_spin.setValue(params.get("rear", self.rear_spin.value()))
+        self.top_spin.setValue(params.get("top", self.top_spin.value()))
+        self.bottom_spin.setValue(params.get("bottom", self.bottom_spin.value()))
+
+    def _apply_save_format_to_controls(self) -> None:
+        fmt = self.geometry_session.default_save_format
+        index = self.save_format_combo.findText(fmt)
+        if index >= 0:
+            self.save_format_combo.setCurrentIndex(index)
+
     def _sync_geometry_ui(self, reset_view: bool = False, update_name: bool = False) -> None:
         foil_points = [QPointF(point.x, point.y) for point in self.geometry_session.foil_points]
         domain_points = [QPointF(point.x, point.y) for point in self.geometry_session.domain_points]
@@ -772,6 +876,7 @@ class MainWindow(QMainWindow):
         self.rear_spin.setEnabled(self.geometry_session.is_closed)
         self.bottom_spin.setEnabled(self.geometry_session.is_closed)
         self.source_path_label.setText(f"Source: {self._short_path(self.geometry_session.source)}")
+        self.output_dir_label.setText(f"Output: {self._short_path(self.geometry_session.output_dir)}")
         self._update_stats_table()
         self._update_vertices_table()
 
@@ -824,7 +929,7 @@ class MainWindow(QMainWindow):
             self.log_panel.append_event(f"Saved foil: {self._short_path(artifacts.foil_path)}")
             self.log_panel.append_event(f"Saved domain: {self._short_path(artifacts.domain_path)}")
             self.log_panel.append_event(f"Saved metadata: {self._short_path(artifacts.metadata_path)}")
-            self.statusBar().showMessage("Standalone geometry artifacts saved")
+            self.statusBar().showMessage("Geometry artifacts saved")
         except GeometryReadError as exc:
             QMessageBox.warning(self, "Geometry save failed", str(exc))
             self.log_panel.append_event(f"Geometry save failed: {exc}")
@@ -845,7 +950,7 @@ class MainWindow(QMainWindow):
         try:
             self._create_domain_from_controls()
             self._sync_geometry_ui(reset_view=False)
-            self.log_panel.append_event("Domain rebuilt in standalone UI model")
+            self.log_panel.append_event("Domain rebuilt in UI geometry model")
         except GeometryReadError as exc:
             QMessageBox.warning(self, "Domain build failed", str(exc))
             self.log_panel.append_event(f"Domain build failed: {exc}")
@@ -867,7 +972,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Airfoil PINN UI",
-            "Standalone PySide6 prototype. Backend integration is intentionally disabled.",
+            "PySide6 UI branch. Geometry is implemented in UI code without modifying backend files.",
         )
 
     def _start_training(self) -> None:

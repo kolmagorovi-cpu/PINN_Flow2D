@@ -1,2 +1,1 @@
-"""Standalone PySide6 UI prototype for Airfoil PINN."""
-
+"""PySide6 UI branch for Airfoil PINN."""

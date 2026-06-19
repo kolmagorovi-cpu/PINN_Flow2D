@@ -1,2 +1,1 @@
-"""Reusable widgets for the standalone UI prototype."""
-
+"""Reusable widgets for the UI branch."""

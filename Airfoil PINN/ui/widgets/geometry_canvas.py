@@ -34,7 +34,7 @@ class GeometryCanvas(QWidget):
         self.collocation_points = generate_collocation_points(self.domain, foil_points=self.foil_points)
         self._view_rect_cache = self._compute_view_rect()
 
-        self.show_points = True
+        self.show_points = False
         self.show_streamlines = False
         self.show_grid = True
 

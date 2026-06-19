@@ -1,8 +1,8 @@
-"""Standalone geometry workflow used by the UI prototype.
+"""Geometry workflow used by the UI.
 
 This module intentionally does not import the project backend. It mirrors the
-Geometry.py workflow closely enough for UI testing: load airfoil coordinates,
-compute stats, build a domain preview and save mock artifacts.
+Geometry.py workflow for UI use: load airfoil coordinates, compute stats, build
+a domain preview and save artifacts into the same Geometry folders.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 
 @dataclass(frozen=True)
@@ -48,25 +48,34 @@ class GeometryArtifacts:
 
 
 class GeometryReadError(RuntimeError):
-    """Raised when standalone UI geometry loading fails."""
+    """Raised when UI geometry loading fails."""
 
 
 class GeometryFrontendSession:
-    """Small independent geometry model for the frontend-only loop."""
+    """Independent geometry model for the UI loop."""
 
     def __init__(self, project_root: Path | None = None) -> None:
         self.project_root = project_root or Path(__file__).resolve().parents[1]
         self.foils_dir = self.project_root / "Geometry" / "Foils"
-        self.output_dir = self.project_root / "ui" / "mock_outputs" / "Geometry" / "Data"
-        self.metadata_dir = self.project_root / "ui" / "mock_outputs" / "Geometry" / "Metadata"
+        self.output_dir = self.project_root / "Geometry" / "Data"
+        self.metadata_dir = self.project_root / "Geometry" / "Metadata"
+        self.geom_config_path = self.project_root / "geom_config.yaml"
+        self.foil_library_path = self.project_root / "Geometry" / "foil_geoms.yaml"
 
-        self.name = "mock_naca0012"
-        self.source = "mock"
+        self.name = "airfoil"
+        self.source = "not loaded"
+        self.default_save_format = "npy"
+        self.last_domain_params: dict[str, float] = {"front": 1.5, "rear": 3.0, "top": 1.2, "bottom": 1.2}
         self.foil_points: list[Point] = []
         self.domain_points: list[Point] = []
         self.stats: GeometryStats | None = None
-        self.load_sample("closed_naca")
-        self.create_domain(front=1.5, rear=3.0, top=1.2, bottom=1.2)
+
+        files = self.available_foil_files()
+        if files:
+            self.load_file(files[0])
+        else:
+            self.load_sample("closed_naca")
+        self.create_domain(**self.last_domain_params)
 
     @property
     def is_loaded(self) -> bool:
@@ -81,6 +90,12 @@ class GeometryFrontendSession:
         if not self.foils_dir.exists():
             return []
         return sorted(path for path in self.foils_dir.iterdir() if path.suffix.lower() in allowed)
+
+    def available_library_names(self) -> list[str]:
+        if not self.foil_library_path.exists():
+            return []
+        data = self._load_yaml_file(self.foil_library_path)
+        return sorted(item.get("name", "") for item in data.get("foils", []) if item.get("name"))
 
     def load_sample(self, sample: str) -> None:
         if sample == "open_plate":
@@ -117,6 +132,65 @@ class GeometryFrontendSession:
         self.domain_points = []
         self.stats = self._compute_stats(points)
 
+    def load_from_config(self, config_path: str | Path | None = None) -> dict[str, Any]:
+        path = Path(config_path) if config_path else self.geom_config_path
+        if not path.exists():
+            raise GeometryReadError(f"Geometry config not found: {path}")
+
+        config = self._load_yaml_file(path)
+        geom_name = config.get("geom_name") or "airfoil"
+        common_params = config.get("common_params", {}) or {}
+        airfoil_params = config.get("airfoil_params", {}) or {}
+
+        self._apply_common_params(common_params)
+        source_type = airfoil_params.get("source_type", "inline")
+
+        if source_type == "file":
+            file_path = airfoil_params.get("file_path")
+            if not file_path:
+                raise GeometryReadError("geom_config.yaml: airfoil_params.file_path is empty")
+            self.load_file(self._resolve_path(file_path, base_dir=path.parent))
+            self.name = self._clean_name(geom_name)
+        elif source_type == "inline":
+            if "X" in airfoil_params and "Y" in airfoil_params:
+                self.load_inline_xy(airfoil_params.get("X", []), airfoil_params.get("Y", []), geom_name)
+            else:
+                self.load_from_library(geom_name)
+        else:
+            raise GeometryReadError(f"Unsupported airfoil source_type: {source_type}")
+
+        self.last_domain_params = self._domain_params_from_config(airfoil_params.get("domain_params", {}) or {})
+        return config
+
+    def load_from_library(self, geom_name: str, library_path: str | Path | None = None) -> None:
+        path = Path(library_path) if library_path else self.foil_library_path
+        if not path.exists():
+            raise GeometryReadError(f"Foil library not found: {path}")
+
+        data = self._load_yaml_file(path)
+        for item in data.get("foils", []):
+            if item.get("name") == geom_name:
+                self._load_from_library_item(item, path.parent)
+                return
+        raise GeometryReadError(f"Airfoil '{geom_name}' not found in {path}")
+
+    def load_inline_xy(self, x_values: Sequence[object], y_values: Sequence[object], name: str) -> None:
+        if len(x_values) != len(y_values):
+            raise GeometryReadError("Inline X and Y arrays must have the same length")
+        points: list[Point] = []
+        for x_value, y_value in zip(x_values, y_values):
+            try:
+                points.append(Point(float(x_value), float(y_value)))
+            except (TypeError, ValueError):
+                continue
+        if len(points) < 2:
+            raise GeometryReadError("Inline geometry must contain at least two coordinate points")
+        self.name = self._clean_name(name)
+        self.source = "inline"
+        self.foil_points = points
+        self.domain_points = []
+        self.stats = self._compute_stats(points)
+
     def load_text_block(self, text: str, name: str = "manual_profile") -> None:
         points = self._parse_coordinate_text(text)
         if len(points) < 2:
@@ -132,9 +206,16 @@ class GeometryFrontendSession:
         if not self.stats:
             raise GeometryReadError("Load an airfoil before creating a domain")
 
+        self.last_domain_params = {
+            "front": float(front),
+            "top": float(top),
+            "rear": float(rear if rear is not None else self.last_domain_params.get("rear", 3.0)),
+            "bottom": float(bottom if bottom is not None else self.last_domain_params.get("bottom", 1.0)),
+        }
+
         if self.stats.is_closed:
-            rear = 3.0 if rear is None else rear
-            bottom = 1.0 if bottom is None else bottom
+            rear = self.last_domain_params["rear"]
+            bottom = self.last_domain_params["bottom"]
             self.domain_points = [
                 Point(-front, -bottom),
                 Point(-front, top),
@@ -206,22 +287,19 @@ class GeometryFrontendSession:
 
         foil_path = self.metadata_dir / f"{clean_name}_foil.{fmt}"
         domain_path = self.output_dir / f"{clean_name}_domain.{fmt}"
-        metadata_path = self.metadata_dir / f"{clean_name}_metadata.json"
+        metadata_path = self.metadata_dir / f"{clean_name}_metadata.npy"
 
         self._save_points(foil_path, self.foil_points, fmt)
         self._save_points(domain_path, self.domain_points, fmt)
 
         metadata = {
-            "mode": "frontend_standalone",
             "geom_type": "airfoil",
-            "name": clean_name,
-            "source": self.source,
             "chord": self.stats.chord,
             "is_closed": self.stats.is_closed,
             "num_foil_points": len(self.foil_points),
             "num_domain_points": len(self.domain_points),
         }
-        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        metadata_path = self._save_metadata(metadata_path, metadata)
         return GeometryArtifacts(foil_path=foil_path, domain_path=domain_path, metadata_path=metadata_path)
 
     def canvas_bounds(self) -> tuple[float, float, float, float]:
@@ -256,6 +334,21 @@ class GeometryFrontendSession:
             stripped = stripped.replace(",", " ").replace(";", " ")
             rows.append(stripped.split())
         return self._points_from_rows(rows)
+
+    def _load_from_library_item(self, item: dict[str, Any], base_dir: Path) -> None:
+        source_type = item.get("source_type", "inline")
+        name = item.get("name") or "airfoil"
+        if source_type == "file":
+            file_path = item.get("file_path")
+            if not file_path:
+                raise GeometryReadError(f"Library item '{name}' has no file_path")
+            self.load_file(self._resolve_path(file_path, base_dir=base_dir))
+            self.name = self._clean_name(name)
+            return
+        if source_type == "inline":
+            self.load_inline_xy(item.get("X", []), item.get("Y", []), name)
+            return
+        raise GeometryReadError(f"Unsupported library source_type: {source_type}")
 
     def _points_from_rows(self, rows: Iterable[Sequence[object]]) -> list[Point]:
         points: list[Point] = []
@@ -299,6 +392,16 @@ class GeometryFrontendSession:
             lines = [f"{point.x:.8f}\t{point.y:.8f}" for point in points]
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def _save_metadata(self, path: Path, metadata: dict[str, Any]) -> Path:
+        try:
+            np = self._numpy()
+            np.save(path, metadata)
+            return path
+        except GeometryReadError:
+            fallback = path.with_suffix(".json")
+            fallback.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            return fallback
+
     def _make_naca0012(self, count: int = 96) -> list[Point]:
         half = max(12, count // 2)
         thickness = 0.12
@@ -330,6 +433,50 @@ class GeometryFrontendSession:
             elif char in {" ", "."}:
                 allowed.append("_")
         return "".join(allowed).strip("_") or "airfoil"
+
+    def _apply_common_params(self, common_params: dict[str, Any]) -> None:
+        output_dir = common_params.get("output_dir")
+        if output_dir:
+            self.output_dir = self._resolve_path(output_dir, base_dir=self.project_root)
+        save_format = common_params.get("save_format")
+        if save_format:
+            self.default_save_format = str(save_format).lower().lstrip(".")
+
+    def _domain_params_from_config(self, params: dict[str, Any]) -> dict[str, float]:
+        result = dict(self.last_domain_params)
+        for key in ("front", "rear", "top", "bottom"):
+            if key in params and params[key] is not None:
+                try:
+                    result[key] = float(params[key])
+                except (TypeError, ValueError):
+                    pass
+        return result
+
+    def _resolve_path(self, value: str | Path, base_dir: Path) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        candidates = [
+            self.project_root / path,
+            base_dir / path,
+            self.foils_dir / path,
+            self.foils_dir / path.name,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
+    def _load_yaml_file(self, path: Path) -> dict[str, Any]:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise GeometryReadError("PyYAML is required to read geometry YAML files") from exc
+        with path.open("r", encoding="utf-8-sig") as handle:
+            data = yaml.safe_load(handle) or {}
+        if not isinstance(data, dict):
+            raise GeometryReadError(f"YAML file must contain a mapping: {path}")
+        return data
 
     def _numpy(self):
         try:

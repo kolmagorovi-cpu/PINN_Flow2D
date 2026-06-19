@@ -1,4 +1,4 @@
-"""Entry point for the standalone Airfoil PINN PySide6 UI."""
+"""Entry point for the Airfoil PINN PySide6 UI."""
 
 from __future__ import annotations
 

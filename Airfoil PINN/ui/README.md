@@ -1,24 +1,34 @@
-# Airfoil PINN UI Prototype
+# Airfoil PINN UI
 
-Автономный прототип интерфейса на PySide6. Он не импортирует основной код проекта и использует мок-данные, чтобы интерфейс можно было тестировать отдельно от backend.
+PySide6 interface developed on the `UI` branch.
 
-Запуск из корня проекта:
+Run from the project root:
 
 ```powershell
 python -m ui.app
 ```
 
-Если PySide6 не установлен:
+Install UI dependencies:
 
 ```powershell
 python -m pip install -r ui/requirements.txt
 ```
 
-Экран `Geometry` работает в замкнутом frontend-контуре:
+The `Geometry` screen is implemented in UI code without modifying backend files.
+It can:
 
-- читает `.txt`, `.dat`, `.csv`, `.npy` координаты без импорта `Geometry.py`;
-- принимает drag-and-drop файла геометрии прямо в окно;
-- принимает ручной ввод координат в формате `x y`, `x,y` или `x; y`;
-- показывает профиль, расчётную область, статистику и вершины домена;
-- строит домен для замкнутого и незамкнутого профиля по тем же параметрам (`front`, `rear`, `top`, `bottom`);
-- сохраняет тестовые артефакты в `ui/mock_outputs/Geometry`, не в backend-папки `Geometry/Data` и `Geometry/Metadata`.
+- load `.txt`, `.dat`, `.csv`, `.npy` airfoil coordinate files;
+- accept drag-and-drop geometry files;
+- accept manual coordinates in `x y`, `x,y`, or `x; y` form;
+- load from `geom_config.yaml`;
+- load from `Geometry/foil_geoms.yaml` when that library exists;
+- detect closed and open profiles;
+- build a domain using `front`, `rear`, `top`, and `bottom`;
+- preview the profile and domain interactively;
+- save geometry artifacts to `Geometry/Data` and `Geometry/Metadata`.
+
+Generated files follow the backend naming pattern:
+
+- `Geometry/Metadata/<name>_foil.<format>`
+- `Geometry/Data/<name>_domain.<format>`
+- `Geometry/Metadata/<name>_metadata.npy`

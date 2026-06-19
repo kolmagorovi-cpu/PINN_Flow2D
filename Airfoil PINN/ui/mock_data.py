@@ -1,4 +1,4 @@
-"""Mock data generators used by the standalone UI prototype."""
+"""Preview data generators used by the UI branch."""
 
 from __future__ import annotations
 
