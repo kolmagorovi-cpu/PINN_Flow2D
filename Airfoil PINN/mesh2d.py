@@ -1338,32 +1338,68 @@ class Mesh2D:
             boundary_step = float(np.median(_bdist[:, 1]))
         else:
             boundary_step = 1.0
+        airfoil_ref = (
+            np.asarray(self._airfoil_coords, dtype=np.float64)
+            if self._airfoil_coords is not None and len(self._airfoil_coords) >= 2
+            else None
+        )
+        raw_airfoil = np.array(
+            [[float(p.x), float(p.y)] for p in self._raw_points if p.on_airfoil],
+            dtype=np.float64,
+        )
+        if len(raw_airfoil) >= 2:
+            raw_airfoil = np.unique(np.round(raw_airfoil, decimals=12), axis=0)
+        if len(raw_airfoil) >= 2:
+            _atree = cKDTree(raw_airfoil)
+            _adist, _ = _atree.query(raw_airfoil, k=2)
+            airfoil_step = float(np.median(_adist[:, 1]))
+        elif airfoil_ref is not None and len(airfoil_ref) >= 2:
+            _seg = np.linalg.norm(np.diff(airfoil_ref, axis=0), axis=1)
+            _seg = _seg[_seg > EPS]
+            airfoil_step = float(np.median(_seg)) if len(_seg) else boundary_step
+        else:
+            airfoil_step = boundary_step
+
         near_boundary_tol = max(EPS * 10.0, boundary_step * 0.02)
+        near_airfoil_tol = max(EPS * 10.0, airfoil_step * 0.15)
+
+        def _point_to_chain_distance(xy: np.ndarray, ref: np.ndarray) -> float:
+            best = float("inf")
+            for i_ref in range(len(ref) - 1):
+                a_ref = ref[i_ref]
+                b_ref = ref[i_ref + 1]
+                seg_ref = b_ref - a_ref
+                denom_ref = float(np.dot(seg_ref, seg_ref))
+                if denom_ref <= 1e-30:
+                    dist_ref = float(np.linalg.norm(xy - a_ref))
+                else:
+                    t_ref = float(np.dot(xy - a_ref, seg_ref) / denom_ref)
+                    t_ref = max(0.0, min(1.0, t_ref))
+                    dist_ref = float(np.linalg.norm(xy - (a_ref + t_ref * seg_ref)))
+                if dist_ref < best:
+                    best = dist_ref
+            return best
 
         def _point_to_ref_distance(xy: np.ndarray) -> float:
             best = float("inf")
             for ref in boundary_refs:
-                for i_ref in range(len(ref) - 1):
-                    a_ref = ref[i_ref]
-                    b_ref = ref[i_ref + 1]
-                    seg_ref = b_ref - a_ref
-                    denom_ref = float(np.dot(seg_ref, seg_ref))
-                    if denom_ref <= 1e-30:
-                        dist_ref = float(np.linalg.norm(xy - a_ref))
-                    else:
-                        t_ref = float(np.dot(xy - a_ref, seg_ref) / denom_ref)
-                        t_ref = max(0.0, min(1.0, t_ref))
-                        dist_ref = float(np.linalg.norm(xy - (a_ref + t_ref * seg_ref)))
-                    if dist_ref < best:
-                        best = dist_ref
+                best = min(best, _point_to_chain_distance(xy, ref))
             return best
 
         n_merged = 0
         n_skipped_near_boundary = 0
+        n_skipped_near_airfoil = 0
         for p in self._raw_points:
             bt = p.boundary_type.value if hasattr(p.boundary_type, "value") else str(p.boundary_type)
             nt = "boundary" if p.on_boundary else "interior"
             xy = np.array([float(p.x), float(p.y)], dtype=np.float64)
+            if (
+                nt == "interior"
+                and airfoil_ref is not None
+                and _point_to_chain_distance(xy, airfoil_ref) <= near_airfoil_tol
+            ):
+                n_skipped_near_airfoil += 1
+                continue
             if (
                 nt == "interior"
                 and boundary_refs
@@ -1388,6 +1424,11 @@ class Mesh2D:
             logger.info(
                 "Mesh2D: skipped %d interior points closer than %.3e m to a boundary",
                 n_skipped_near_boundary, near_boundary_tol,
+            )
+        if n_skipped_near_airfoil:
+            logger.info(
+                "Mesh2D: skipped %d interior points closer than %.3e m to the airfoil",
+                n_skipped_near_airfoil, near_airfoil_tol,
             )
 
         self._domain_idx = []
