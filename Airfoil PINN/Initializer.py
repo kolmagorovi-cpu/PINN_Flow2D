@@ -49,6 +49,12 @@ from type_hints import InitializerMetadataDict
 # Импортируем наши модули и классы
 from Fluids import FluidLibrary, Fluid
 from Conditions import ConditionsManager, BoundaryConditions, select_fluid as choose_fluid
+from sdf_diagnostics import (
+    compute_nearest_wall_distances,
+    compute_sdf_summary,
+    estimate_boundary_layer_delta,
+    format_sdf_summary,
+)
 
 # Определяем корневую директорию проекта
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -182,6 +188,8 @@ class Initializer:
         self.Re: Optional[float] = None
         self.rho: Optional[float] = None
         self.mu: Optional[float] = None
+        self.delta_bl_est: Optional[float] = None
+        self.delta_bl_est_norm: Optional[float] = None
 
         self.pressure_mode: Optional[str] = None
         self.velocity_initial_mode: Optional[str] = None
@@ -336,9 +344,27 @@ class Initializer:
 
     def _load_chord_from_metadata(self) -> float:
         """Определяет хорду из метаданных геометрии или оценивает по разбросу x."""
-        meta_files = glob.glob(os.path.join(GEOMETRY_DIR, "*_metadata.npy"))
-        if meta_files:
-            meta_path = max(meta_files, key=os.path.getmtime)
+        metadata_dir = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
+        search_dirs = [metadata_dir, self.geometry_dir]
+        geom_name = self._current_geom_name()
+        meta_files: List[str] = []
+
+        if geom_name:
+            for directory in search_dirs:
+                path = os.path.join(directory, f"{geom_name}_metadata.npy")
+                if os.path.exists(path):
+                    meta_files.append(path)
+
+        if not meta_files:
+            seen = set()
+            for directory in search_dirs:
+                for path in glob.glob(os.path.join(directory, "*_metadata.npy")):
+                    if path not in seen:
+                        meta_files.append(path)
+                        seen.add(path)
+            meta_files.sort(key=os.path.getmtime, reverse=True)
+
+        for meta_path in meta_files:
             try:
                 meta = np.load(meta_path, allow_pickle=True).item()
                 chord = meta.get('chord', None)
@@ -349,6 +375,17 @@ class Initializer:
                     logger.warning(f"Метаданные {os.path.basename(meta_path)} не содержат 'chord', оцениваю по разбросу x.")
             except Exception as e:
                 logger.warning(f"Ошибка загрузки метаданных из {os.path.basename(meta_path)}: {e}")
+
+        foil = self.foil_coords if self.foil_coords is not None else self._load_geometry_coords("foil")
+        if foil is not None and len(foil) >= 2:
+            chord = float(np.max(foil[:, 0]) - np.min(foil[:, 0]))
+            if chord > 0.0:
+                logger.warning(
+                    "Хорда оценена по координатам профиля, metadata не использованы: "
+                    f"{chord:.4f} м"
+                )
+                return chord
+
         x_range = self.points['x'].max() - self.points['x'].min()
         logger.warning(
             f"Файлы метаданных не найдены или не содержат хорду. "
@@ -428,6 +465,68 @@ class Initializer:
         logger.info(f"Re = {self.Re:.2e}")
         logger.info(f"p_ref = {self.p_ref:.1f} Па (давление на выходе)")
 
+    def print_sdf_diagnostics_after_conditions(self) -> None:
+        """
+        Выводит оценку delta и SDF-статистику сразу после выбора условий.
+
+        На этом этапе поля ещё не нормализованы, но уже известны жидкость,
+        скорость на входе и Re. Статистика считается для interior-точек,
+        чтобы WALL-точки с SDF=0 не маскировали разрешение пристенной области.
+        """
+        if self.points is None:
+            raise RuntimeError("Сначала загрузите точки.")
+        if self.wall_points is None:
+            self.extract_wall_points()
+
+        self._compute_normalization_params()
+        self.delta_bl_est, self.delta_bl_est_norm = estimate_boundary_layer_delta(
+            self.chord,
+            self.Re,
+        )
+
+        print("\n" + "=" * 60)
+        print("SDF-ДИАГНОСТИКА ПРИСТЕННОЙ СЕТКИ".center(60))
+        print("=" * 60)
+        if self.delta_bl_est is not None and self.delta_bl_est_norm is not None:
+            print(
+                "Оценка толщины слоя: "
+                f"delta_99/c ~= 5/sqrt(Re) = {self.delta_bl_est_norm:.6g}, "
+                f"delta_99 = {self.delta_bl_est:.6g} м"
+            )
+        else:
+            print("WARNING: Не удалось оценить delta_99: проверьте хорду и Re.")
+
+        if self.wall_points is None or len(self.wall_points) == 0:
+            print("WARNING: Нет WALL-точек: SDF-статистика не рассчитана.")
+            return
+
+        if 'boundary_type' in self.points.dtype.names:
+            interior_mask = self.points['boundary_type'] == 'interior'
+        elif 'on_boundary' in self.points.dtype.names:
+            interior_mask = ~self.points['on_boundary']
+        else:
+            interior_mask = np.ones(len(self.points), dtype=bool)
+
+        if not np.any(interior_mask):
+            print("WARNING: Нет interior-точек для SDF-статистики.")
+            return
+
+        query_xy = np.column_stack((
+            self.points['x'][interior_mask],
+            self.points['y'][interior_mask],
+        ))
+        sdf_m = compute_nearest_wall_distances(query_xy, self.wall_points)
+        summary = compute_sdf_summary(
+            sdf_m,
+            chord=self.chord,
+            delta=self.delta_bl_est,
+        )
+        for line in format_sdf_summary(
+            summary,
+            title="SDF-статистика initial-сетки (interior -> WALL)",
+        ):
+            print(line)
+
     def initialize_fields(self,
                           pressure_mode: str = 'constant',
                           velocity_initial_mode: str = 'constant',
@@ -472,6 +571,10 @@ class Initializer:
         self.pressure_perturbation_amplitude = pressure_perturbation_amplitude
 
         self._compute_normalization_params()
+        self.delta_bl_est, self.delta_bl_est_norm = estimate_boundary_layer_delta(
+            self.chord,
+            self.Re,
+        )
 
         N = len(self.points)
         arr_norm = np.zeros(N, dtype=point_dtype)
@@ -631,6 +734,8 @@ class Initializer:
             'rho': self.rho,
             'mu': self.mu,
             'Re': self.Re,
+            'delta_bl_99_est': self.delta_bl_est,
+            'delta_bl_99_est_norm': self.delta_bl_est_norm,
             'normalized': True,
             'sdf_norm_factor': self.chord,
             'inlet_u_norm': inlet_u_norm,
@@ -909,6 +1014,11 @@ def initialize_menu() -> None:
         print(f"❌ {e}")
         input("Нажмите Enter для возврата...")
         return
+
+    try:
+        init.print_sdf_diagnostics_after_conditions()
+    except Exception as e:
+        print(f"WARNING: Не удалось вывести SDF-диагностику: {e}")
 
     print("\nПараметры инициализации:")
     print("Режим давления:")

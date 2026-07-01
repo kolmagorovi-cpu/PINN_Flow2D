@@ -73,6 +73,11 @@ from constants import (
     DEFAULT_NUM_PROCESSES,
     QUEUE_TIMEOUT,
 )
+from sdf_diagnostics import (
+    compute_nearest_wall_distances,
+    compute_sdf_summary,
+    format_sdf_summary,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1371,6 +1376,35 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Основной метод генерации всех точек
     # ------------------------------------------------------------------
+    def _log_sdf_statistics(self, chord: Optional[float]) -> Optional[Dict[str, object]]:
+        """Печатает SDF-статистику interior-точек относительно WALL."""
+        if not self.points_interior:
+            logger.warning("SDF-статистика: нет interior-точек.")
+            return None
+
+        wall_xy = np.array(
+            [(p.x, p.y) for p in self.points if p.boundary_type == BoundaryType.WALL],
+            dtype=np.float64,
+        )
+        if len(wall_xy) == 0:
+            logger.warning("SDF-статистика: нет WALL-точек, расстояние до стенки не рассчитано.")
+            return None
+
+        interior_xy = np.array(
+            [(p.x, p.y) for p in self.points_interior],
+            dtype=np.float64,
+        )
+        sdf_m = compute_nearest_wall_distances(interior_xy, wall_xy)
+        summary = compute_sdf_summary(sdf_m, chord=chord)
+
+        logger.info("")
+        for line in format_sdf_summary(
+            summary,
+            title="SDF-статистика сетки (interior -> WALL)",
+        ):
+            logger.info(line)
+        return summary
+
     def generate_all_points(
         self,
         domain: np.ndarray,
@@ -1499,6 +1533,13 @@ class CollocationPoints:
         for p in self.points:
             type_counts[p.boundary_type] = type_counts.get(p.boundary_type, 0) + 1
 
+        chord_for_sdf = None
+        if foil is not None and len(foil) >= 2:
+            chord_for_sdf = float(np.max(foil[:, 0]) - np.min(foil[:, 0]))
+            if chord_for_sdf <= 0.0:
+                chord_for_sdf = None
+        sdf_summary = self._log_sdf_statistics(chord_for_sdf)
+
         self.metadata = {
             'num_points': len(self.points),
             'num_interior': len(self.points_interior),
@@ -1515,7 +1556,8 @@ class CollocationPoints:
             'bottom_boundary_type': self.config.bottom_boundary_type,
             'sampling_method': self.config.sampling_method,
             'adaptive_alpha': self.config.adaptive_alpha,
-            'adaptive_epsilon_factor': self.config.adaptive_epsilon_factor
+            'adaptive_epsilon_factor': self.config.adaptive_epsilon_factor,
+            'sdf_statistics': sdf_summary,
         }
 
         logger.info("\n" + "=" * 60)
