@@ -1886,7 +1886,14 @@ class Mesh2D:
                 )
             except Exception:
                 foil_seed = np.mean(np.asarray(self._airfoil_coords, dtype=np.float64), axis=0)
-            tris = _flood_fill_remove(tris, self._coords, [foil_seed], foil_ce)
+            tris_ff = _flood_fill_remove(tris, self._coords, [foil_seed], foil_ce)
+            if len(tris_ff) == 0 and len(tris) > 0:
+                logger.warning(
+                    "Hole removal (flood-fill, профиль): удалил все треугольники; "
+                    "оставляю исходную триангуляцию для Shapely-фильтрации"
+                )
+            else:
+                tris = tris_ff
             logger.info("Hole removal (flood-fill, профиль): удалено %d треугольников",
                         n_before - len(tris))
 

@@ -30,7 +30,7 @@ Example:
 """
 
 import numpy as np
-from shapely.geometry import Polygon, LineString
+from shapely.geometry import Point, Polygon, LineString
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from multiprocessing import Process, Queue, freeze_support
@@ -852,6 +852,32 @@ class CollocationPoints:
         logger.info(f"✅ Нижняя граница ({btype.value}): {len(points)} точек")
         return points
 
+    def filter_interior_against_closed_foil(
+        self,
+        points: List[CollocationPoint],
+        foil: Optional[np.ndarray],
+        foil_is_closed: bool,
+    ) -> List[CollocationPoint]:
+        """Удаляет interior-точки, попавшие внутрь замкнутого профиля."""
+        if not points or foil is None or len(foil) < 3 or not foil_is_closed:
+            return points
+
+        foil_poly = Polygon(foil)
+        if not foil_poly.is_valid:
+            foil_poly = foil_poly.buffer(0)
+        if foil_poly.is_empty or not foil_poly.is_valid or foil_poly.area <= 0.0:
+            logger.warning("⚠️ Контур профиля некорректен, фильтрация interior-точек внутри профиля пропущена")
+            return points
+
+        filtered = [
+            p for p in points
+            if not foil_poly.covers(Point(float(p.x), float(p.y)))
+        ]
+        removed = len(points) - len(filtered)
+        if removed:
+            logger.info("   Исключено %d внутренних точек внутри замкнутого профиля", removed)
+        return filtered
+
     # ------------------------------------------------------------------
     # Внутренние точки: регулярный метод (векторизованный)
     # ------------------------------------------------------------------
@@ -1392,6 +1418,7 @@ class CollocationPoints:
             and len(foil) >= 3
             and np.allclose(foil[0], foil[-1], atol=max(step_m * CLASSIFICATION_TOLERANCE_FACTOR, 1e-9))
         )
+        self.foil_is_closed = foil_is_closed
         if foil is not None and len(foil) >= 3 and foil_is_closed:
             poly_foil = Polygon(foil)
             if not poly_foil.is_valid:
@@ -1464,6 +1491,7 @@ class CollocationPoints:
         else:
             raise ValueError(f"Неизвестный метод: {self.config.sampling_method}")
 
+        interior = self.filter_interior_against_closed_foil(interior, foil, foil_is_closed)
         self.points_interior = interior
         self.points = self.points_boundary + self.points_interior
 
