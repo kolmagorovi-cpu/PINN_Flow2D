@@ -2084,8 +2084,19 @@ class Mesh2D:
 
             area_vec = 0.5 * S_raw
             edge_key = (min(vi, vj), max(vi, vj))
-            bt_i = "wall" if edge_key in foil_edges else node_bt[vi]
-            bt_j = "wall" if edge_key in foil_edges else node_bt[vj]
+            touches_wall = (
+                edge_key in foil_edges
+                or self._nodes[vi].on_airfoil
+                or self._nodes[vj].on_airfoil
+                or str(node_bt[vi]).lower() == "wall"
+                or str(node_bt[vj]).lower() == "wall"
+            )
+            if touches_wall:
+                bt_i = "wall"
+                bt_j = "wall"
+            else:
+                bt_i = node_bt[vi]
+                bt_j = node_bt[vj]
 
             bfaces.append(BoundaryFace(
                 node=vi, neighbor_node=vj,
