@@ -31,6 +31,12 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from utils import safe_grad
+from sdf_diagnostics import (
+    compute_sdf_summary,
+    estimate_boundary_layer_delta,
+    format_sdf_summary,
+)
+from solver_components.rar import RARManager
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +165,7 @@ class Trainer:
         self.compute_grad_cosine = self.diag_config.get('compute_grad_cosine', False)
         self.strict_autograd = bool(self.diag_config.get('strict_autograd', True))
         self._fvm_tensor_cache = None
+        self.rar_manager = RARManager(self)
 
     def _grad(
         self,
@@ -999,13 +1006,13 @@ class Trainer:
         if self.rar_mode == 'legacy':
             return self._apply_rar_legacy()
 
-        logger.info("Adaptive RAR: генерация новых точек по карте RAR-score...")
-        generated = self._generate_adaptive_rar_points(self.rar_num_points)
-        if generated is None:
+        logger.info("Adaptive RAR: генерация новых точек через RARManager...")
+        generated = self.rar_manager.generate(self.rar_num_points)
+        if generated is None or generated.n_points == 0:
             logger.info("Adaptive RAR: новые точки не добавлены.")
             return 0
 
-        x_new, y_new, sdf_new = generated
+        x_new, y_new, sdf_new = generated.x, generated.y, generated.sdf
         added = self.data_handler.add_interior_points(x_new, y_new, sdf_new)
         if added == 0:
             logger.info("Adaptive RAR: DataHandler не добавил новых точек.")
@@ -1018,10 +1025,13 @@ class Trainer:
         self.max_pde_residual = torch.cat([self.max_pde_residual, torch.zeros_like(new_residual)], dim=0)
         self._extend_sa_weights(added)
 
-        self.rar_history.append({'interior': added})
+        history_entry = {'interior': added}
+        history_entry.update(generated.stats)
+        self.rar_history.append(history_entry)
         self._rar_step_counter += 1
         self._rar_new_points_since_fvm += added
         self._maybe_rebuild_fvm_after_rar()
+        self._log_rar_sdf_delta_statistics()
 
         logger.info(
             "Adaptive RAR: добавлено %d новых точек. Теперь всего точек: %d",
@@ -1071,6 +1081,29 @@ class Trainer:
         self._extend_sa_weights(top_k)
         logger.info("Legacy RAR: добавлено %d копий. FVM-сетка не перестраивается.", top_k)
         return top_k
+
+    def _log_rar_sdf_delta_statistics(self) -> None:
+        """Печатает SDF/delta статистику interior-точек после RAR."""
+        try:
+            ds = self.data_handler.dataset
+            if ds.boundary_types is not None and 'interior' in ds.type_to_idx:
+                mask = (ds.boundary_types[:, ds.type_to_idx['interior']] > 0.5).cpu().numpy()
+            else:
+                mask = ~getattr(ds, 'on_boundary', torch.zeros(ds.n_points, dtype=torch.bool)).cpu().numpy()
+            if not np.any(mask):
+                return
+            chord = float(getattr(self.data_handler, 'chord', 1.0))
+            re = float(getattr(self.data_handler, 'Re', 0.0))
+            delta, _ = estimate_boundary_layer_delta(chord, re)
+            sdf_m = ds.sdf.cpu().numpy().reshape(-1)[mask].astype(np.float64) * chord
+            summary = compute_sdf_summary(sdf_m, chord=chord, delta=delta)
+            for line in format_sdf_summary(
+                summary,
+                title="SDF-статистика после RAR (interior -> WALL)",
+            ):
+                logger.info(line)
+        except Exception as exc:
+            logger.warning("Adaptive RAR: не удалось вывести SDF/delta статистику: %s", exc)
 
     def _extend_sa_weights(self, n_new: int) -> None:
         """Расширяет SA-веса после добавления новых точек."""

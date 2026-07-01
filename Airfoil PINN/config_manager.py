@@ -115,6 +115,31 @@ class ConfigManager:
                 'rar_jitter_scale': 0.85,
                 'rar_min_distance_factor': 0.35,
                 'rar_min_boundary_distance_factor': 0.05,
+                'flow_rar': {
+                    'enabled': True,
+                    'num_points': None,
+                    'exclude_sdf_delta': None,
+                },
+                'boundary_rar': {
+                    'enabled': False,
+                    'num_points': None,
+                    'fraction': 0.4,
+                    'delta_mode': 'estimated',
+                    'delta_max': 5.0,
+                    'eta_levels': [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0],
+                    'contour_samples': 400,
+                    'alpha': 1.5,
+                    'uniform_contour_weight': 0.5,
+                    'min_distance_factor': 0.2,
+                    'score_batch_size': 2048,
+                    'error_weights': {
+                        'cont': 1.0,
+                        'mom_x': 3.0,
+                        'mom_y': 3.0,
+                        'mom_r': 3.0,
+                        'mom_z': 3.0,
+                    },
+                },
                 'rar_rebuild_fvm': True,
                 'rar_fvm_rebuild_every': 1,
                 'rar_fvm_min_new_points': 1,
@@ -356,6 +381,16 @@ class ConfigManager:
                 print(f"    rar_rebuild_fvm       : {tr.get('rar_rebuild_fvm', True)}")
                 print(f"    rar_fvm_rebuild_every : {tr.get('rar_fvm_rebuild_every', 1)}")
                 print(f"    rar_save_mesh_volume_plot: {tr.get('rar_save_mesh_volume_plot', True)}")
+                flow_rar = tr.get('flow_rar', {}) or {}
+                boundary_rar = tr.get('boundary_rar', {}) or {}
+                print(f"    flow_rar.enabled      : {flow_rar.get('enabled', True)}")
+                print(f"    flow_rar.exclude_sdf_delta: {flow_rar.get('exclude_sdf_delta', None)}")
+                print(f"    boundary_rar.enabled  : {boundary_rar.get('enabled', False)}")
+                if boundary_rar.get('enabled', False):
+                    print(f"    boundary_rar.num_points: {boundary_rar.get('num_points', None)}")
+                    print(f"    boundary_rar.fraction : {boundary_rar.get('fraction', 0.4)}")
+                    print(f"    boundary_rar.delta_max: {boundary_rar.get('delta_max', 5.0)}")
+                    print(f"    boundary_rar.contour_samples: {boundary_rar.get('contour_samples', 400)}")
         print(f"  switch_to_lbfgs_epoch   : {tr['switch_to_lbfgs_epoch']}")
         if tr['switch_to_lbfgs_epoch'] > 0:
             print(f"    lbfgs_max_iter        : {tr['lbfgs_max_iter']}")

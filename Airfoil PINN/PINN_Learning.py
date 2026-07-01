@@ -731,6 +731,64 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
                     tr['rar_min_distance_factor'] = float(input(
                         f"Мин. расстояние до соседей в локальных шагах [{tr['rar_min_distance_factor']}]: "
                     ) or tr['rar_min_distance_factor'])
+                    flow_rar = tr.setdefault('flow_rar', {})
+                    flow_rar.setdefault('enabled', True)
+                    flow_rar.setdefault('num_points', None)
+                    flow_rar.setdefault('exclude_sdf_delta', None)
+                    boundary_rar = tr.setdefault('boundary_rar', {})
+                    boundary_rar.setdefault('enabled', False)
+                    boundary_rar.setdefault('num_points', None)
+                    boundary_rar.setdefault('fraction', 0.4)
+                    boundary_rar.setdefault('delta_mode', 'estimated')
+                    boundary_rar.setdefault('delta_max', 5.0)
+                    boundary_rar.setdefault(
+                        'eta_levels',
+                        [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0],
+                    )
+                    boundary_rar.setdefault('contour_samples', 400)
+                    boundary_rar.setdefault('alpha', 1.5)
+                    boundary_rar.setdefault('uniform_contour_weight', 0.5)
+                    boundary_rar.setdefault('min_distance_factor', 0.2)
+                    boundary_rar.setdefault('score_batch_size', 2048)
+                    boundary_rar.setdefault(
+                        'error_weights',
+                        {'cont': 1.0, 'mom_x': 3.0, 'mom_y': 3.0, 'mom_r': 3.0, 'mom_z': 3.0},
+                    )
+
+                    flow_rar['enabled'] = yes_no("Flow RAR для свободного потока", flow_rar.get('enabled', True))
+                    excl_current = flow_rar.get('exclude_sdf_delta', None)
+                    excl = input(
+                        f"Исключать из Flow RAR зону sdf/delta < value (Enter - авто/выкл, текущ: {excl_current}): "
+                    ).strip()
+                    if excl:
+                        flow_rar['exclude_sdf_delta'] = float(excl)
+
+                    boundary_rar['enabled'] = yes_no(
+                        "Boundary-Layer RAR для пограничного слоя",
+                        boundary_rar.get('enabled', False),
+                    )
+                    if boundary_rar['enabled']:
+                        n_boundary = input(
+                            f"Boundary RAR точек (Enter - fraction от rar_num_points, текущ: {boundary_rar.get('num_points')}): "
+                        ).strip()
+                        boundary_rar['num_points'] = int(n_boundary) if n_boundary else None
+                        if boundary_rar['num_points'] is None:
+                            boundary_rar['fraction'] = float(input(
+                                f"Boundary RAR fraction [{boundary_rar.get('fraction', 0.4)}]: "
+                            ) or boundary_rar.get('fraction', 0.4))
+                        boundary_rar['delta_max'] = float(input(
+                            f"Максимальная высота Boundary RAR sdf/delta [{boundary_rar.get('delta_max', 5.0)}]: "
+                        ) or boundary_rar.get('delta_max', 5.0))
+                        boundary_rar['contour_samples'] = int(input(
+                            f"Сэмплов по контуру профиля [{boundary_rar.get('contour_samples', 400)}]: "
+                        ) or boundary_rar.get('contour_samples', 400))
+                        boundary_rar['alpha'] = float(input(
+                            f"Степень вероятности по ошибке alpha [{boundary_rar.get('alpha', 1.5)}]: "
+                        ) or boundary_rar.get('alpha', 1.5))
+                        boundary_rar['uniform_contour_weight'] = float(input(
+                            "Доля равномерности по контуру "
+                            f"[{boundary_rar.get('uniform_contour_weight', 0.5)}]: "
+                        ) or boundary_rar.get('uniform_contour_weight', 0.5))
                     tr['rar_rebuild_fvm'] = yes_no("Перестраивать FVM после adaptive RAR", tr['rar_rebuild_fvm'])
                     if tr['rar_rebuild_fvm']:
                         tr['rar_fvm_rebuild_every'] = int(input(
@@ -788,6 +846,21 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
                           f"FVM rebuild: {tr.get('rar_rebuild_fvm', True)}")
                     print(f"  mesh CV plot: {tr.get('rar_save_mesh_volume_plot', True)}, "
                           f"dpi={tr.get('rar_mesh_plot_dpi', 150)}")
+                    flow_rar = tr.get('flow_rar', {}) or {}
+                    boundary_rar = tr.get('boundary_rar', {}) or {}
+                    print(
+                        "  Flow RAR: "
+                        f"enabled={flow_rar.get('enabled', True)}, "
+                        f"num_points={flow_rar.get('num_points', None)}, "
+                        f"exclude_sdf_delta={flow_rar.get('exclude_sdf_delta', None)}"
+                    )
+                    print(
+                        "  Boundary RAR: "
+                        f"enabled={boundary_rar.get('enabled', False)}, "
+                        f"num_points={boundary_rar.get('num_points', None)}, "
+                        f"fraction={boundary_rar.get('fraction', 0.4)}, "
+                        f"delta_max={boundary_rar.get('delta_max', 5.0)}"
+                    )
             print(f"Переключение на L-BFGS: эпоха {tr['switch_to_lbfgs_epoch']}")
             print(f"Батч: {tr['batch_size']}, накопление: {tr['gradient_accumulation_steps']}")
             print(f"Эпох: {tr['epochs']}")
