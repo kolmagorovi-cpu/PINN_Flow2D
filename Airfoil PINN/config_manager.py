@@ -130,7 +130,7 @@ class ConfigManager:
                     'contour_samples': 400,
                     'alpha': 1.5,
                     'uniform_contour_weight': 0.5,
-                    'min_distance_factor': 0.2,
+                    'min_distance_factor': 0.02,
                     'score_batch_size': 2048,
                     'error_weights': {
                         'cont': 1.0,
@@ -391,6 +391,7 @@ class ConfigManager:
                     print(f"    boundary_rar.fraction : {boundary_rar.get('fraction', 0.4)}")
                     print(f"    boundary_rar.delta_max: {boundary_rar.get('delta_max', 5.0)}")
                     print(f"    boundary_rar.contour_samples: {boundary_rar.get('contour_samples', 400)}")
+                    print(f"    boundary_rar.min_distance_factor: {boundary_rar.get('min_distance_factor', 0.02)}")
         print(f"  switch_to_lbfgs_epoch   : {tr['switch_to_lbfgs_epoch']}")
         if tr['switch_to_lbfgs_epoch'] > 0:
             print(f"    lbfgs_max_iter        : {tr['lbfgs_max_iter']}")

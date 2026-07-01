@@ -748,7 +748,7 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
                     boundary_rar.setdefault('contour_samples', 400)
                     boundary_rar.setdefault('alpha', 1.5)
                     boundary_rar.setdefault('uniform_contour_weight', 0.5)
-                    boundary_rar.setdefault('min_distance_factor', 0.2)
+                    boundary_rar.setdefault('min_distance_factor', 0.02)
                     boundary_rar.setdefault('score_batch_size', 2048)
                     boundary_rar.setdefault(
                         'error_weights',
@@ -789,6 +789,10 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
                             "Доля равномерности по контуру "
                             f"[{boundary_rar.get('uniform_contour_weight', 0.5)}]: "
                         ) or boundary_rar.get('uniform_contour_weight', 0.5))
+                        boundary_rar['min_distance_factor'] = float(input(
+                            "Мин. расстояние Boundary RAR в долях delta "
+                            f"[{boundary_rar.get('min_distance_factor', 0.02)}]: "
+                        ) or boundary_rar.get('min_distance_factor', 0.02))
                     tr['rar_rebuild_fvm'] = yes_no("Перестраивать FVM после adaptive RAR", tr['rar_rebuild_fvm'])
                     if tr['rar_rebuild_fvm']:
                         tr['rar_fvm_rebuild_every'] = int(input(
@@ -859,7 +863,8 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
                         f"enabled={boundary_rar.get('enabled', False)}, "
                         f"num_points={boundary_rar.get('num_points', None)}, "
                         f"fraction={boundary_rar.get('fraction', 0.4)}, "
-                        f"delta_max={boundary_rar.get('delta_max', 5.0)}"
+                        f"delta_max={boundary_rar.get('delta_max', 5.0)}, "
+                        f"min_distance_factor={boundary_rar.get('min_distance_factor', 0.02)}"
                     )
             print(f"Переключение на L-BFGS: эпоха {tr['switch_to_lbfgs_epoch']}")
             print(f"Батч: {tr['batch_size']}, накопление: {tr['gradient_accumulation_steps']}")

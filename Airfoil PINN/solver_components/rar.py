@@ -87,11 +87,16 @@ class RARManager:
             flow_n = max(0, total_points - boundary_n) if boundary_enabled else total_points
 
         parts: List[Tuple[str, RARGenerationResult]] = []
+        boundary_added = 0
         if boundary_enabled and boundary_n > 0:
             logger.info("Boundary-Layer RAR: запрос %d точек.", boundary_n)
             boundary_result = self.boundary.generate(boundary_n)
             if boundary_result is not None and boundary_result.n_points > 0:
                 parts.append(("boundary", boundary_result))
+                boundary_added = boundary_result.n_points
+
+        if flow_enabled and boundary_enabled and boundary_added < boundary_n and flow_num_points is None:
+            flow_n += boundary_n - boundary_added
 
         if flow_enabled and flow_n > 0:
             logger.info("Flow RAR: запрос %d точек.", flow_n)
@@ -452,8 +457,14 @@ class BoundaryLayerRAR:
         coords = _dataset_xy(ds)
         domain_norm = _domain_norm(dh, coords)
         foil_norm = _foil_norm(dh)
+        raw_count = int(len(candidates))
         valid = valid_interior_mask(candidates, domain_norm, foil_norm)
+        domain_count = int(np.count_nonzero(valid))
         if not np.any(valid):
+            logger.info(
+                "Boundary-Layer RAR filter: raw=%d, geometry=0",
+                raw_count,
+            )
             return candidates[:0], contour_idx[:0], eta_idx[:0], np.empty(0, dtype=np.float64)
 
         candidates = candidates[valid]
@@ -470,7 +481,13 @@ class BoundaryLayerRAR:
         eta_max = float(cfg.get("delta_max", cfg.get("eta_max", max(eta_levels))))
         eta_min = float(cfg.get("eta_min", 0.0))
         valid = (eta_actual >= eta_min) & (eta_actual <= eta_max)
+        eta_count = int(np.count_nonzero(valid))
         if not np.any(valid):
+            logger.info(
+                "Boundary-Layer RAR filter: raw=%d, geometry=%d, eta=0",
+                raw_count,
+                domain_count,
+            )
             return candidates[:0], contour_idx[:0], eta_idx[:0], np.empty(0, dtype=np.float64)
 
         candidates = candidates[valid]
@@ -478,18 +495,41 @@ class BoundaryLayerRAR:
         eta_idx = eta_idx[valid]
         sdf_vals = sdf_vals[valid]
 
-        existing_tree = cKDTree(coords)
-        min_dist = float(cfg.get("min_distance_factor", 0.2)) * float(delta_norm)
+        interior_coords = _interior_xy(ds, coords)
+        existing_tree = cKDTree(interior_coords) if len(interior_coords) else None
+        min_dist = float(cfg.get("min_distance_factor", 0.02)) * float(delta_norm)
         if min_dist > 0.0:
-            dist_existing, _ = existing_tree.query(candidates, k=1, workers=-1)
-            valid = dist_existing >= min_dist
-            if not np.any(valid):
-                return candidates[:0], contour_idx[:0], eta_idx[:0], np.empty(0, dtype=np.float64)
-            candidates = candidates[valid]
-            contour_idx = contour_idx[valid]
-            eta_idx = eta_idx[valid]
-            sdf_vals = sdf_vals[valid]
+            if existing_tree is not None:
+                dist_existing, _ = existing_tree.query(candidates, k=1, workers=-1)
+                valid = dist_existing >= min_dist
+                if not np.any(valid):
+                    logger.info(
+                        "Boundary-Layer RAR filter: raw=%d, geometry=%d, eta=%d, min_distance=0 "
+                        "(min_distance_factor=%.3g)",
+                        raw_count,
+                        domain_count,
+                        eta_count,
+                        min_dist / float(delta_norm) if delta_norm > 0.0 else 0.0,
+                    )
+                    return candidates[:0], contour_idx[:0], eta_idx[:0], np.empty(0, dtype=np.float64)
+                candidates = candidates[valid]
+                contour_idx = contour_idx[valid]
+                eta_idx = eta_idx[valid]
+                sdf_vals = sdf_vals[valid]
 
+        logger.info(
+            "Boundary-Layer RAR filter: raw=%d, geometry=%d, eta=%d, min_distance=%d "
+            "(min_distance_factor=%.3g)",
+            raw_count,
+            domain_count,
+            eta_count,
+            len(candidates),
+            min_dist / float(delta_norm) if delta_norm > 0.0 else 0.0,
+        )
+        logger.info(
+            "Boundary-Layer RAR eta candidates after filter: %s",
+            _format_eta_counts(eta_idx, eta_levels),
+        )
         return candidates, contour_idx, eta_idx, sdf_vals
 
     def _score_candidates(
@@ -595,23 +635,36 @@ class BoundaryLayerRAR:
             + (1.0 - uniform_contour_weight) * contour_error_prob
         )
 
-        height_prob = np.zeros_like(powered)
-        for ci in range(len(unique_contours)):
-            mask = inverse == ci
-            total = float(powered[mask].sum())
-            if total > 0.0 and np.isfinite(total):
-                height_prob[mask] = powered[mask] / total
-            else:
-                height_prob[mask] = 1.0 / max(int(mask.sum()), 1)
-
-        prob = contour_prob[inverse] * height_prob
-        if not np.isfinite(prob).all() or prob.sum() <= 0.0:
-            prob = np.full(len(scores), 1.0 / len(scores))
-        else:
-            prob = prob / prob.sum()
-
         size = min(int(n_points), len(scores))
-        return np.random.choice(np.arange(len(scores)), size=size, replace=False, p=prob)
+        available: Dict[int, List[int]] = {
+            ci: np.where(inverse == ci)[0].astype(np.int64).tolist()
+            for ci in range(len(unique_contours))
+        }
+        selected: List[int] = []
+
+        while len(selected) < size and available:
+            active_contours = np.array(sorted(available.keys()), dtype=np.int64)
+            p_contour = contour_prob[active_contours].astype(np.float64, copy=True)
+            if not np.isfinite(p_contour).all() or p_contour.sum() <= 0.0:
+                p_contour = np.full(len(active_contours), 1.0 / len(active_contours))
+            else:
+                p_contour /= p_contour.sum()
+
+            ci = int(np.random.choice(active_contours, p=p_contour))
+            local_idx = np.asarray(available[ci], dtype=np.int64)
+            p_height = powered[local_idx].astype(np.float64, copy=True)
+            if not np.isfinite(p_height).all() or p_height.sum() <= 0.0:
+                p_height = np.full(len(local_idx), 1.0 / len(local_idx))
+            else:
+                p_height /= p_height.sum()
+
+            chosen = int(np.random.choice(local_idx, p=p_height))
+            selected.append(chosen)
+            available[ci].remove(chosen)
+            if not available[ci]:
+                del available[ci]
+
+        return np.asarray(selected, dtype=np.int64)
 
 
 def _estimate_delta_norm(data_handler: Any) -> Optional[float]:
@@ -626,6 +679,14 @@ def _dataset_xy(dataset: Any) -> np.ndarray:
         dataset.x.cpu().numpy().reshape(-1),
         dataset.y.cpu().numpy().reshape(-1),
     ]).astype(np.float64)
+
+
+def _interior_xy(dataset: Any, coords: np.ndarray) -> np.ndarray:
+    if dataset.boundary_types is not None and "interior" in dataset.type_to_idx:
+        mask = (dataset.boundary_types[:, dataset.type_to_idx["interior"]] > 0.5).cpu().numpy()
+    else:
+        mask = ~getattr(dataset, "on_boundary", torch.zeros(dataset.n_points, dtype=torch.bool)).cpu().numpy()
+    return coords[mask]
 
 
 def _domain_norm(data_handler: Any, coords: np.ndarray) -> np.ndarray:
@@ -808,3 +869,15 @@ def _positive_array(values: Sequence[float]) -> np.ndarray:
     if len(arr) == 0:
         return np.asarray(DEFAULT_ETA_LEVELS, dtype=np.float64)
     return np.unique(np.sort(arr))
+
+
+def _format_eta_counts(eta_idx: np.ndarray, eta_levels: np.ndarray) -> str:
+    if len(eta_idx) == 0:
+        return "empty"
+    counts = np.bincount(eta_idx.astype(np.int64), minlength=len(eta_levels))
+    parts = [
+        f"{float(eta_levels[i]):.3g}:{int(count)}"
+        for i, count in enumerate(counts[: len(eta_levels)])
+        if count > 0
+    ]
+    return ", ".join(parts) if parts else "empty"

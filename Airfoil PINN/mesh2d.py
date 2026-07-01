@@ -1361,7 +1361,9 @@ class Mesh2D:
             airfoil_step = boundary_step
 
         near_boundary_tol = max(EPS * 10.0, boundary_step * 0.02)
-        near_airfoil_tol = max(EPS * 10.0, airfoil_step * 0.15)
+        # Boundary-layer RAR deliberately adds interior points close to the wall.
+        # Keep only a near-duplicate guard here; a wider exclusion erases the first eta layers.
+        near_airfoil_tol = max(EPS * 10.0, airfoil_step * 0.02)
 
         def _point_to_chain_distance(xy: np.ndarray, ref: np.ndarray) -> float:
             best = float("inf")
