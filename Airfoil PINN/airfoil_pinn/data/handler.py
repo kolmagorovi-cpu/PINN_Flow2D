@@ -730,7 +730,7 @@ class DataHandler:
                 "Пересоздайте mesh2d.npz новым mesh2d.py или проверьте geom_config.yaml."
             )
 
-        from mesh2d import Mesh2D
+        from airfoil_pinn.sampling.mesh import Mesh2D
 
         mesh = Mesh2D(
             self.mesh_points_from_dataset(),

@@ -1931,10 +1931,10 @@ def S2DR() -> None:
         if mesh_input in ('y', 'yes'):
             print("\n🔧 Построение FVM-сетки (CDT)...")
             try:
-                from mesh2d import Mesh2D
+                from airfoil_pinn.sampling.mesh import Mesh2D
             except ImportError:
-                print("\n❌ Модуль mesh2d.py не найден — убедитесь, что файл находится в директории проекта")
-                logger.error("ImportError: mesh2d не найден")
+                print("\n❌ Модуль airfoil_pinn.sampling.mesh не найден")
+                logger.error("ImportError: airfoil_pinn.sampling.mesh не найден")
             else:
                 try:
                     mesh = Mesh2D.from_sampler(sampler)
