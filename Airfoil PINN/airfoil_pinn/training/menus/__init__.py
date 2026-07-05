@@ -13,7 +13,13 @@ from airfoil_pinn.training.menus.common import (
     print_submenu_header,
 )
 
-__all__ = ["architecture_menu", "print_submenu_footer", "print_submenu_header"]
+__all__ = [
+    "architecture_menu",
+    "loss_function_menu",
+    "print_submenu_footer",
+    "print_submenu_header",
+    "weights_menu",
+]
 
 
 def __getattr__(name: str):
@@ -27,4 +33,14 @@ def __getattr__(name: str):
         from airfoil_pinn.training.menus.architecture import architecture_menu
 
         return architecture_menu
+    if name in {"loss_function_menu", "weights_menu"}:
+        from airfoil_pinn.training.menus.loss import (
+            loss_function_menu,
+            weights_menu,
+        )
+
+        return {
+            "loss_function_menu": loss_function_menu,
+            "weights_menu": weights_menu,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
