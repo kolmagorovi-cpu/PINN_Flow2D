@@ -15,7 +15,10 @@ from airfoil_pinn.training.menus.common import (
 
 __all__ = [
     "architecture_menu",
+    "checkpoint_menu",
+    "diagnostics_menu",
     "loss_function_menu",
+    "output_menu",
     "print_submenu_footer",
     "print_submenu_header",
     "training_strategy_menu",
@@ -48,4 +51,16 @@ def __getattr__(name: str):
         from airfoil_pinn.training.menus.strategy import training_strategy_menu
 
         return training_strategy_menu
+    if name in {"checkpoint_menu", "diagnostics_menu", "output_menu"}:
+        from airfoil_pinn.training.menus.results import (
+            checkpoint_menu,
+            diagnostics_menu,
+            output_menu,
+        )
+
+        return {
+            "checkpoint_menu": checkpoint_menu,
+            "diagnostics_menu": diagnostics_menu,
+            "output_menu": output_menu,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
