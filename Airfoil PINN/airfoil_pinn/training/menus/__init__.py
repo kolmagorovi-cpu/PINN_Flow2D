@@ -16,13 +16,18 @@ from airfoil_pinn.training.menus.common import (
 __all__ = [
     "architecture_menu",
     "checkpoint_menu",
+    "create_new_config",
     "diagnostics_menu",
+    "edit_config",
+    "load_config",
     "loss_function_menu",
+    "main_menu",
     "output_menu",
     "process_settings",
     "print_submenu_footer",
     "print_submenu_header",
     "training_strategy_menu",
+    "save_config",
     "weights_menu",
 ]
 
@@ -68,4 +73,26 @@ def __getattr__(name: str):
         from airfoil_pinn.training.menus.process import process_settings
 
         return process_settings
+    if name in {
+        "create_new_config",
+        "edit_config",
+        "load_config",
+        "main_menu",
+        "save_config",
+    }:
+        from airfoil_pinn.training.menus.configuration import (
+            create_new_config,
+            edit_config,
+            load_config,
+            main_menu,
+            save_config,
+        )
+
+        return {
+            "create_new_config": create_new_config,
+            "edit_config": edit_config,
+            "load_config": load_config,
+            "main_menu": main_menu,
+            "save_config": save_config,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
