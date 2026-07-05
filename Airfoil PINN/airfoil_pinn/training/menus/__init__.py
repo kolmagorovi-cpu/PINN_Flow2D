@@ -13,4 +13,18 @@ from airfoil_pinn.training.menus.common import (
     print_submenu_header,
 )
 
-__all__ = ["print_submenu_footer", "print_submenu_header"]
+__all__ = ["architecture_menu", "print_submenu_footer", "print_submenu_header"]
+
+
+def __getattr__(name: str):
+    """
+    Лениво экспортирует тяжёлые подменю.
+
+    ``architecture_menu`` тянет построение схемы сети и matplotlib. Ленивый
+    импорт позволяет общим helper-функциям меню оставаться лёгкими.
+    """
+    if name == "architecture_menu":
+        from airfoil_pinn.training.menus.architecture import architecture_menu
+
+        return architecture_menu
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
