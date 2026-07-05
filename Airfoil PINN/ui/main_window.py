@@ -1727,7 +1727,7 @@ class MainWindow(QMainWindow):
                 data = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
                 if isinstance(data, dict):
                     return deepcopy(data)
-        from config_manager import ConfigManager
+        from airfoil_pinn.config.manager import ConfigManager
 
         return deepcopy(ConfigManager().config)
 

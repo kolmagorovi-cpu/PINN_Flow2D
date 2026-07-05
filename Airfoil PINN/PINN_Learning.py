@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 # Импорты модулей проекта
-from config_manager import ConfigManager, yes_no, warn_activation
+from airfoil_pinn.config.manager import ConfigManager, warn_activation, yes_no
 from airfoil_pinn.training.solver import PINNSolver
 from airfoil_pinn.training.checkpoint import CheckpointManager
 from constants import (
