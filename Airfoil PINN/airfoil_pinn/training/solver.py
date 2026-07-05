@@ -30,7 +30,7 @@ from torch.cuda.amp import GradScaler
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils import check_memory_usage, set_seed
+from airfoil_pinn.utils import check_memory_usage, set_seed
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.training.models import PINNIncompressible, SelfAdaptiveWeights
 from airfoil_pinn.training.checkpoint import CheckpointManager

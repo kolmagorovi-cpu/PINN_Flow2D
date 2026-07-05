@@ -1,53 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Пакет утилит для проекта Airfoil PINN.
+Совместимый фасад пакета утилит.
 
-Экспортирует:
-  - UI-утилиты (ui_utils): меню, ввод, очистка экрана
-  - I/O-утилиты (io_utils): работа с файлами JSON
-  - Вспомогательные функции (auxiliary_utils): seed, память, градиент
+Реальная реализация перенесена в ``airfoil_pinn.utils``. Этот пакет оставлен,
+чтобы старые сценарии с импортами вида ``from utils import safe_grad`` работали
+без изменений во время поэтапного рефакторинга.
 """
 
-from .ui_utils import (
-    get_menu_choice,
-    safe_input_number,
-    confirm_action,
-    input_with_default,
-    clear_screen,
-    print_header,
-    pause_and_continue,
-    Colors,
-)
-from .io_utils import (
-    save_json,
-    load_json,
-    sanitize_filename,
-    ensure_directory,
-)
-from .auxiliary_utils import (
-    set_seed,
-    check_memory_usage,
-    safe_grad,
-)
-
-__all__ = [
-    # UI
-    'get_menu_choice',
-    'safe_input_number',
-    'confirm_action',
-    'input_with_default',
-    'clear_screen',
-    'print_header',
-    'pause_and_continue',
-    'Colors',
-    # I/O
-    'save_json',
-    'load_json',
-    'sanitize_filename',
-    'ensure_directory',
-    # Вспомогательные
-    'set_seed',
-    'check_memory_usage',
-    'safe_grad',
-]
+from airfoil_pinn.utils import *  # noqa: F401,F403
+from airfoil_pinn.utils import __all__  # noqa: F401

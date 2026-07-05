@@ -23,7 +23,12 @@ from airfoil_pinn.app.module_registry import (
     find_by_command,
     modules_as_legacy_dicts,
 )
-from utils.ui_utils import Colors, clear_screen, get_menu_choice, pause_and_continue
+from airfoil_pinn.utils.ui_utils import (
+    Colors,
+    clear_screen,
+    get_menu_choice,
+    pause_and_continue,
+)
 
 
 def print_banner() -> None:

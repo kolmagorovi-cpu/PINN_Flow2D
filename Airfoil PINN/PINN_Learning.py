@@ -33,7 +33,7 @@ from constants import (
     DEFAULT_OUTPUT_DIM,
     DEFAULT_OUTPUT_BIAS,
 )
-from utils import (
+from airfoil_pinn.utils import (
     clear_screen,
     safe_input_number,
     input_with_default,

@@ -30,7 +30,7 @@ from torch.cuda.amp import GradScaler
 import numpy as np
 from scipy.spatial import cKDTree
 
-from utils import safe_grad
+from airfoil_pinn.utils import safe_grad
 from airfoil_pinn.data.sdf_diagnostics import (
     compute_sdf_summary,
     estimate_boundary_layer_delta,

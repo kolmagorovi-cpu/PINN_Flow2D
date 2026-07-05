@@ -33,7 +33,7 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
 
 from airfoil_pinn.physics.fluids import FluidLibrary
-from utils import safe_input_number, input_with_default, confirm_action
+from airfoil_pinn.utils import confirm_action, input_with_default, safe_input_number
 from airfoil_pinn.core.type_hints import BoundaryConditionsDict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -236,7 +236,7 @@ class ConditionsManager:
             cond: Объект граничных условий
             name: Имя для сохранения
         """
-        from utils import save_json
+        from airfoil_pinn.utils import save_json
         save_json(cond.to_dict(), self.directory, name)
         self.conditions[name] = cond
         logger.info(f"Сохранены условия: {name}")

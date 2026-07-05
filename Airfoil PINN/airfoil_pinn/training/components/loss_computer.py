@@ -17,7 +17,7 @@ import torch
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from utils import safe_grad
+from airfoil_pinn.utils import safe_grad
 from airfoil_pinn.physics.pde import PDEResiduals
 
 if TYPE_CHECKING:
