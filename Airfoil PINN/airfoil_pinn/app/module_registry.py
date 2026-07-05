@@ -65,7 +65,7 @@ def default_modules() -> tuple[ModuleDescriptor, ...]:
             code="S2DR",
             command="sampling",
             name="Дискретизация",
-            module="Collocation",
+            module="airfoil_pinn.sampling.cli",
             function="S2DR",
             status="готов",
             description="Генерация точек коллокации с классификацией границ",
