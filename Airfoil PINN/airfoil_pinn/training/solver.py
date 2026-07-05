@@ -34,8 +34,8 @@ from airfoil_pinn.utils import check_memory_usage, set_seed
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.training.models import PINNIncompressible, SelfAdaptiveWeights
 from airfoil_pinn.training.checkpoint import CheckpointManager
-from key_listener import KeyListener
-from visualizer import Visualizer
+from airfoil_pinn.training.key_listener import KeyListener
+from airfoil_pinn.training.visualizer import Visualizer
 from airfoil_pinn.training.reference import (
     compute_l2_errors,
     interpolate_reference,
