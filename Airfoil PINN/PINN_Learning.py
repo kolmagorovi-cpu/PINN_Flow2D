@@ -25,8 +25,8 @@ import matplotlib.patches as patches
 
 # Импорты модулей проекта
 from config_manager import ConfigManager, yes_no, warn_activation
-from solver import PINNSolver
-from checkpoint import CheckpointManager
+from airfoil_pinn.training.solver import PINNSolver
+from airfoil_pinn.training.checkpoint import CheckpointManager
 from constants import (
     DEFAULT_HIDDEN_LAYERS,
     DEFAULT_ACTIVATION,
