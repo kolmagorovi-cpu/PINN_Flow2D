@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from airfoil_pinn.app.paths import for_project_root
 from ui.geometry_frontend import GeometryFrontendSession, GeometryReadError
 from ui.theme import PALETTE
 from ui.workers import BackendWorker, ResultsScanWorker
@@ -80,7 +81,8 @@ class MainWindow(QMainWindow):
         self.resize(1320, 840)
         self.setAcceptDrops(True)
         self.project_root = Path(__file__).resolve().parents[1]
-        self.default_results_root = self.project_root / "ui" / "runs"
+        self.workspace_paths = for_project_root(self.project_root)
+        self.default_results_root = self.workspace_paths.experiments_dir / "ui_runs"
         self.current_results_dir = self.default_results_root / datetime.now().strftime("run_%Y%m%d_%H%M%S")
         self.settings = QSettings("AirfoilPINN", "AirfoilPINNUI")
         self.backend_worker: BackendWorker | None = None
@@ -729,10 +731,10 @@ class MainWindow(QMainWindow):
 
         self.source_combo = QComboBox()
         self.source_combo.addItems([
-            "Geometry/Foils file",
+            "workspace/geometry/foils",
             "External file",
             "Manual input",
-            "geom_config.yaml",
+            "workspace/geometry/geom_config.yaml",
             "Foil library",
             "Built-in closed NACA 0012",
             "Built-in NACA 2412",
@@ -1023,14 +1025,14 @@ class MainWindow(QMainWindow):
             self.library_combo.addItem(str(exc), "")
             return
         if not names:
-            self.library_combo.addItem("No foil_geoms.yaml entries", "")
+            self.library_combo.addItem("No workspace/geometry/foil_geoms.yaml entries", "")
         for name in names:
             self.library_combo.addItem(name, name)
         self._update_source_controls()
 
     def _update_source_controls(self) -> None:
         mode = self.source_combo.currentText()
-        file_mode = mode == "Geometry/Foils file"
+        file_mode = mode == "workspace/geometry/foils"
         library_mode = mode == "Foil library"
         external_mode = mode == "External file"
         manual_mode = mode == "Manual input"
@@ -1109,22 +1111,22 @@ class MainWindow(QMainWindow):
                 self.geometry_session.load_sample("rae2822")
             elif mode == "Built-in open plate":
                 self.geometry_session.load_sample("open_plate")
-            elif mode == "Geometry/Foils file":
+            elif mode == "workspace/geometry/foils":
                 path = self.foil_file_combo.currentData()
                 if not path:
-                    raise GeometryReadError("Geometry/Foils does not contain supported files")
+                    raise GeometryReadError("workspace/geometry/foils does not contain supported files")
                 self.geometry_session.load_file(path)
             elif mode == "Manual input":
                 self._open_manual_coordinates_dialog()
                 return
-            elif mode == "geom_config.yaml":
+            elif mode == "workspace/geometry/geom_config.yaml":
                 self.geometry_session.load_from_config()
                 self._apply_domain_params_to_controls()
                 self._apply_save_format_to_controls()
             elif mode == "Foil library":
                 geom_name = self.library_combo.currentData()
                 if not geom_name:
-                    raise GeometryReadError("Geometry/foil_geoms.yaml does not contain profiles")
+                    raise GeometryReadError("workspace/geometry/foil_geoms.yaml does not contain profiles")
                 self.geometry_session.load_from_library(geom_name)
             else:
                 if self.external_geometry_path is None:
@@ -1737,7 +1739,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save training config",
-            str(self.project_root / "ui_training_config.json"),
+            str(self.workspace_paths.configs_dir / "ui_training_config.json"),
             "JSON files (*.json);;All files (*.*)",
         )
         if not path:
@@ -1750,7 +1752,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load training config",
-            str(self.project_root),
+            str(self.workspace_paths.configs_dir),
             "JSON files (*.json);;All files (*.*)",
         )
         if not path:
@@ -1916,7 +1918,7 @@ class MainWindow(QMainWindow):
             self.log_panel.append_event(f"Preset profile failed: {exc}")
 
     def _available_backend_configs(self) -> list[Path]:
-        configs_dir = self.project_root / "Configs"
+        configs_dir = self.workspace_paths.configs_dir
         if not configs_dir.exists():
             return []
         return sorted(configs_dir.glob("*.yaml"))

@@ -1,0 +1,12 @@
+{
+    "fluid_name": "Воздух (20°C)",
+    "inlet_pressure": 101325.0,
+    "outlet_pressure": 101325.0,
+    "inlet_velocity_mode": "components",
+    "inlet_u": 5.0,
+    "inlet_v": 0.0,
+    "inlet_speed": 0.0,
+    "inlet_angle": 0.0,
+    "symmetry_type": null,
+    "description": ""
+}

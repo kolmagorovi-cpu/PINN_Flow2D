@@ -30,6 +30,7 @@ from torch.cuda.amp import GradScaler
 import matplotlib.pyplot as plt
 import numpy as np
 
+from airfoil_pinn.app.paths import PATHS, project_relative, resolve_project_path
 from airfoil_pinn.utils import check_memory_usage, set_seed
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.training.models import PINNIncompressible, SelfAdaptiveWeights
@@ -65,11 +66,11 @@ class PINNSolver:
         Args:
             config: словарь конфигурации
             experiment_dir: директория для сохранения результатов эксперимента
-                           (если None, создаётся уникальная папка в Checkpoints)
+                           (если None, создаётся уникальная папка в workspace/experiments)
         """
         self.config = config
         self.config_name = config.get('project_name', 'unnamed')
-        self.experiment_dir = experiment_dir
+        self.experiment_dir = str(resolve_project_path(experiment_dir)) if experiment_dir else None
 
         # Timestamp фиксируется один раз — используется во всех _get_*_dir()
         self._timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -580,8 +581,8 @@ class PINNSolver:
 
     def _get_run_dir(self) -> str:
         """Возвращает корневую директорию текущего запуска (единый timestamp)."""
-        base_dir = self.config.get('checkpoint_dir', 'Checkpoints')
-        return os.path.join(base_dir, f"{self.config_name}_{self._timestamp}")
+        base_dir = self.config.get('checkpoint_dir', project_relative(PATHS.experiments_dir))
+        return os.path.join(str(resolve_project_path(base_dir)), f"{self.config_name}_{self._timestamp}")
 
     def _get_checkpoint_dir(self) -> str:
         if self.experiment_dir:

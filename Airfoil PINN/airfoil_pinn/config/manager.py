@@ -17,6 +17,8 @@ from typing import Dict, Any, Optional
 
 import yaml
 
+from airfoil_pinn.app.paths import PATHS, project_relative
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["ConfigManager", "yes_no", "warn_activation"]
@@ -27,8 +29,8 @@ class ConfigManager:
     Хранит все настройки проекта, загружает/сохраняет в YAML-файлы.
     Предоставляет методы для интерактивного редактирования через меню.
     """
-    CONFIG_DIR = "Configs"
-    FLUIDS_DIR = "Fluids"
+    CONFIG_DIR = str(PATHS.configs_dir)
+    FLUIDS_DIR = str(PATHS.fluids_dir)
 
     def __init__(self) -> None:
         os.makedirs(self.CONFIG_DIR, exist_ok=True)
@@ -188,8 +190,8 @@ class ConfigManager:
                 'seed': 42,
             },
             'data': {
-                'points_file': None,
-                'mesh_file': 'Sampler\\Data\\mesh2d.npz',
+                'points_file': project_relative(PATHS.initial_fields_dir / 'initial.npy'),
+                'mesh_file': project_relative(PATHS.sampling_mesh_dir / 'mesh2d.npz'),
                 'num_workers': 0,
                 'pin_memory': None,
                 'persistent_workers': None,
@@ -215,7 +217,7 @@ class ConfigManager:
                 'mass_metrics_interval': 1,
             },
             'enable_key_listener': True,
-            'checkpoint_dir': 'Checkpoints',
+            'checkpoint_dir': project_relative(PATHS.experiments_dir),
         }
 
     def load(self, name: str) -> None:

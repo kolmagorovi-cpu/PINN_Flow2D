@@ -14,7 +14,7 @@ from typing import Any
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 
-PICTURES_DIR = "Pictures"
+from airfoil_pinn.app.paths import PICTURES_DIR
 
 __all__ = ["PICTURES_DIR", "visualize_network"]
 
@@ -25,7 +25,7 @@ def visualize_network(config: dict[str, Any], filename: str) -> None:
 
     Args:
         config: полная конфигурация проекта.
-        filename: имя файла внутри директории ``Pictures``.
+        filename: имя файла внутри директории ``workspace/pictures``.
     """
     input_params = config.get("input_params", {})
     arch = config.get("architecture", {})

@@ -25,9 +25,16 @@ import matplotlib.pyplot as plt
 from typing import Optional, Tuple, Dict, Union, List
 from dataclasses import dataclass
 import logging
-from pathlib import Path
 from scipy import interpolate
 
+from airfoil_pinn.app.paths import (
+    GEOM_CONFIG_PATH,
+    GEOMETRY_DOMAINS_DIR,
+    GEOMETRY_FOILS_DIR,
+    GEOMETRY_METADATA_DIR,
+    FOIL_GEOMS_PATH,
+    PATHS,
+)
 from airfoil_pinn.core.type_hints import (
     GeometryConfigDict,
     DomainParamsDict,
@@ -35,16 +42,12 @@ from airfoil_pinn.core.type_hints import (
     GeometryMetadataDict,
 )
 
-# Корень проекта нужен для совместимости с существующей структурой данных:
-# Geometry/Data, Geometry/Metadata, geom_config.yaml и библиотека профилей пока
-# остаются в прежних местах относительно репозитория.
-PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
-DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Data")
-DEFAULT_METADATA_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
+# Геометрические артефакты хранятся в workspace/geometry.
+# Константы оставлены строками, потому что большая часть модуля использует os.path.
+PROJECT_ROOT = str(PATHS.project_root)
+DEFAULT_OUTPUT_DIR = GEOMETRY_DOMAINS_DIR
+DEFAULT_METADATA_DIR = GEOMETRY_METADATA_DIR
 DEFAULT_PLOT_DPI = 300
-
-# Путь к YAML-библиотеке профилей
-FOIL_GEOMS_PATH = os.path.join(PROJECT_ROOT, "Geometry", "foil_geoms.yaml")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -416,9 +419,9 @@ class AirfoilGeometry:
         """
         Сохранение геометрии (координаты в метрах).
 
-        domain  → config.output_dir  (Geometry/Data/)
-        foil    → metadata_dir        (Geometry/Metadata/)
-        metadata→ metadata_dir        (Geometry/Metadata/)
+        domain  → config.output_dir  (workspace/geometry/domains/)
+        foil    → metadata_dir        (workspace/geometry/metadata/)
+        metadata→ metadata_dir        (workspace/geometry/metadata/)
 
         Args:
             filename: Базовое имя файла (без расширения)
@@ -430,7 +433,7 @@ class AirfoilGeometry:
 
         Example:
             >>> foil_path, domain_path = geom.save('naca0012', format='npy',
-            ...                                      metadata_dir='Geometry/Metadata')
+            ...                                      metadata_dir='workspace/geometry/metadata')
         """
         fmt = format or self.config.save_format
         base_name = filename or "airfoil"
@@ -608,13 +611,13 @@ class Geometry2D:
         Загрузка профиля напрямую из geom_config.yaml.
 
         Args:
-            config_path: Путь к geom_config.yaml (по умолчанию PROJECT_ROOT/geom_config.yaml)
+            config_path: Путь к geom_config.yaml (по умолчанию workspace/geometry/geom_config.yaml)
 
         Returns:
             True если загрузка успешна
         """
         if config_path is None:
-            config_path = os.path.join(PROJECT_ROOT, "geom_config.yaml")
+            config_path = GEOM_CONFIG_PATH
 
         if not os.path.exists(config_path):
             logger.error(f"❌ Конфигурационный файл не найден: {config_path}")
@@ -693,6 +696,9 @@ class Geometry2D:
                 logger.error("❌ Не указан file_path для source_type='file'")
                 return False
 
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(PROJECT_ROOT, file_path)
+
             success = self._airfoil_geom.load_airfoil(file_path)
             if success:
                 self.geometry_coords = self._airfoil_geom.foil_coords
@@ -757,7 +763,7 @@ def load_geometry_from_config(config_path: str = None, verbose: bool = True) -> 
     Автоматическая загрузка профиля из geom_config.yaml.
 
     Args:
-        config_path: Путь к geom_config.yaml (по умолчанию PROJECT_ROOT/geom_config.yaml)
+        config_path: Путь к geom_config.yaml (по умолчанию workspace/geometry/geom_config.yaml)
         verbose: Выводить ли информацию о процессе
 
     Returns:
@@ -769,7 +775,7 @@ def load_geometry_from_config(config_path: str = None, verbose: bool = True) -> 
         >>> geom.save('my_geometry')
     """
     if config_path is None:
-        config_path = os.path.join(PROJECT_ROOT, "geom_config.yaml")
+        config_path = GEOM_CONFIG_PATH
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Конфигурационный файл не найден: {config_path}")
@@ -793,14 +799,14 @@ def load_geometry_from_config(config_path: str = None, verbose: bool = True) -> 
     return geom
 
 
-FOILS_DIR = os.path.join(PROJECT_ROOT, 'Geometry', 'Foils')
+FOILS_DIR = GEOMETRY_FOILS_DIR
 
 
 def _select_geometry_file() -> Optional[str]:
     """
-    Меню выбора файла профиля из папки Geometry/Foils/.
+    Меню выбора файла профиля из папки workspace/geometry/foils/.
 
-    Сканирует Geometry/Foils/ на файлы .txt и .csv с координатами профиля
+    Сканирует workspace/geometry/foils/ на файлы .txt и .csv с координатами профиля
     и предлагает пользователю выбрать нужный по номеру.
 
     Returns:
@@ -825,7 +831,7 @@ def _select_geometry_file() -> Optional[str]:
         print("=" * 60)
         return None
 
-    print(f"  Папка: Geometry/Foils/    Найдено файлов: {len(files)}")
+    print(f"  Папка: workspace/geometry/foils/    Найдено файлов: {len(files)}")
     print("-" * 60)
     for i, (fname, full_path) in enumerate(files, 1):
         size_kb = os.path.getsize(full_path) / 1024
@@ -855,7 +861,7 @@ def g2d() -> None:
     """
     Главная функция модуля геометрии.
 
-    Показывает меню выбора файла из папки Geometry/, затем загружает
+    Показывает меню выбора файла из workspace/geometry/foils, затем загружает
     профиль, создаёт расчётную область, визуализирует и сохраняет.
     """
     print('\033c')
@@ -876,7 +882,7 @@ def g2d() -> None:
     )
 
     # Читаем базовую конфигурацию для параметров области
-    geom_config_path = os.path.join(PROJECT_ROOT, "geom_config.yaml")
+    geom_config_path = GEOM_CONFIG_PATH
     geom_config: Dict = {}
     if os.path.exists(geom_config_path):
         try:

@@ -13,7 +13,7 @@ Example:
     ...     "plot_enabled": True,
     ...     "plot_show": True,
     ...     "plot_dpi": 300,
-    ...     "output_dir": "./Geometry/Data"
+    ...     "output_dir": "workspace/geometry/domains"
     ... }
 """
 

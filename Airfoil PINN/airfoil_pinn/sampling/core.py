@@ -45,9 +45,16 @@ import threading
 from collections import defaultdict
 import sys
 import queue
-from pathlib import Path as FilePath
 from scipy.spatial import cKDTree
 
+from airfoil_pinn.app.paths import (
+    GEOM_CONFIG_PATH,
+    GEOMETRY_DOMAINS_DIR,
+    GEOMETRY_METADATA_DIR,
+    PATHS,
+    SAMPLING_COLLOCATION_DIR,
+    SAMPLING_MESH_DIR,
+)
 from airfoil_pinn.core.type_hints import (
     CollocationPointDict,
     SamplerConfigDict,
@@ -60,13 +67,13 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
 
-# Корень проекта нужен для сохранения прежней структуры артефактов:
-# Geometry/Data, Geometry/Metadata и Sampler/Data остаются относительно
-# репозитория, даже если код модуля переехал внутрь пакета.
-PROJECT_ROOT = str(FilePath(__file__).resolve().parents[2])
-DEFAULT_GEOMETRY_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Data")
-DEFAULT_METADATA_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
-DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Sampler", "Data")
+# Сэмплинг читает геометрию из workspace/geometry и пишет свои артефакты
+# в workspace/sampling. Пути остаются строками для совместимости с os.path.
+PROJECT_ROOT = str(PATHS.project_root)
+DEFAULT_GEOMETRY_DIR = GEOMETRY_DOMAINS_DIR
+DEFAULT_METADATA_DIR = GEOMETRY_METADATA_DIR
+DEFAULT_OUTPUT_DIR = SAMPLING_COLLOCATION_DIR
+DEFAULT_MESH_DIR = SAMPLING_MESH_DIR
 
 # Импортируем константы после определения локальных констант
 from airfoil_pinn.core.constants import (
@@ -452,16 +459,17 @@ class CollocationPoints:
 
         Args:
             config_path: Путь к geom_config.yaml (по умолчанию:
-                         'Airfoil PINN/geom_config.yaml')
+                         workspace/geometry/geom_config.yaml)
         """
         if config_path is None:
-            # Ищем файл в директории проекта
+            # Основной путь живёт в workspace/geometry. Старые варианты оставлены
+            # только как мягкий fallback для пользовательских рабочих копий.
             possible_paths = [
+                GEOM_CONFIG_PATH,
                 os.path.join(PROJECT_ROOT, "geom_config.yaml"),
-                os.path.join(PROJECT_ROOT, "Airfoil PINN", "geom_config.yaml"),
                 "geom_config.yaml"
             ]
-            logger.info(f"🔍 Поиск geom_config.yaml по путям:")
+            logger.info("🔍 Поиск geom_config.yaml по путям:")
             for path in possible_paths:
                 exists = "✅" if os.path.exists(path) else "❌"
                 logger.info(f"   {exists} {path}")
@@ -497,9 +505,9 @@ class CollocationPoints:
         """
         Поиск файлов геометрии по geom_name из конфига.
 
-        domain   → Geometry/Data/       ({geom_name}_domain.npy)
-        foil     → Geometry/Metadata/   ({geom_name}_foil.npy)
-        metadata → Geometry/Metadata/   ({geom_name}_metadata.npy)
+        domain   → workspace/geometry/domains/   ({geom_name}_domain.npy)
+        foil     → workspace/geometry/metadata/  ({geom_name}_foil.npy)
+        metadata → workspace/geometry/metadata/  ({geom_name}_metadata.npy)
 
         Returns:
             Словарь с путями к файлам {'foil': path, 'domain': path, 'metadata': path}
@@ -509,8 +517,8 @@ class CollocationPoints:
         if not geom_name:
             return result
 
-        data_dir = self.config.geometry_dir          # Geometry/Data/
-        meta_dir = DEFAULT_METADATA_DIR              # Geometry/Metadata/
+        data_dir = self.config.geometry_dir
+        meta_dir = DEFAULT_METADATA_DIR
 
         # domain — только в Data/
         for ext in ('_domain.npy', '_domain.txt'):
@@ -1697,7 +1705,7 @@ class CollocationPoints:
 
 def _select_geometry_data() -> Optional[str]:
     """
-    Меню выбора расчётной области из папки Geometry/Data/.
+    Меню выбора расчётной области из папки workspace/geometry/domains/.
 
     Сканирует директорию на файлы *_domain.npy / *_domain.txt и предлагает
     пользователю выбрать нужный по номеру.
@@ -1725,7 +1733,7 @@ def _select_geometry_data() -> Optional[str]:
         print("=" * 60)
         return None
 
-    print(f"  Папка: Geometry/Data/    Найдено: {len(candidates)}")
+    print(f"  Папка: workspace/geometry/domains/    Найдено: {len(candidates)}")
     print("-" * 60)
     for i, (base, path) in enumerate(candidates, 1):
         size_kb = os.path.getsize(path) / 1024
@@ -1775,7 +1783,7 @@ def _show_geometry_preview(base: str, domain_path: str, geom_dir: str) -> None:
         print("-" * 60)
         return
 
-    # Профиль — в Geometry/Metadata/
+    # Профиль хранится рядом с метаданными геометрии.
     for ext in ('.npy', '.txt'):
         foil_path = os.path.join(DEFAULT_METADATA_DIR, f"{base}_foil{ext}")
         if os.path.exists(foil_path):
@@ -1939,7 +1947,8 @@ def S2DR() -> None:
                 try:
                     mesh = Mesh2D.from_sampler(sampler)
                     mesh.build()
-                    mesh_path = os.path.join(config.output_dir, "mesh2d.npz")
+                    os.makedirs(DEFAULT_MESH_DIR, exist_ok=True)
+                    mesh_path = os.path.join(DEFAULT_MESH_DIR, "mesh2d.npz")
                     mesh.save(mesh_path)
                     s = mesh.summary()
                     print(f"✅ Сетка сохранена: {mesh_path}")
@@ -1954,13 +1963,13 @@ def S2DR() -> None:
                     print(f"   Минимальный объём CV: {min_vol:.3e} (узел {min_vol_idx})")
 
                     print("\n📊 Построение графика сетки...")
-                    mesh_plot_path = os.path.join(config.output_dir, "mesh2d.png")
+                    mesh_plot_path = os.path.join(DEFAULT_MESH_DIR, "mesh2d.png")
                     mesh.plot(save_path=mesh_plot_path, dpi=config.plot_dpi,
                               show=config.plot_results)
                     print(f"✅ График сохранён: {mesh_plot_path}")
 
                     print("\n📊 Построение карты объёмов CV...")
-                    cv_map_path = os.path.join(config.output_dir, "mesh2d_cv_map.png")
+                    cv_map_path = os.path.join(DEFAULT_MESH_DIR, "mesh2d_cv_map.png")
                     mesh.plot_cv_volume_map(
                         save_path=cv_map_path,
                         dpi=config.plot_dpi,
@@ -1969,7 +1978,7 @@ def S2DR() -> None:
                     print(f"✅ Карта CV сохранена: {cv_map_path}")
 
                     print("\n📊 Построение гистограммы распределения объёмов CV...")
-                    cv_hist_path = os.path.join(config.output_dir, "mesh2d_cv_hist.png")
+                    cv_hist_path = os.path.join(DEFAULT_MESH_DIR, "mesh2d_cv_hist.png")
                     mesh.plot_cv_volume_hist(
                         bins=100,
                         save_path=cv_hist_path,

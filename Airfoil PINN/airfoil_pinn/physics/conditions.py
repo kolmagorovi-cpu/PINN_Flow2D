@@ -32,6 +32,7 @@ import numpy as np
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
 
+from airfoil_pinn.app.paths import CONDITIONS_DIR, FLUIDS_DIR, resolve_project_path
 from airfoil_pinn.physics.fluids import FluidLibrary
 from airfoil_pinn.utils import confirm_action, input_with_default, safe_input_number
 from airfoil_pinn.core.type_hints import BoundaryConditionsDict
@@ -188,14 +189,14 @@ class ConditionsManager:
         fluid_lib: Библиотека жидкостей
     """
 
-    def __init__(self, directory: str = "Conditions") -> None:
+    def __init__(self, directory: str = CONDITIONS_DIR) -> None:
         """
         Инициализирует менеджер граничных условий.
 
         Args:
             directory: Директория для хранения файлов условий
         """
-        self.directory = directory
+        self.directory = str(resolve_project_path(directory))
         self.conditions: Dict[str, BoundaryConditions] = {}
         self.fluid_lib = FluidLibrary()
         os.makedirs(self.directory, exist_ok=True)
@@ -338,7 +339,7 @@ def select_fluid(fluid_lib: FluidLibrary) -> Optional[str]:
     """
     fluids = fluid_lib.list_fluids()
     if not fluids:
-        print("Библиотека жидкостей пуста. Сначала создайте жидкость в модуле Fluids.")
+        print(f"Библиотека жидкостей пуста. Добавьте JSON-файлы в {FLUIDS_DIR}.")
         return None
     print("\nДоступные жидкости:")
     for i, name in enumerate(fluids, 1):

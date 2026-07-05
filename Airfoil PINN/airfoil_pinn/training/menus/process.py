@@ -12,6 +12,7 @@ import os
 
 import torch
 
+from airfoil_pinn.app.paths import PATHS, project_relative, resolve_project_path
 from airfoil_pinn.config.manager import ConfigManager, yes_no
 from airfoil_pinn.training.menus.common import (
     print_submenu_footer,
@@ -39,13 +40,17 @@ def process_settings(cfg: ConfigManager) -> None:
 
         if sub == '1':
             if yes_no("Загрузить PINN и её конфигурацию для дообучения", proc['load_model_path'] is not None):
-                default_path = os.path.join(cfg.config.get('checkpoint_dir', 'Checkpoints'), 'pinn_interrupted.pt')
+                default_path = os.path.join(
+                    cfg.config.get('checkpoint_dir', project_relative(PATHS.experiments_dir)),
+                    'pinn_interrupted.pt',
+                )
                 path = input(f"Путь к файлу модели (.pt) [Enter для '{default_path}']: ").strip()
                 if not path:
                     path = default_path
-                if os.path.exists(path):
-                    proc['load_model_path'] = path
-                    base = os.path.splitext(os.path.basename(path))[0]
+                resolved_path = resolve_project_path(path)
+                if resolved_path.exists():
+                    proc['load_model_path'] = str(resolved_path)
+                    base = os.path.splitext(os.path.basename(resolved_path))[0]
                     conf_path = os.path.join(CONFIG_DIR, base + '.yaml')
                     if os.path.exists(conf_path):
                         cfg.load(base)

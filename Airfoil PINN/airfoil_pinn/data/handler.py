@@ -24,17 +24,24 @@ import torch
 from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader, Subset
 import logging
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from scipy.spatial import cKDTree
 
+from airfoil_pinn.app.paths import (
+    GEOM_CONFIG_PATH,
+    GEOMETRY_DOMAINS_DIR,
+    GEOMETRY_METADATA_DIR,
+    PATHS,
+    SAMPLING_COLLOCATION_DIR,
+    resolve_project_path,
+)
 from airfoil_pinn.core.type_hints import PointDtypeDict
 
 logger = logging.getLogger(__name__)
 
-# Корень проекта нужен для поиска существующих артефактов Sampler/Data,
-# Geometry/Data и geom_config.yaml после переноса кода внутрь пакета.
-PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+# Обработчик данных ищет артефакты через workspace. Старые пути ниже
+# используются только как fallback при открытии пользовательских архивов.
+PROJECT_ROOT = str(PATHS.project_root)
 
 __all__ = [
     "DataHandler",
@@ -165,6 +172,7 @@ class PINNDataset(Dataset):
         Raises:
             ValueError: Если файл имеет неверный формат
         """
+        points_file = str(resolve_project_path(points_file))
         data = np.load(points_file, allow_pickle=True)
         if data.dtype.names is None:
             raise ValueError("Файл точек должен быть структурированным массивом")
@@ -415,7 +423,7 @@ class DataHandler:
             persistent_workers: держать worker'ы между эпохами.
             prefetch_factor: число заранее подготовленных batch на worker.
         """
-        self.points_file = points_file
+        self.points_file = str(resolve_project_path(points_file))
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = max(0, int(num_workers))
@@ -431,11 +439,11 @@ class DataHandler:
             else 2
         )
         self.mesh_data: Optional[MeshData] = None
-        self.mesh_file = mesh_file
+        self.mesh_file = str(resolve_project_path(mesh_file)) if mesh_file is not None else None
         self.mesh_domain_coords: Optional[np.ndarray] = None
         self.mesh_airfoil_coords: Optional[np.ndarray] = None
 
-        self.dataset = PINNDataset(points_file)
+        self.dataset = PINNDataset(self.points_file)
         self.load_metadata()
         self._load_sampler_point_metadata()
         self.load_mesh_geometry_from_geom_config()
@@ -443,8 +451,8 @@ class DataHandler:
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
         self.dataloader = self._make_dataloader(self.dataset, batch_size=batch_size, shuffle=shuffle)
 
-        if mesh_file is not None:
-            self.load_mesh(mesh_file)
+        if self.mesh_file is not None:
+            self.load_mesh(self.mesh_file)
 
     def _make_dataloader(
         self,
@@ -497,14 +505,15 @@ class DataHandler:
 
     def _load_sampler_point_metadata(self) -> None:
         """
-        Дополняет initial.npy геометрическими флагами из Sampler/Data/collocation_points.npy.
+        Дополняет initial.npy геометрическими флагами из collocation_points.npy.
 
-        Initial/Data/initial.npy хранит нормированные поля, но обычно не хранит
+        workspace/initial/fields/initial.npy хранит нормированные поля, но обычно не хранит
         on_airfoil/segment_id. Эти флаги нужны только для корректной перестройки
         boundary-fitted Mesh2D после adaptive RAR.
         """
         project_dir = PROJECT_ROOT
         candidates = [
+            os.path.join(SAMPLING_COLLOCATION_DIR, "collocation_points.npy"),
             os.path.join(project_dir, "Sampler", "Data", "collocation_points.npy"),
         ]
 
@@ -559,15 +568,15 @@ class DataHandler:
             self.dataset.on_airfoil = self.dataset.boundary_types[:, wall_idx] > 0.5
             logger.info(
                 "on_airfoil восстановлен эвристически по boundary_type='wall' "
-                "(Sampler/Data/collocation_points.npy не найден или не совпал)."
+                "(collocation_points.npy не найден или не совпал)."
             )
 
-    def load_mesh_geometry_from_geom_config(self, config_path: str = "geom_config.yaml") -> bool:
+    def load_mesh_geometry_from_geom_config(self, config_path: str = GEOM_CONFIG_PATH) -> bool:
         """
         Загружает контуры домена/профиля для последующих rebuild Mesh2D.
 
         Новые mesh2d.npz сохраняют эти контуры прямо в файле. Для старых сеток
-        остаётся fallback через geom_config.yaml и Geometry/Data|Metadata.
+        остаётся fallback через geom_config.yaml и сохранённые контуры геометрии.
         """
         if self.mesh_domain_coords is not None:
             return True
@@ -601,12 +610,22 @@ class DataHandler:
                 return np.asarray(np.loadtxt(path, delimiter=',' if ext == ".csv" else None), dtype=np.float64)
             return None
 
-        data_dir = os.path.join(project_dir, "Geometry", "Data")
-        meta_dir = os.path.join(project_dir, "Geometry", "Metadata")
-        domain = _load_coords(os.path.join(data_dir, f"{geom_name}_domain"))
-        foil = _load_coords(os.path.join(meta_dir, f"{geom_name}_foil"))
-        if foil is None:
-            foil = _load_coords(os.path.join(data_dir, f"{geom_name}_foil"))
+        search_pairs = [
+            (GEOMETRY_DOMAINS_DIR, GEOMETRY_METADATA_DIR),
+            (
+                os.path.join(project_dir, "Geometry", "Data"),
+                os.path.join(project_dir, "Geometry", "Metadata"),
+            ),
+        ]
+        domain = None
+        foil = None
+        for data_dir, meta_dir in search_pairs:
+            domain = _load_coords(os.path.join(data_dir, f"{geom_name}_domain"))
+            foil = _load_coords(os.path.join(meta_dir, f"{geom_name}_foil"))
+            if foil is None:
+                foil = _load_coords(os.path.join(data_dir, f"{geom_name}_foil"))
+            if domain is not None:
+                break
 
         if domain is None or len(domain) < 2:
             return False
@@ -635,6 +654,7 @@ class DataHandler:
         Raises:
             FileNotFoundError: Если файл не найден
         """
+        mesh_file = str(resolve_project_path(mesh_file))
         if not os.path.exists(mesh_file):
             raise FileNotFoundError(f"Файл сетки не найден: {mesh_file}")
         with np.load(mesh_file, allow_pickle=True) as data:
@@ -727,7 +747,7 @@ class DataHandler:
         if self.mesh_domain_coords is None:
             raise RuntimeError(
                 "Нет domain_coords для перестройки FVM-сетки. "
-                "Пересоздайте mesh2d.npz новым mesh2d.py или проверьте geom_config.yaml."
+                "Пересоздайте mesh2d.npz через S2DR или проверьте geom_config.yaml."
             )
 
         from airfoil_pinn.sampling.mesh import Mesh2D

@@ -1,6 +1,5 @@
 """Smoke tests for FVM/DataLoader/training refactor."""
 
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +11,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from airfoil_pinn.app.paths import PATHS
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.data.initializer import SCIPY_AVAILABLE, _compute_sdf_chunk
 from airfoil_pinn.physics.fvm import FVMResiduals
@@ -22,7 +22,7 @@ from airfoil_pinn.utils import safe_grad
 
 
 def _load_config() -> dict:
-    with open(os.path.join("Configs", "FVM7.yaml"), "r", encoding="utf-8") as fh:
+    with (PATHS.configs_dir / "FVM7.yaml").open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
     cfg["training"]["batch_size"] = 32
     cfg["data"]["num_workers"] = 0

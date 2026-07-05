@@ -25,13 +25,13 @@ checkpoint:
   interval: 500
   model_name_pattern: '{project_name}_{timestamp}'
   name_pattern: '{project_name}_{timestamp}'
-checkpoint_dir: Checkpoints
+checkpoint_dir: workspace/experiments
 data:
-  mesh_file: Sampler\Data\mesh2d.npz
+  mesh_file: workspace/sampling/mesh/mesh2d.npz
   num_workers: 0
   persistent_workers: null
   pin_memory: null
-  points_file: Initial\Data\initial.npy
+  points_file: workspace/initial/fields/initial.npy
   prefetch_factor: 2
 diagnostics:
   compute_grad_cosine: false

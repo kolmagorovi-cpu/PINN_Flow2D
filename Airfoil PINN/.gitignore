@@ -1,62 +1,66 @@
-# Python кэш
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 
-# Виртуальные окружения
+# Virtual environments
 venv/
 env/
 ENV/
-.venv
+.venv/
 
-# IDE
+# IDE and OS files
 .vs/
 .idea/
+.vscode/
+.claude/
 *.swp
 *.swo
 *~
 .DS_Store
 *.suo
-.vsidx
+*.vsidx
 
-# Логи и чекпоинты (исключены из репозитория)
-logs/
-Checkpoints/
-
-# Временные файлы
+# Logs and temporary files
+*.log
 *.tmp
 *.temp
 *.bak
 *.backup
 *.old
+.ipynb_checkpoints/
 
-# Архивы
+# Archives
 *.zip
 *.rar
 *.7z
 *.tar.gz
 
-# Сгенерированные графики
+# Generated numeric and mesh artifacts
+*.msh
+*.npy
+*.npz
 Figure_*.png
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Legacy root-level data folders. They should not reappear after refactoring.
+/logs/
+/Checkpoints/
+/Fluids/
+/Conditions/
+/Geometry/Data/
+/Geometry/*.png
+/Sampler/Data/
+/Initial/Data/
+/Initial/Plots/
+/Pictures/
 
-# Прочее
-.vscode/
-.claude/
-*.log
-
-# Данные (сгенерированные файлы)
-Fluids/
-Conditions/
-Geometry/Data/
-Geometry/*.png
-Sampler/Data/
-Initial/Data/
-Initial/Plots/
-Pictures/
-*.msh
-*.npz
-*.csv
+# Workspace generated artifacts.
+workspace/backups/
+workspace/experiments/
+workspace/geometry/domains/
+workspace/geometry/metadata/
+workspace/initial/
+workspace/logs/
+workspace/pictures/
+workspace/sampling/

@@ -44,7 +44,7 @@ elif fvm2.get('weight') != 2.5:
 else:
     print("OK  ConfigManager save/load сохраняет fvm.enabled и fvm.weight корректно")
 
-os.remove(os.path.join('Configs', '__test_fvm__.yaml'))
+os.remove(os.path.join(ConfigManager.CONFIG_DIR, '__test_fvm__.yaml'))
 
 # ── 3. LossComputer — новый формат {enabled: True, weight: X} ────────────────
 def make_lw(fvm_val):

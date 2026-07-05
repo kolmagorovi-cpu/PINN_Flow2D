@@ -16,6 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSettings, QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from airfoil_pinn.app.paths import for_project_root  # noqa: E402
 from ui.geometry_frontend import GeometryFrontendSession  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
 from ui.workers import BackendWorker  # noqa: E402
@@ -40,7 +41,7 @@ def test_worker_metric_parser() -> None:
 def test_geometry_save() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        foils_dir = root / "Geometry" / "Foils"
+        foils_dir = for_project_root(root).geometry_foils_dir
         foils_dir.mkdir(parents=True)
         (foils_dir / "sample.txt").write_text("0 0\n1 0\n", encoding="utf-8")
 

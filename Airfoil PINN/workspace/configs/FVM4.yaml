@@ -15,9 +15,9 @@ architecture:
   - 50
   - 50
   output_bias:
-  - 1.0
+  - 0.1
   - 0.0
-  - 1.0
+  - 0.0
   output_dim: 3
 boundary_conditions:
   type: soft
@@ -25,22 +25,17 @@ checkpoint:
   interval: 500
   model_name_pattern: '{project_name}_{timestamp}'
   name_pattern: '{project_name}_{timestamp}'
-checkpoint_dir: Checkpoints
+checkpoint_dir: workspace/experiments
 data:
-  mesh_file: Sampler\Data\mesh2d.npz
-  num_workers: 0
-  persistent_workers: null
-  pin_memory: null
-  points_file: Initial\Data\initial.npy
-  prefetch_factor: 2
+  mesh_file: workspace/sampling/mesh/mesh2d.npz
+  points_file: workspace/initial/fields/initial.npy
 diagnostics:
   compute_grad_cosine: false
   compute_ntk_condition: false
+  strict_autograd: true
   interval: 50
-  mass_metrics_interval: 1
   plot_2d_spectrum: false
   plot_profiles: true
-  plot_rar_error_map: true
   plot_residual_map: true
   plot_spectrum: true
   profile_sections:
@@ -50,12 +45,11 @@ diagnostics:
   save_rar_history: true
   spectrum_2d_resolution: 256
   spectrum_section_x: 0.5
-  strict_autograd: true
 enable_key_listener: true
 input_params:
   coordinates: true
   density: true
-  fluid_file: Воздух_(20°C)
+  fluid_file: VMFL63
   inlet_velocity: true
   sdf: true
   viscosity: true
@@ -64,7 +58,7 @@ loss_weights:
   bc_weights:
     axis_symmetry: 1.0
     axis_symmetry_grad: 1.0
-    inlet: 100.0
+    inlet: 1.0
     outlet: 1.0
     symmetry: 1.0
     symmetry_grad: 1.0
@@ -72,7 +66,7 @@ loss_weights:
   fvm:
     batch_interval: 1
     enabled: true
-    weight: 25.0
+    weight: 1.0
   integral_condition: false
   integral_weight: 0.0
   pde_weights:
@@ -92,7 +86,6 @@ output:
   plot_frequency: 10
 pde:
   flow_type: 2d
-  pde_on_boundary: false
   system: incompressible_navier_stokes
 process:
   device: cuda
@@ -100,56 +93,18 @@ process:
   load_model_path: null
   num_gpus: 1
   seed: 42
-  torch_compile: false
-  torch_compile_dynamic: null
-  torch_compile_fullgraph: false
-  torch_compile_mode: null
   use_amp: false
-project_name: FVM9
+project_name: FVM4
 reference:
   path: null
 training:
   batch_size: 1000
-  boundary_rar:
-    alpha: 1.5
-    contour_samples: 1000
-    delta_max: 5.0
-    delta_mode: estimated
-    enabled: true
-    error_weights:
-      cont: 1.0
-      mom_r: 3.0
-      mom_x: 3.0
-      mom_y: 3.0
-      mom_z: 3.0
-    eta_levels:
-    - 0.02
-    - 0.05
-    - 0.1
-    - 0.2
-    - 0.35
-    - 0.5
-    - 0.75
-    - 1.0
-    - 1.5
-    - 2.0
-    - 3.0
-    - 5.0
-    fraction: 0.4
-    min_distance_factor: 0.02
-    num_points: 2500
-    score_batch_size: 2048
-    uniform_contour_weight: 0.5
   early_stopping:
     enabled: false
     min_delta: 1.0e-06
     patience: 100
     restore_best: true
   epochs: 1500
-  flow_rar:
-    enabled: true
-    exclude_sdf_delta: 5.0
-    num_points: null
   grad_clip: null
   gradient_accumulation_steps: 1
   lbfgs_history_size: 100
@@ -160,22 +115,9 @@ training:
   lr_detector_patience: 10
   lr_detector_recovery: 50
   lr_schedule: constant
-  rar_candidate_multiplier: 12
-  rar_enable: true
-  rar_error_quantile: 0.75
-  rar_fvm_min_new_points: 1
-  rar_fvm_rebuild_every: 1
-  rar_interval: 50
-  rar_jitter_scale: 0.85
-  rar_mesh_plot_dpi: 150
-  rar_min_boundary_distance_factor: 0.05
-  rar_min_distance_factor: 0.35
-  rar_mode: adaptive
-  rar_num_points: 500
-  rar_rebuild_fvm: true
-  rar_residual_power: 1.0
-  rar_save_mesh_volume_plot: true
-  rar_score_mode: total_loss
+  rar_enable: false
+  rar_interval: 100
+  rar_num_points: 200
   reset_interval: 0
   reset_noise: 0.01
   stage1_epochs: 100

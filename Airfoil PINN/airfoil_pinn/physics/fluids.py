@@ -25,6 +25,7 @@ import logging
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 
+from airfoil_pinn.app.paths import FLUIDS_DIR, resolve_project_path
 from airfoil_pinn.core.type_hints import FluidDict
 
 # Настройка логирования
@@ -119,14 +120,14 @@ class FluidLibrary:
         fluids: Словарь с загруженными жидкостями
     """
 
-    def __init__(self, directory: str = "Fluids") -> None:
+    def __init__(self, directory: str = FLUIDS_DIR) -> None:
         """
         Инициализирует библиотеку жидкостей.
 
         Args:
             directory: Директория для хранения файлов
         """
-        self.directory = directory
+        self.directory = str(resolve_project_path(directory))
         self.fluids: Dict[str, Fluid] = {}
         os.makedirs(self.directory, exist_ok=True)
         self._load_all()

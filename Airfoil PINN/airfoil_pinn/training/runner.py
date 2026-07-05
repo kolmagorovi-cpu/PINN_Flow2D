@@ -10,17 +10,17 @@
 """
 
 import logging
-import os
 import sys
 from typing import Optional
 
+from airfoil_pinn.app.paths import PATHS, project_relative, resolve_project_path
 from airfoil_pinn.config.manager import ConfigManager
 from airfoil_pinn.training.solver import PINNSolver
 from airfoil_pinn.utils import clear_screen
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_POINTS_FILE = os.path.join("Initial", "Data", "initial.npy")
+DEFAULT_POINTS_FILE = project_relative(PATHS.initial_fields_dir / "initial.npy")
 
 __all__ = ["DEFAULT_POINTS_FILE", "run_experiment", "start_training"]
 
@@ -34,6 +34,7 @@ def run_experiment(config_path: str, experiment_dir: str) -> None:
         experiment_dir: директория для сохранения результатов эксперимента.
     """
     cfg = ConfigManager()
+    config_path = str(resolve_project_path(config_path))
     try:
         # Пакетный режим всегда читает конфигурацию из указанного файла.
         cfg.load_from_file(config_path)
@@ -42,7 +43,8 @@ def run_experiment(config_path: str, experiment_dir: str) -> None:
         sys.exit(1)
 
     points_file = cfg.config["data"].get("points_file")
-    if not points_file or not os.path.exists(points_file):
+    points_path = resolve_project_path(points_file) if points_file else None
+    if points_path is None or not points_path.exists():
         logger.error("Файл с точками не найден: %s", points_file)
         sys.exit(1)
 
@@ -65,12 +67,13 @@ def start_training(
         cfg.config["data"]["points_file"] = DEFAULT_POINTS_FILE
         print(f"Используется путь к точкам по умолчанию: {DEFAULT_POINTS_FILE}")
 
-    if not os.path.exists(cfg.config["data"]["points_file"]):
+    points_path = resolve_project_path(cfg.config["data"]["points_file"])
+    if not points_path.exists():
         print(f"Файл с точками не найден: {cfg.config['data']['points_file']}")
         alt = input(
             "Введите путь к файлу вручную (или Enter для отмены): "
         ).strip()
-        if alt and os.path.exists(alt):
+        if alt and resolve_project_path(alt).exists():
             cfg.config["data"]["points_file"] = alt
         else:
             print("Файл не найден. Обучение невозможно.")

@@ -21,6 +21,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+from airfoil_pinn.app.paths import PATHS
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -29,8 +31,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы
-DEFAULT_BASE_CONFIG = "Configs/base.yaml"
-DEFAULT_EXPERIMENTS_ROOT = "experiments"
+DEFAULT_BASE_CONFIG = str(PATHS.configs_dir / "base.yaml")
+DEFAULT_EXPERIMENTS_ROOT = str(PATHS.experiments_dir / "batch")
 SUMMARY_CSV = "summary.csv"
 
 __all__ = [

@@ -172,7 +172,7 @@ def print_help() -> None:
     • python -m airfoil_pinn fluids
     • python -m airfoil_pinn conditions
     • python -m airfoil_pinn init
-    • python -m airfoil_pinn train --config Configs/FVM7.yaml --experiment-dir Checkpoints/run1
+    • python -m airfoil_pinn train --config workspace/configs/FVM7.yaml --experiment-dir workspace/experiments/run1
 
     {Colors.BOLD}Горячие клавиши:{Colors.RESET}
     • {Colors.CYAN}0{Colors.RESET} - вернуться в главное меню / выход

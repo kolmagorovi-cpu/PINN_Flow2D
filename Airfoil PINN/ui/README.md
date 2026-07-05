@@ -31,18 +31,18 @@ It can:
 - load `.txt`, `.dat`, `.csv`, `.npy` airfoil coordinate files;
 - accept drag-and-drop geometry files;
 - accept manual coordinates in `x y`, `x,y`, or `x; y` form;
-- load from `geom_config.yaml`;
-- load from `Geometry/foil_geoms.yaml` when that library exists;
+- load from `workspace/geometry/geom_config.yaml`;
+- load from `workspace/geometry/foil_geoms.yaml` when that library exists;
 - detect closed and open profiles;
 - build a domain using `front`, `rear`, `top`, and `bottom`;
 - preview the profile and domain interactively;
-- save geometry artifacts to `Geometry/Data` and `Geometry/Metadata`.
+- save geometry artifacts to `workspace/geometry/domains` and `workspace/geometry/metadata`.
 
 Generated files follow the backend naming pattern:
 
-- `Geometry/Metadata/<name>_foil.<format>`
-- `Geometry/Data/<name>_domain.<format>`
-- `Geometry/Metadata/<name>_metadata.npy`
+- `workspace/geometry/metadata/<name>_foil.<format>`
+- `workspace/geometry/domains/<name>_domain.<format>`
+- `workspace/geometry/metadata/<name>_metadata.npy`
 
 Training UI features:
 

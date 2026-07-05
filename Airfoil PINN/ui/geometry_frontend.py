@@ -1,8 +1,8 @@
 """Geometry workflow used by the UI.
 
-This module intentionally does not import the project backend. It mirrors the
-Geometry.py workflow for UI use: load airfoil coordinates, compute stats, build
-a domain preview and save artifacts into the same Geometry folders.
+This module keeps geometry editing independent from the heavy backend modules:
+it loads airfoil coordinates, computes stats, builds a domain preview and saves
+artifacts into the workspace geometry folders.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+from airfoil_pinn.app.paths import for_project_root
 
 
 @dataclass(frozen=True)
@@ -56,11 +58,12 @@ class GeometryFrontendSession:
 
     def __init__(self, project_root: Path | None = None) -> None:
         self.project_root = project_root or Path(__file__).resolve().parents[1]
-        self.foils_dir = self.project_root / "Geometry" / "Foils"
-        self.output_dir = self.project_root / "Geometry" / "Data"
-        self.metadata_dir = self.project_root / "Geometry" / "Metadata"
-        self.geom_config_path = self.project_root / "geom_config.yaml"
-        self.foil_library_path = self.project_root / "Geometry" / "foil_geoms.yaml"
+        paths = for_project_root(self.project_root)
+        self.foils_dir = paths.geometry_foils_dir
+        self.output_dir = paths.geometry_domains_dir
+        self.metadata_dir = paths.geometry_metadata_dir
+        self.geom_config_path = paths.geom_config_path
+        self.foil_library_path = paths.foil_geoms_path
 
         self.name = "airfoil"
         self.source = "not loaded"

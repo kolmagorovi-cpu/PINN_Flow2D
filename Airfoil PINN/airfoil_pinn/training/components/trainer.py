@@ -30,6 +30,7 @@ from torch.cuda.amp import GradScaler
 import numpy as np
 from scipy.spatial import cKDTree
 
+from airfoil_pinn.app.paths import PICTURES_DIR
 from airfoil_pinn.utils import safe_grad
 from airfoil_pinn.data.sdf_diagnostics import (
     compute_sdf_summary,
@@ -1372,7 +1373,7 @@ class Trainer:
         if not self.rar_save_mesh_volume_plot:
             return
 
-        base_dir = self.plots_dir or os.path.join(os.getcwd(), "Pictures")
+        base_dir = self.plots_dir or PICTURES_DIR
         out_dir = os.path.join(base_dir, "rar_mesh")
         os.makedirs(out_dir, exist_ok=True)
 

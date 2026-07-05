@@ -53,7 +53,7 @@ def _configure_input_params(cfg: ConfigManager) -> None:
             except ValueError:
                 inp['fluid_file'] = ch
         else:
-            print("В папке Fluids нет JSON-файлов. Поместите файлы туда.")
+            print(f"В папке {ConfigManager.FLUIDS_DIR} нет JSON-файлов. Поместите файлы туда.")
             inp['fluid_file'] = None
 
     print_submenu_footer()

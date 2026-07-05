@@ -11,11 +11,11 @@
 #     - 'junction' - плоский тройник (T-образный, Y-образный)
 #
 #   geom_name: имя конфигурации из библиотеки
-#     - для airfoil: смотри Geometry/foil_geoms.yaml
+#     - для airfoil: смотри workspace/geometry/foil_geoms.yaml
 #     - для junction: смотри Geometry/junction_geoms.yaml
 #
 # Библиотеки геометрии (фиксированные пути):
-#   FOIL_GEOMS_PATH: C:\Users\BelchikovDA\projects\dev\proj\pinn-solver\PINN_Flow2D\Airfoil PINN\Geometry\foil_geoms.yaml
+#   FOIL_GEOMS_PATH: workspace/geometry/foil_geoms.yaml
 #   JUNCTION_GEOMS_PATH: C:\Users\BelchikovDA\projects\dev\proj\pinn-solver\PINN_Flow2D\Airfoil PINN\Geometry\junction_geoms.yaml
 #
 # ============================================================================
@@ -57,7 +57,7 @@ airfoil_params:
   source_type: 'file'              # 'file' или 'inline'
   
   # Для source_type: 'file' раскомментировать:
-  file_path: 'Geometry/plate.txt'
+  file_path: 'workspace/geometry/foils/plate.txt'
   file_format: 'txt'
 
   contour_coef: 1.0
@@ -107,7 +107,7 @@ junction_params:
 # Эти параметры применяются к обоим типам геометрии
 
 common_params:
-  output_dir: 'Geometry/Data'            # Директория выходных файлов
+  output_dir: 'workspace/geometry/domains'            # Директория выходных файлов
   save_format: 'npy'                     # Формат сохранения: 'npy', 'csv', 'txt'
   plot_enabled: true                     # Включить визуализацию
   plot_show: true                        # Показывать графики сразу
@@ -124,7 +124,7 @@ common_params:
 # geom_name: 'NACA0012'
 # airfoil_params:
 #   source_type: 'file'
-#   file_path: 'Geometry/Foils/naca0012.csv'
+#   file_path: 'workspace/geometry/foils/naca0012.csv'
 #   file_format: 'csv'
 #   domain_params:
 #     front: 0.5

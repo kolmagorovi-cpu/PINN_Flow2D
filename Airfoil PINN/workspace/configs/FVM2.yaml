@@ -25,10 +25,10 @@ checkpoint:
   interval: 500
   model_name_pattern: '{project_name}_{timestamp}'
   name_pattern: '{project_name}_{timestamp}'
-checkpoint_dir: Checkpoints
+checkpoint_dir: workspace/experiments
 data:
-  mesh_file: Sampler\Data\mesh2d.npz
-  points_file: Initial\Data\initial.npy
+  mesh_file: workspace/sampling/mesh/mesh2d.npz
+  points_file: workspace/initial/fields/initial.npy
 diagnostics:
   compute_grad_cosine: false
   compute_ntk_condition: false
@@ -66,14 +66,15 @@ loss_weights:
   fvm:
     enabled: true
     weight: 1.0
+    batch_interval: 1
   integral_condition: false
   integral_weight: 0.0
   pde_weights:
-    cont: 0.0
-    mom_r: 0.0
-    mom_x: 0.0
-    mom_y: 0.0
-    mom_z: 0.0
+    cont: 1.0
+    mom_r: 1.0
+    mom_x: 1.0
+    mom_y: 1.0
+    mom_z: 1.0
   sa_apply_to_bc: false
   use_sa_weights: false
 output:
@@ -93,7 +94,7 @@ process:
   num_gpus: 1
   seed: 42
   use_amp: false
-project_name: FVM3
+project_name: FVM2
 reference:
   path: null
 training:

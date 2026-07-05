@@ -37,7 +37,6 @@ from typing import Optional, List, Tuple, Dict, Any
 import glob
 import multiprocessing as mp
 from functools import partial
-from pathlib import Path
 
 try:
     from scipy.spatial import cKDTree
@@ -45,6 +44,18 @@ try:
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
+from airfoil_pinn.app.paths import (
+    CONDITIONS_DIR,
+    FLUIDS_DIR,
+    GEOM_CONFIG_PATH,
+    GEOMETRY_DOMAINS_DIR,
+    GEOMETRY_METADATA_DIR,
+    INITIAL_FIELDS_DIR,
+    INITIAL_PLOTS_DIR,
+    PATHS,
+    SAMPLING_COLLOCATION_DIR,
+    resolve_project_path,
+)
 from airfoil_pinn.core.type_hints import InitializerMetadataDict
 
 # Импортируем наши модули и классы
@@ -61,17 +72,14 @@ from airfoil_pinn.data.sdf_diagnostics import (
     format_sdf_summary,
 )
 
-# Корень проекта остается базой для существующих папок артефактов:
-# Geometry/Data, Sampler/Data, Initial/Data и справочников JSON.
-PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
-
-# Константы путей (абсолютные)
-GEOMETRY_DIR = os.path.join(PROJECT_ROOT, "Geometry", "Data")
-SAMPLER_DIR = os.path.join(PROJECT_ROOT, "Sampler", "Data")
-FLUIDS_DIR = os.path.join(PROJECT_ROOT, "Fluids")
-CONDITIONS_DIR = os.path.join(PROJECT_ROOT, "Conditions")
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Initial", "Data")
-PLOTS_DIR = os.path.join(PROJECT_ROOT, "Initial", "Plots")
+# Инициализатор связывает артефакты geometry/sampling с обучающими полями.
+# Все директории берём из единой карты workspace, чтобы поиск файлов был
+# одинаковым в консоли, тестах и будущих сценариях автоматизации.
+PROJECT_ROOT = str(PATHS.project_root)
+GEOMETRY_DIR = GEOMETRY_DOMAINS_DIR
+SAMPLER_DIR = SAMPLING_COLLOCATION_DIR
+OUTPUT_DIR = INITIAL_FIELDS_DIR
+PLOTS_DIR = INITIAL_PLOTS_DIR
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -223,7 +231,7 @@ class Initializer:
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
         """
-        Загружает точки коллокации из Sampler.
+        Загружает точки коллокации из workspace/sampling/collocation.
 
         Args:
             filename: Путь к файлу с точками (по умолчанию выбирается автоматически)
@@ -232,19 +240,25 @@ class Initializer:
             Массив загруженных точек
 
         Raises:
-            FileNotFoundError: Если нет файлов в директории Sampler
+            FileNotFoundError: Если нет файлов в директории сэмплинга
             ValueError: Если файл имеет неверный формат
         """
         if filename is None:
-            files = glob.glob(os.path.join(self.sampler_dir, "*.npy"))
-            if not files:
-                raise FileNotFoundError(f"Нет .npy файлов в {self.sampler_dir}")
-            main_files = [f for f in files
-                          if not f.endswith('_interior.npy')
-                          and not f.endswith('_boundary.npy')
-                          and not f.endswith('_metadata.npy')]
-            filename = main_files[0] if main_files else files[0]
+            default_file = os.path.join(self.sampler_dir, "collocation_points.npy")
+            if os.path.exists(default_file):
+                filename = default_file
+            else:
+                files = sorted(glob.glob(os.path.join(self.sampler_dir, "*.npy")))
+                if not files:
+                    raise FileNotFoundError(f"Нет .npy файлов в {self.sampler_dir}")
+                main_files = [f for f in files
+                              if not f.endswith('_interior.npy')
+                              and not f.endswith('_boundary.npy')
+                              and not f.endswith('_metadata.npy')]
+                filename = main_files[0] if main_files else files[0]
             print(f"Использую файл точек: {os.path.basename(filename)}")
+        else:
+            filename = str(resolve_project_path(filename))
         data = np.load(filename, allow_pickle=True)
 
         if data.dtype.names is not None:
@@ -261,7 +275,7 @@ class Initializer:
             else:
                 raise ValueError("Неизвестный формат файла точек")
 
-        logger.info(f"Загружено {len(self.points)} точек из Sampler.")
+        logger.info(f"Загружено {len(self.points)} точек из сэмплинга.")
         return self.points
 
     def extract_wall_points(self) -> None:
@@ -312,7 +326,7 @@ class Initializer:
 
     @staticmethod
     def _current_geom_name() -> Optional[str]:
-        cfg_path = os.path.join(PROJECT_ROOT, "geom_config.yaml")
+        cfg_path = GEOM_CONFIG_PATH
         if not os.path.exists(cfg_path):
             return None
         try:
@@ -328,7 +342,7 @@ class Initializer:
     def _load_geometry_coords(self, suffix: str) -> Optional[np.ndarray]:
         geom_name = self._current_geom_name()
         search_dirs = [self.geometry_dir]
-        metadata_dir = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
+        metadata_dir = GEOMETRY_METADATA_DIR
         if suffix == "foil":
             search_dirs.append(metadata_dir)
 
@@ -365,7 +379,7 @@ class Initializer:
 
     def _load_chord_from_metadata(self) -> float:
         """Определяет хорду из метаданных геометрии или оценивает по разбросу x."""
-        metadata_dir = os.path.join(PROJECT_ROOT, "Geometry", "Metadata")
+        metadata_dir = GEOMETRY_METADATA_DIR
         search_dirs = [metadata_dir, self.geometry_dir]
         geom_name = self._current_geom_name()
         meta_files: List[str] = []

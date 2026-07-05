@@ -20,9 +20,9 @@ import sys
 from pathlib import Path
 
 
-# ``runtime.py`` ????? ? airfoil_pinn/app, ??????? parents[2] ????????? ??
-# ?????? ???????. ???? ???? ????? ??? ??????? ?? ????????? ??????, ?????
-# Python ????????? ??????? ????? ``airfoil_pinn`` ? ????????? ?????????.
+# ``runtime.py`` лежит в airfoil_pinn/app, поэтому parents[2] указывает на
+# корень репозитория. Этот путь нужен для запуска через Airfoil_PINN.py и для
+# корректного разрешения относительных путей из workspace-конфигов.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 VENV_DIR = PROJECT_ROOT / "venv"
 
@@ -61,9 +61,9 @@ def ensure_project_root_on_path() -> None:
     """
     Добавляет корень проекта в ``sys.path``.
 
-    Это временный мост совместимости: пока расчетные модули остаются в корне
-    репозитория, новый пакетный CLI должен уметь импортировать их по старым
-    именам: ``Geometry``, ``Collocation``, ``Initializer`` и т.д.
+    Консольная точка входа может запускаться из разных рабочих директорий.
+    Явный корень в ``sys.path`` гарантирует импорт пакета ``airfoil_pinn`` и
+    корректную работу относительных путей внутри ``workspace``.
     """
     root = str(PROJECT_ROOT)
     if root not in sys.path:
@@ -262,4 +262,7 @@ def bootstrap_environment() -> None:
     """
     configure_text_output()
     ensure_project_root_on_path()
+    from airfoil_pinn.app.paths import ensure_workspace_dirs
+
+    ensure_workspace_dirs()
     ensure_virtual_environment()
