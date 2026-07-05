@@ -17,11 +17,10 @@ import argparse
 import logging
 
 import torch
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 
 # Импорты модулей проекта
 from airfoil_pinn.config.manager import ConfigManager, warn_activation, yes_no
+from airfoil_pinn.training.network_diagram import visualize_network
 from airfoil_pinn.training.runner import (
     DEFAULT_POINTS_FILE,
     run_experiment,
@@ -40,7 +39,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы
-PICTURES_DIR = "Pictures"
 CONFIG_DIR = ConfigManager.CONFIG_DIR
 
 
@@ -52,87 +50,6 @@ def print_submenu_header(title: str) -> None:
 def print_submenu_footer() -> None:
     """Выводит закрывающую скобку подменю."""
     print("}")
-
-
-def visualize_network(config: dict, filename: str) -> None:
-    """
-    Строит схему нейронной сети в виде столбцов и сохраняет в PNG.
-    """
-    input_params = config.get('input_params', {})
-    arch = config.get('architecture', {})
-    hidden_layers = arch.get('hidden_layers', [50, 50, 50, 50])
-    activation = arch.get('activation', 'tanh')
-    output_dim = arch.get('output_dim', 3)
-
-    # Формируем подписи для входного слоя
-    input_labels = ["x", "y", "sdf"]
-    if input_params.get('inlet_velocity', False):
-        input_labels.extend(["u_in", "v_in"])
-    if input_params.get('viscosity', False):
-        input_labels.append("μ")
-    if input_params.get('density', False):
-        input_labels.append("ρ")
-    # one-hot границ всегда присутствует, если есть типы границ,
-    # но для схемы добавим как один обобщённый нейрон
-    input_labels.append("boundary (one‑hot)")
-
-    input_dim = len(input_labels)
-
-    fig, ax = plt.subplots(1, 1, figsize=(max(8, len(hidden_layers) * 2), 6))
-    ax.set_xlim(0, len(hidden_layers) + 2.5)
-    ax.set_ylim(0, 10)
-    ax.axis('off')
-    ax.set_aspect('equal')
-
-    color_input = '#FFDDC1'
-    color_hidden = '#C1E1FF'
-    color_output = '#D1FFD1'
-
-    box_width = 0.8
-    max_neurons = max(hidden_layers) if hidden_layers else 1
-    scale = 8.0 / max(max_neurons, 1)
-
-    # Входной слой
-    x_in = 0.5
-    height_in = input_dim * scale
-    rect_in = patches.Rectangle((x_in - box_width / 2, 1), box_width, height_in,
-                                 linewidth=2, edgecolor='black', facecolor=color_input)
-    ax.add_patch(rect_in)
-    ax.text(x_in, 1 + height_in / 2, f"Input\n{input_dim} neurons",
-            ha='center', va='center', fontsize=10, weight='bold')
-    y_text = 1 + height_in + 0.2
-    ax.text(x_in, y_text, "\n".join(input_labels[:5]), ha='center', va='bottom', fontsize=7)
-    if len(input_labels) > 5:
-        ax.text(x_in, y_text - 0.3, "...", ha='center', va='bottom', fontsize=7)
-
-    # Скрытые слои
-    for i, neurons in enumerate(hidden_layers):
-        x = 1.5 + i
-        height = neurons * scale
-        rect = patches.Rectangle((x - box_width / 2, 1), box_width, height,
-                                 linewidth=2, edgecolor='black', facecolor=color_hidden)
-        ax.add_patch(rect)
-        # Добавляем информацию об активации
-        ax.text(x, 1 + height / 2, f"Layer {i + 1}\n{neurons}\n{activation}",
-                ha='center', va='center', fontsize=9)
-
-    # Выходной слой
-    x_out = 1.5 + len(hidden_layers)
-    height_out = output_dim * scale
-    rect_out = patches.Rectangle((x_out - box_width / 2, 1), box_width, height_out,
-                                 linewidth=2, edgecolor='black', facecolor=color_output)
-    ax.add_patch(rect_out)
-    outputs = ["u", "v", "p"] if output_dim == 3 else ["u", "v", "p", "ρ"]
-    ax.text(x_out, 1 + height_out / 2, f"Output\n" + ", ".join(outputs),
-            ha='center', va='center', fontsize=9)
-
-    plt.title(f"Схема сети: {config.get('project_name', 'unnamed')}", fontsize=14)
-
-    os.makedirs(PICTURES_DIR, exist_ok=True)
-    path = os.path.join(PICTURES_DIR, filename)
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Схема сети сохранена: {path}")
 
 
 # =============================================================================
