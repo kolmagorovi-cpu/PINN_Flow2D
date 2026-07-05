@@ -18,6 +18,7 @@ __all__ = [
     "loss_function_menu",
     "print_submenu_footer",
     "print_submenu_header",
+    "training_strategy_menu",
     "weights_menu",
 ]
 
@@ -43,4 +44,8 @@ def __getattr__(name: str):
             "loss_function_menu": loss_function_menu,
             "weights_menu": weights_menu,
         }[name]
+    if name == "training_strategy_menu":
+        from airfoil_pinn.training.menus.strategy import training_strategy_menu
+
+        return training_strategy_menu
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
