@@ -15,7 +15,6 @@ import os
 import sys
 import argparse
 import logging
-from typing import Optional, List, Dict, Union
 
 import torch
 import matplotlib.pyplot as plt
@@ -23,21 +22,13 @@ import matplotlib.patches as patches
 
 # Импорты модулей проекта
 from airfoil_pinn.config.manager import ConfigManager, warn_activation, yes_no
-from airfoil_pinn.training.solver import PINNSolver
-from airfoil_pinn.training.checkpoint import CheckpointManager
-from airfoil_pinn.core.constants import (
-    DEFAULT_HIDDEN_LAYERS,
-    DEFAULT_ACTIVATION,
-    DEFAULT_OUTPUT_DIM,
-    DEFAULT_OUTPUT_BIAS,
+from airfoil_pinn.training.runner import (
+    DEFAULT_POINTS_FILE,
+    run_experiment,
+    start_training,
 )
 from airfoil_pinn.utils import (
     clear_screen,
-    safe_input_number,
-    input_with_default,
-    confirm_action,
-    print_header,
-    get_menu_choice,
 )
 
 # Настройка логирования
@@ -49,7 +40,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы
-DEFAULT_POINTS_FILE = os.path.join("Initial", "Data", "initial.npy")
 PICTURES_DIR = "Pictures"
 CONFIG_DIR = ConfigManager.CONFIG_DIR
 
@@ -282,34 +272,6 @@ def _configure_output_params(cfg: ConfigManager) -> None:
 
 
 # =============================================================================
-
-
-def run_experiment(config_path: str, experiment_dir: str) -> None:
-    """
-    Запускает обучение с заданной конфигурацией и сохраняет результаты в experiment_dir.
-    Используется для пакетного запуска.
-
-    Args:
-        config_path: путь к файлу конфигурации (.yaml)
-        experiment_dir: директория для сохранения результатов
-    """
-    cfg = ConfigManager()
-    try:
-        # Загружаем конфигурацию напрямую из файла
-        cfg.load_from_file(config_path)
-    except Exception as e:
-        logger.error(f"Не удалось загрузить конфигурацию {config_path}: {e}")
-        sys.exit(1)
-
-    # Проверяем наличие файла с точками
-    points_file = cfg.config['data'].get('points_file')
-    if not points_file or not os.path.exists(points_file):
-        logger.error(f"Файл с точками не найден: {points_file}")
-        sys.exit(1)
-
-    # Создаём solver с указанием директории эксперимента
-    solver = PINNSolver(cfg.config, experiment_dir=experiment_dir)
-    solver.train()
 
 
 def main_menu() -> None:
@@ -1077,48 +1039,6 @@ def process_settings(cfg: ConfigManager) -> None:
         elif sub == '0':
             print_submenu_footer()
             break
-
-
-def start_training(cfg: ConfigManager, experiment_dir: Optional[str] = None) -> None:
-    """
-    Запуск обучения с текущей конфигурацией.
-
-    Args:
-        cfg: объект ConfigManager с загруженной конфигурацией
-        experiment_dir: если указан, результаты сохраняются в эту директорию
-    """
-    if not cfg.config['data'].get('points_file'):
-        cfg.config['data']['points_file'] = DEFAULT_POINTS_FILE
-        print(f"Используется путь к точкам по умолчанию: {DEFAULT_POINTS_FILE}")
-
-    if not os.path.exists(cfg.config['data']['points_file']):
-        print(f"Файл с точками не найден: {cfg.config['data']['points_file']}")
-        alt = input("Введите путь к файлу вручную (или Enter для отмены): ").strip()
-        if alt and os.path.exists(alt):
-            cfg.config['data']['points_file'] = alt
-        else:
-            print("Файл не найден. Обучение невозможно.")
-            input("Нажмите Enter...")
-            return
-
-    # Убедимся, что есть раздел boundary_conditions (для совместимости)
-    if 'boundary_conditions' not in cfg.config:
-        cfg.config['boundary_conditions'] = {'type': 'soft'}
-        logger.warning("В конфигурации отсутствует раздел 'boundary_conditions', установлен 'soft' по умолчанию.")
-
-    if experiment_dir is None:
-        # Интерактивный режим: показываем конфигурацию и запрашиваем подтверждение
-        clear_screen()
-        print("=" * 60)
-        print("ЗАПУСК ОБУЧЕНИЯ".center(60))
-        print("=" * 60)
-        cfg.show()
-        print("\nНажмите Enter для начала обучения или Ctrl+C для отмены...")
-        input()
-
-    # Создаём solver (передаём experiment_dir, если есть)
-    solver = PINNSolver(cfg.config, experiment_dir=experiment_dir)
-    solver.train()
 
 
 def main():
