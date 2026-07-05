@@ -19,6 +19,7 @@ __all__ = [
     "diagnostics_menu",
     "loss_function_menu",
     "output_menu",
+    "process_settings",
     "print_submenu_footer",
     "print_submenu_header",
     "training_strategy_menu",
@@ -63,4 +64,8 @@ def __getattr__(name: str):
             "diagnostics_menu": diagnostics_menu,
             "output_menu": output_menu,
         }[name]
+    if name == "process_settings":
+        from airfoil_pinn.training.menus.process import process_settings
+
+        return process_settings
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

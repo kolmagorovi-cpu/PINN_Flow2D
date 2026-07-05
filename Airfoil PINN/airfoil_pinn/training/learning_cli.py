@@ -16,10 +16,8 @@ import sys
 import argparse
 import logging
 
-import torch
-
 # Импорты модулей проекта
-from airfoil_pinn.config.manager import ConfigManager, yes_no
+from airfoil_pinn.config.manager import ConfigManager
 from airfoil_pinn.training.menus.architecture import (
     _configure_activation,
     _configure_coordinate_scaling,
@@ -36,6 +34,7 @@ from airfoil_pinn.training.menus.loss import (
     loss_function_menu,
     weights_menu,
 )
+from airfoil_pinn.training.menus.process import process_settings
 from airfoil_pinn.training.menus.results import (
     checkpoint_menu,
     diagnostics_menu,
@@ -232,61 +231,6 @@ def save_config(cfg: ConfigManager) -> None:
     cfg.save()
     print(f"Конфигурация сохранена как {cfg.name}.yaml")
     input("Нажмите Enter...")
-
-def process_settings(cfg: ConfigManager) -> None:
-    """Меню настроек процесса обучения."""
-    while True:
-        clear_screen()
-        print_submenu_header("Настройки процесса обучения")
-        proc = cfg.config['process']
-        print("1. Загрузить PINN и её конфигурацию для дообучения")
-        print("2. Выбор GPU/CPU и их количества")
-        print("3. Выбор типа данных")
-        print("4. Показать настройки")
-        print("0. Выход")
-        sub = input("Выберите пункт: ").strip()
-
-        if sub == '1':
-            if yes_no("Загрузить PINN и её конфигурацию для дообучения", proc['load_model_path'] is not None):
-                default_path = os.path.join(cfg.config.get('checkpoint_dir', 'Checkpoints'), 'pinn_interrupted.pt')
-                path = input(f"Путь к файлу модели (.pt) [Enter для '{default_path}']: ").strip()
-                if not path:
-                    path = default_path
-                if os.path.exists(path):
-                    proc['load_model_path'] = path
-                    base = os.path.splitext(os.path.basename(path))[0]
-                    conf_path = os.path.join(CONFIG_DIR, base + '.yaml')
-                    if os.path.exists(conf_path):
-                        cfg.load(base)
-                        print(f"Конфигурация {base} загружена.")
-                    else:
-                        print("Конфигурация не найдена, будет использована текущая.")
-                else:
-                    print("Файл не найден.")
-                    proc['load_model_path'] = None
-            else:
-                proc['load_model_path'] = None
-        elif sub == '2':
-            proc['device'] = input(f"Устройство (auto/cuda/cpu) [{proc['device']}]: ").strip() or proc['device']
-            if torch.cuda.is_available() and proc['device'] != 'cpu':
-                proc['num_gpus'] = int(input(f"Количество GPU [{proc['num_gpus']}]: ") or proc['num_gpus'])
-            else:
-                proc['num_gpus'] = 0
-        elif sub == '3':
-            proc['dtype'] = input(f"Тип данных (float32/float64/float16) [{proc['dtype']}]: ").strip() or proc['dtype']
-            if proc['dtype'] == 'float32':
-                proc['use_amp'] = yes_no("Использовать AMP", proc['use_amp'])
-        elif sub == '4':
-            print("\n--- ТЕКУЩИЕ НАСТРОЙКИ ПРОЦЕССА ---")
-            print(f"Загруженная модель: {proc['load_model_path']}")
-            print(f"Устройство: {proc['device']}, GPU: {proc['num_gpus']}")
-            print(f"Тип данных: {proc['dtype']}, AMP: {proc['use_amp']}")
-            print(f"Seed: {proc.get('seed', 42)}")
-            input("Нажмите Enter...")
-        elif sub == '0':
-            print_submenu_footer()
-            break
-
 
 def main():
     """Основная функция: обрабатывает аргументы командной строки и запускает либо меню, либо эксперимент."""
