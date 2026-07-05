@@ -56,7 +56,7 @@ def default_modules() -> tuple[ModuleDescriptor, ...]:
             code="G2D",
             command="geometry",
             name="Геометрия (2D)",
-            module="Geometry",
+            module="airfoil_pinn.geometry.cli",
             function="g2d",
             status="готов",
             description="Загрузка контура профиля и построение расчетной области",
