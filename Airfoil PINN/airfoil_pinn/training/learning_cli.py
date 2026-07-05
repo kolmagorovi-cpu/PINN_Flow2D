@@ -20,6 +20,10 @@ import torch
 
 # Импорты модулей проекта
 from airfoil_pinn.config.manager import ConfigManager, warn_activation, yes_no
+from airfoil_pinn.training.menus.common import (
+    print_submenu_footer,
+    print_submenu_header,
+)
 from airfoil_pinn.training.network_diagram import visualize_network
 from airfoil_pinn.training.runner import (
     DEFAULT_POINTS_FILE,
@@ -40,16 +44,6 @@ logger = logging.getLogger(__name__)
 
 # Константы
 CONFIG_DIR = ConfigManager.CONFIG_DIR
-
-
-def print_submenu_header(title: str) -> None:
-    """Выводит заголовок подменю."""
-    print(f"\n{title} {{")
-
-
-def print_submenu_footer() -> None:
-    """Выводит закрывающую скобку подменю."""
-    print("}")
 
 
 # =============================================================================
