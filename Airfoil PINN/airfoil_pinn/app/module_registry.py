@@ -92,7 +92,7 @@ def default_modules() -> tuple[ModuleDescriptor, ...]:
             code="Initializer",
             command="init",
             name="Инициализация",
-            module="Initializer",
+            module="airfoil_pinn.data.initializer_cli",
             function="initialize_menu",
             status="готов",
             description="Нормализация данных и вычисление SDF",
