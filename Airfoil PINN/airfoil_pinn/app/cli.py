@@ -438,7 +438,7 @@ def _run_training_command(args: argparse.Namespace) -> None:
     Запускает обучение без меню, если передан ``--config``.
 
     При отсутствии ``--config`` команда ``train`` ведет себя как пункт меню и
-    открывает интерактивное меню обучения из ``airfoil_pinn.training.learning_cli``.
+    открывает интерактивное меню обучения из ``airfoil_pinn.training.menus.configuration``.
     """
     if not args.config:
         module = find_by_command("train")
@@ -449,8 +449,8 @@ def _run_training_command(args: argparse.Namespace) -> None:
     if not args.experiment_dir:
         raise SystemExit("Для train --config необходимо указать --experiment-dir")
 
-    learning_module = importlib.import_module("airfoil_pinn.training.learning_cli")
-    learning_module.run_experiment(args.config, args.experiment_dir)
+    runner = importlib.import_module("airfoil_pinn.training.runner")
+    runner.run_experiment(args.config, args.experiment_dir)
 
 
 def run_command(args: argparse.Namespace) -> None:

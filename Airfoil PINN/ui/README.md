@@ -12,7 +12,7 @@ python -m pip install -r requirements_ui.txt
 Run the UI:
 
 ```powershell
-python main_ui.py
+python -m ui.app
 ```
 
 Run UI smoke checks:
@@ -21,7 +21,7 @@ Run UI smoke checks:
 python -m ui.smoke_tests
 ```
 
-The Training panel can run `PINN_Learning.py --config ... --experiment_dir ...`
+The Training panel can run `Airfoil_PINN.py train --config ... --experiment-dir ...`
 or a quick `Mock backend` subprocess for UI testing. Progress is parsed from
 backend stdout lines such as `Epoch 100/1000, Loss: 0.00123`.
 

@@ -7,7 +7,7 @@
 используемых в различных модулях проекта.
 
 Example:
-    >>> from type_hints import GeometryConfigDict, SamplerConfigDict
+    >>> from airfoil_pinn.core.type_hints import GeometryConfigDict, SamplerConfigDict
     >>> config: GeometryConfigDict = {
     ...     "save_format": "npy",
     ...     "plot_enabled": True,
@@ -555,7 +555,7 @@ class PlotConfigDict(TypedDict, total=False):
 
 
 # =============================================================================
-# ОБУЧЕНИЕ (solver_components)
+# ОБУЧЕНИЕ (training.components)
 # =============================================================================
 
 class OptimizerParamsDict(TypedDict, total=False):

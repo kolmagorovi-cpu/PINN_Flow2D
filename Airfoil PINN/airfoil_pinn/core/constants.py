@@ -8,7 +8,7 @@
 поддерживаемости кода.
 
 Example:
-    >>> from constants import CLASSIFICATION_TOLERANCE_FACTOR, DEFAULT_BATCH_SIZE
+    >>> from airfoil_pinn.core.constants import CLASSIFICATION_TOLERANCE_FACTOR, DEFAULT_BATCH_SIZE
     >>> tol = step * CLASSIFICATION_TOLERANCE_FACTOR
     >>> batch = DEFAULT_BATCH_SIZE
 """

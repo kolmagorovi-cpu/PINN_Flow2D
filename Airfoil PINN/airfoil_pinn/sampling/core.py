@@ -76,7 +76,7 @@ from airfoil_pinn.core.constants import (
     DEFAULT_NUM_PROCESSES,
     QUEUE_TIMEOUT,
 )
-from sdf_diagnostics import (
+from airfoil_pinn.data.sdf_diagnostics import (
     compute_nearest_wall_distances,
     compute_sdf_summary,
     format_sdf_summary,

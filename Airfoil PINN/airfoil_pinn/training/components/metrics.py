@@ -1,5 +1,3 @@
-﻿# Исправленный файл: metrics.py (должен находиться в solver_components/ или в корне)
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

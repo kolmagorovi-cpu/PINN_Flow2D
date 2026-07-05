@@ -1,13 +1,16 @@
 """Диагностический тест FVM-настроек."""
+
 import os
 import sys
-sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'solver_components'))
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 errors = []
 
-# ── 1. ConfigManager default ─────────────────────────────────────────────────
-from config_manager import ConfigManager
+from airfoil_pinn.config.manager import ConfigManager
+from airfoil_pinn.training.components.loss_computer import LossComputer
 
 cfg = ConfigManager()
 lw = cfg.config['loss_weights']
@@ -61,36 +64,21 @@ def make_lw(fvm_val):
 
 import torch
 
+
 class _FakeDataHandler:
     boundary_type_names = ['inlet', 'outlet', 'wall']
     inlet_u_norm = 1.0
     inlet_v_norm = 0.0
 
+
 def _make_lc(fvm_val):
-    import importlib.util, types
-    spec = importlib.util.spec_from_file_location(
-        'loss_computer',
-        os.path.join(os.path.dirname(__file__), 'solver_components', 'loss_computer.py')
-    )
-    mod = importlib.util.module_from_spec(spec)
-    # patch pde_residuals & utils стабами
-    stub_pde = types.ModuleType('pde_residuals')
-    stub_pde.PDEResiduals = type('PDEResiduals', (), {
-        'compute_residuals_2d': staticmethod(lambda *a, **kw: {}),
-        'compute_residuals_axisymmetric': staticmethod(lambda *a, **kw: {}),
-    })
-    stub_utils = types.ModuleType('utils')
-    stub_utils.safe_grad = lambda *a, **kw: torch.zeros_like(a[1]) if len(a) > 1 else torch.zeros(1)
-    sys.modules.setdefault('pde_residuals', stub_pde)
-    sys.modules.setdefault('utils', stub_utils)
-    spec.loader.exec_module(mod)
     cfg_dict = {
         'pde': {'flow_type': '2d'},
         'boundary_conditions': {'type': 'soft'},
         'loss_weights': make_lw(fvm_val),
         'input_params': {'inlet_velocity': False, 'viscosity': False, 'density': False},
     }
-    lc = mod.LossComputer(
+    lc = LossComputer(
         config=cfg_dict,
         data_handler=_FakeDataHandler(),
         rho_norm=torch.tensor(1.0),

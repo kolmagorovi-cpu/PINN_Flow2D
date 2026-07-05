@@ -12,44 +12,8 @@ import argparse
 import logging
 import sys
 
-# Импорты ниже оставлены как совместимые реэкспорты для PINN_Learning.py и внешних скриптов.
-from airfoil_pinn.config.manager import ConfigManager
-from airfoil_pinn.training.menus.architecture import (
-    _configure_activation,
-    _configure_coordinate_scaling,
-    _configure_hidden_layers,
-    _configure_input_params,
-    _configure_output_params,
-    architecture_menu,
-)
-from airfoil_pinn.training.menus.common import (
-    print_submenu_footer,
-    print_submenu_header,
-)
-from airfoil_pinn.training.menus.configuration import (
-    create_new_config,
-    edit_config,
-    load_config,
-    main_menu,
-    save_config,
-)
-from airfoil_pinn.training.menus.loss import (
-    loss_function_menu,
-    weights_menu,
-)
-from airfoil_pinn.training.menus.process import process_settings
-from airfoil_pinn.training.menus.results import (
-    checkpoint_menu,
-    diagnostics_menu,
-    output_menu,
-)
-from airfoil_pinn.training.menus.strategy import training_strategy_menu
-from airfoil_pinn.training.runner import (
-    DEFAULT_POINTS_FILE,
-    run_experiment,
-    start_training,
-)
-from airfoil_pinn.utils import clear_screen
+from airfoil_pinn.training.menus.configuration import main_menu
+from airfoil_pinn.training.runner import run_experiment
 
 # Настройка логирования
 logging.basicConfig(
@@ -58,9 +22,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
-
-# Константы
-CONFIG_DIR = ConfigManager.CONFIG_DIR
 
 
 def main():
@@ -77,7 +38,8 @@ def main():
         help="Путь к файлу конфигурации для запуска эксперимента (без меню)",
     )
     parser.add_argument(
-        "--experiment_dir",
+        "--experiment-dir",
+        dest="experiment_dir",
         type=str,
         help="Директория для сохранения результатов эксперимента",
     )
@@ -87,7 +49,7 @@ def main():
         # Пакетный режим: запускаем эксперимент
         if not args.experiment_dir:
             logger.error(
-                "При использовании --config необходимо указать --experiment_dir"
+                "При использовании --config необходимо указать --experiment-dir"
             )
             sys.exit(1)
         run_experiment(args.config, args.experiment_dir)

@@ -101,7 +101,7 @@ def default_modules() -> tuple[ModuleDescriptor, ...]:
             code="PINNLearning",
             command="train",
             name="Обучение PINN",
-            module="airfoil_pinn.training.learning_cli",
+            module="airfoil_pinn.training.menus.configuration",
             function="main_menu",
             status="готов",
             description="Настройка конфигурации и запуск обучения",

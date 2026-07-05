@@ -560,13 +560,13 @@ class MainWindow(QMainWindow):
         backend_box = QGroupBox("Backend")
         backend_form = QFormLayout(backend_box)
         self.backend_mode_combo = QComboBox()
-        self.backend_mode_combo.addItems(["PINN_Learning.py", "Mock backend"])
+        self.backend_mode_combo.addItems(["Airfoil_PINN.py", "Mock backend"])
         self.base_config_combo = QComboBox()
         for config_path in self._available_backend_configs():
             self.base_config_combo.addItem(self._short_project_path(config_path), str(config_path))
         if self.base_config_combo.count() == 0:
             self.base_config_combo.addItem("No YAML configs found", "")
-        self.backend_script_edit = QLineEdit(str(self.project_root / "PINN_Learning.py"))
+        self.backend_script_edit = QLineEdit(str(self.project_root / "Airfoil_PINN.py"))
         self.browse_backend_button = QPushButton("Browse")
         self.browse_backend_button.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
         backend_script_row = QWidget()
@@ -880,7 +880,7 @@ class MainWindow(QMainWindow):
         self.bottom_spin.setToolTip("Lower domain clearance for closed airfoils")
         self.points_spin.setToolTip("Number of preview points drawn in the UI canvas")
         self.collocation_points_spin.setToolTip("Saved in the UI config; real backend uses data.points_file from YAML")
-        self.base_config_combo.setToolTip("YAML config passed to PINN_Learning.py")
+        self.base_config_combo.setToolTip("YAML config passed to Airfoil_PINN.py")
         self.backend_script_edit.setToolTip("Console backend script launched through subprocess")
         self.results_dir_edit.setToolTip("Run folder for backend config, UI config, logs, plots, and checkpoints")
         self.fvm_checkbox.setToolTip("Requires data.mesh_file in the selected backend YAML")
@@ -1581,7 +1581,8 @@ class MainWindow(QMainWindow):
         self._set_combo_text(self.training_profile_combo, profile.get("preset"))
         self.custom_profile_edit.setText(str(profile.get("coordinate_file") or ""))
         self._set_combo_text(self.backend_mode_combo, backend.get("mode"))
-        self.backend_script_edit.setText(str(backend.get("script") or self.project_root / "PINN_Learning.py"))
+        backend_script = Path(str(backend.get("script") or self.project_root / "Airfoil_PINN.py"))
+        self.backend_script_edit.setText(str(backend_script))
         self._set_combo_data(self.base_config_combo, backend.get("base_config"))
         self.epochs_spin.setValue(int(training.get("epochs", self.epochs_spin.value())))
         self.learning_rate_spin.setValue(float(training.get("learning_rate", self.learning_rate_spin.value())))
@@ -1616,7 +1617,7 @@ class MainWindow(QMainWindow):
             ]
             return command, run_dir
 
-        script = Path(ui_config["backend"]["script"] or self.project_root / "PINN_Learning.py")
+        script = Path(ui_config["backend"]["script"] or self.project_root / "Airfoil_PINN.py")
         if not script.is_absolute():
             script = self.project_root / script
         if not script.exists():
@@ -1628,9 +1629,10 @@ class MainWindow(QMainWindow):
             sys.executable,
             "-u",
             str(script),
+            "train",
             "--config",
             str(backend_config_path),
-            "--experiment_dir",
+            "--experiment-dir",
             str(run_dir),
         ]
         return command, run_dir

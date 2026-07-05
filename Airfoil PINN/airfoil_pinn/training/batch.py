@@ -147,9 +147,14 @@ def run_experiment(config_path: str, exp_dir: str) -> bool:
     Возвращает True, если процесс завершился успешно (код 0).
     """
     cmd = [
-        sys.executable, "-m", "airfoil_pinn.training.learning_cli",
-        "--config", config_path,
-        "--experiment_dir", exp_dir
+        sys.executable,
+        "-m",
+        "airfoil_pinn",
+        "train",
+        "--config",
+        config_path,
+        "--experiment-dir",
+        exp_dir,
     ]
     logger.info(f"Запуск эксперимента в {exp_dir}: {' '.join(cmd)}")
     try:

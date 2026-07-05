@@ -2,21 +2,23 @@
 
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 import yaml
 
-sys.path.insert(0, os.path.dirname(__file__))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from data_handler import DataHandler
-from fvm_residuals import FVMResiduals
-from Initializer import SCIPY_AVAILABLE, _compute_sdf_chunk
-from models import PINNIncompressible
-from solver_components.loss_computer import LossComputer
-from solver_components.trainer import Trainer
-from utils import safe_grad
+from airfoil_pinn.data.handler import DataHandler
+from airfoil_pinn.data.initializer import SCIPY_AVAILABLE, _compute_sdf_chunk
+from airfoil_pinn.physics.fvm import FVMResiduals
+from airfoil_pinn.training.components.loss_computer import LossComputer
+from airfoil_pinn.training.components.trainer import Trainer
+from airfoil_pinn.training.models import PINNIncompressible
+from airfoil_pinn.utils import safe_grad
 
 
 def _load_config() -> dict:
