@@ -106,9 +106,16 @@ class LossComputer:
             else:
                 self.fvm_weight: float = float(fvm_cfg.get('weight', 0.0))
             self.fvm_batch_interval: int = max(1, int(fvm_cfg.get('batch_interval', 1)))
+            self.fvm_loss_reduction: str = str(
+                fvm_cfg.get(
+                    'reduction',
+                    fvm_cfg.get('loss_reduction', 'volume_weighted'),
+                )
+            )
         else:
             self.fvm_weight: float = float(fvm_cfg)
             self.fvm_batch_interval: int = 1
+            self.fvm_loss_reduction: str = 'legacy'
         # Заполняется из PINNSolver при наличии mesh_file в конфиге
         self.fvm: Optional["FVMResiduals"] = None
 
@@ -159,7 +166,10 @@ class LossComputer:
         """
         if self.fvm is None or self.fvm_weight == 0.0:
             return torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        return self.fvm_weight * self.fvm.mass_loss(u_fvm)
+        return self.fvm_weight * self.fvm.mass_loss(
+            u_fvm,
+            reduction=self.fvm_loss_reduction,
+        )
 
     def _setup_pde_components(self) -> List[str]:
         """Возвращает список названий компонент PDE в зависимости от типа течения."""
@@ -211,6 +221,95 @@ class LossComputer:
     # ------------------------------------------------------------------
     # Граничные условия (только для soft)
     # ------------------------------------------------------------------
+    def _freestream_velocity_loss(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            torch.mean((u[mask] - self.data_handler.inlet_u_norm) ** 2)
+            + torch.mean((v[mask] - self.data_handler.inlet_v_norm) ** 2)
+        )
+
+    def _boundary_side_masks(
+        self,
+        mask: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        left = mask & (x <= self.x_min + self.tol)
+        right = mask & (x >= self.x_max - self.tol)
+        bottom = mask & (y <= self.y_min + self.tol)
+        top = mask & (y >= self.y_max - self.tol)
+        return left, right, bottom, top
+
+    def _normal_velocity_gradient_loss(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        left, right, bottom, top = self._boundary_side_masks(mask, x, y)
+        vertical = left | right
+        horizontal = bottom | top
+        terms = []
+
+        if bool(vertical.any()):
+            du_dx = self._grad(u, x, silent=False)
+            dv_dx = self._grad(v, x, silent=False)
+            terms.extend([du_dx[vertical] ** 2, dv_dx[vertical] ** 2])
+
+        if bool(horizontal.any()):
+            du_dy = self._grad(u, y, silent=False)
+            dv_dy = self._grad(v, y, silent=False)
+            terms.extend([du_dy[horizontal] ** 2, dv_dy[horizontal] ** 2])
+
+        if not terms:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        return torch.mean(torch.cat([term.flatten() for term in terms]))
+
+    def _slip_bc_losses(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        left, right, bottom, top = self._boundary_side_masks(mask, x, y)
+        vertical = left | right
+        horizontal = bottom | top
+
+        normal_terms = []
+        tangent_grad_terms = []
+        velocity_anchor_terms = []
+
+        if bool(horizontal.any()):
+            normal_terms.append((v[horizontal] - self.data_handler.inlet_v_norm) ** 2)
+            du_dy = self._grad(u, y, silent=False)
+            tangent_grad_terms.append(du_dy[horizontal] ** 2)
+            velocity_anchor_terms.append((u[horizontal] - self.data_handler.inlet_u_norm) ** 2)
+
+        if bool(vertical.any()):
+            normal_terms.append((u[vertical] - self.data_handler.inlet_u_norm) ** 2)
+            dv_dx = self._grad(v, x, silent=False)
+            tangent_grad_terms.append(dv_dx[vertical] ** 2)
+            velocity_anchor_terms.append((v[vertical] - self.data_handler.inlet_v_norm) ** 2)
+
+        if not normal_terms:
+            normal_terms.append((v[mask] - self.data_handler.inlet_v_norm) ** 2)
+            du_dy = self._grad(u, y, silent=False)
+            tangent_grad_terms.append(du_dy[mask] ** 2)
+            velocity_anchor_terms.append((u[mask] - self.data_handler.inlet_u_norm) ** 2)
+
+        normal_loss = torch.mean(torch.cat([term.flatten() for term in normal_terms]))
+        tangent_grad_loss = torch.mean(torch.cat([term.flatten() for term in tangent_grad_terms]))
+        velocity_anchor_loss = torch.mean(torch.cat([term.flatten() for term in velocity_anchor_terms]))
+        return normal_loss, tangent_grad_loss, velocity_anchor_loss
+
     def compute_bc_loss(
         self,
         u: torch.Tensor,
@@ -248,20 +347,35 @@ class LossComputer:
                 continue
 
             if name == 'inlet':
-                u_in = u[mask]
-                v_in = v[mask]
-                bc_comp[name] += torch.mean((u_in - self.data_handler.inlet_u_norm) ** 2)
-                bc_comp[name] += torch.mean((v_in - self.data_handler.inlet_v_norm) ** 2)
+                bc_comp[name] += self._freestream_velocity_loss(u, v, mask)
+
+            elif name in ('farfield', 'velocity_dirichlet'):
+                bc_comp[name] += self._freestream_velocity_loss(u, v, mask)
 
             elif name == 'outlet':
                 p_out = p[mask]
                 bc_comp[name] += torch.mean(p_out ** 2)
+                outlet_grad_weight = self.loss_weights.get('outlet_grad', 0.0)
+                if outlet_grad_weight > 0.0:
+                    extra_grad += outlet_grad_weight * self._normal_velocity_gradient_loss(
+                        u, v, x, y, mask
+                    )
 
             elif name == 'wall':
                 u_w = u[mask]
                 v_w = v[mask]
                 bc_comp[name] += torch.mean(u_w ** 2)
                 bc_comp[name] += torch.mean(v_w ** 2)
+
+            elif name == 'slip':
+                normal_loss, tangent_grad_loss, velocity_anchor_loss = self._slip_bc_losses(
+                    u, v, x, y, mask
+                )
+                bc_comp[name] += normal_loss
+                extra_grad += (
+                    self.loss_weights.get('slip_tangent_grad', 1.0) * tangent_grad_loss
+                    + self.loss_weights.get('slip_velocity', 0.1) * velocity_anchor_loss
+                )
 
             elif name == 'symmetry':
                 bc_comp[name] += torch.mean(v[mask] ** 2)
@@ -509,6 +623,29 @@ class LossComputer:
         v_final = torch.where(mask_v, v_bc, v_raw)
         p_final = torch.where(mask_p, p_bc, p_raw)
         return u_final, v_final, p_final
+
+    def apply_velocity_dirichlet_constraint(
+        self,
+        u_raw: torch.Tensor,
+        v_raw: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Hard speed Dirichlet for boundary_type='velocity_dirichlet' in any BC mode."""
+        names = getattr(self.data_handler, 'boundary_type_names', [])
+        if boundary_types is None or 'velocity_dirichlet' not in names:
+            return u_raw, v_raw
+
+        idx = names.index('velocity_dirichlet')
+        if idx >= boundary_types.shape[1]:
+            return u_raw, v_raw
+
+        mask = boundary_types[:, idx].view(-1, 1) > 0.5
+        if not bool(mask.any()):
+            return u_raw, v_raw
+
+        u_final = torch.where(mask, torch.ones_like(u_raw) * self.data_handler.inlet_u_norm, u_raw)
+        v_final = torch.where(mask, torch.ones_like(v_raw) * self.data_handler.inlet_v_norm, v_raw)
+        return u_final, v_final
 
     # ------------------------------------------------------------------
     # Обновление адаптивных весов

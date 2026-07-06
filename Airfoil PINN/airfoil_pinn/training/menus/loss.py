@@ -90,16 +90,23 @@ def weights_menu(cfg: ConfigManager) -> None:
         print(f"4. SA-PINN для BC (текущ: {lw['sa_apply_to_bc']})")
         fvm_cfg = lw.setdefault(
             'fvm',
-            {'enabled': False, 'weight': 1.0, 'batch_interval': 1},
+            {
+                'enabled': False,
+                'weight': 1.0,
+                'batch_interval': 1,
+                'reduction': 'volume_weighted',
+            },
         )
         if not isinstance(fvm_cfg, dict):
             fvm_cfg = {
                 'enabled': bool(fvm_cfg),
                 'weight': float(fvm_cfg) if float(fvm_cfg) > 0 else 1.0,
                 'batch_interval': 1,
+                'reduction': 'legacy',
             }
             lw['fvm'] = fvm_cfg
         fvm_cfg.setdefault('batch_interval', 1)
+        fvm_cfg.setdefault('reduction', 'volume_weighted')
         fvm_enabled = bool(fvm_cfg.get('enabled', False))
         fvm_weight = fvm_cfg.get('weight', 1.0)
         fvm_bi = fvm_cfg.get('batch_interval', 1)

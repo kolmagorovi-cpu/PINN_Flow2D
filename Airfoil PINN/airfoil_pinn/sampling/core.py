@@ -13,6 +13,7 @@
     - irregular: равномерное случайное распределение
     - adaptive_foil: сгущение у профиля (на основе расстояния до профиля)
     - adaptive_all: сгущение ко всем границам (на основе расстояния до ближайшей границы)
+    - normal_layer: нормальные слои от профиля внутрь расчётной области
 
 Все методы поддерживают многопроцессорность (с корректной работой на Windows).
 Пользователь может задать параметры alpha (степень сгущения) и epsilon_factor (масштаб сгущения),
@@ -88,6 +89,12 @@ from airfoil_pinn.data.sdf_diagnostics import (
     compute_sdf_summary,
     format_sdf_summary,
 )
+from airfoil_pinn.sampling.normal_layer import (
+    DEFAULT_ETA_LEVELS,
+    NormalLayerConfig,
+    generate_normal_layer_points,
+    resample_profile_by_step,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -96,6 +103,9 @@ logger = logging.getLogger(__name__)
 class BoundaryType(Enum):
     INLET = "inlet"
     OUTLET = "outlet"
+    FARFIELD = "farfield"
+    SLIP = "slip"
+    VELOCITY_DIRICHLET = "velocity_dirichlet"
     WALL = "wall"
     SYMMETRY = "symmetry"
     AXIS_SYMMETRY = "axis_symmetry"
@@ -151,7 +161,16 @@ class CollocationPoint:
         return (self.x, self.y)
 
 
-_VALID_BOUNDARY_TYPES = ('inlet', 'outlet', 'symmetry', 'axis_symmetry', 'wall')
+_VALID_BOUNDARY_TYPES = (
+    'inlet',
+    'outlet',
+    'farfield',
+    'slip',
+    'velocity_dirichlet',
+    'symmetry',
+    'axis_symmetry',
+    'wall',
+)
 
 
 @dataclass
@@ -172,13 +191,14 @@ class SamplerConfig:
         output_dir: Директория для выходных файлов
         boundary_point_density: Плотность точек на границах
         interior_point_density: Плотность внутренних точек
-        left_boundary_type: Тип левой границы (x=x_min); одно из: inlet, outlet, symmetry, axis_symmetry, wall
+        left_boundary_type: Тип левой границы (x=x_min); одно из: inlet, outlet, farfield, slip, velocity_dirichlet, symmetry, axis_symmetry, wall
         right_boundary_type: Тип правой границы (x=x_max)
         top_boundary_type: Тип верхней границы (y=y_max)
         bottom_boundary_type: Тип нижней границы (y=y_min)
-        sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all')
+        sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all', 'normal_layer')
         adaptive_alpha: Степень сгущения (для адаптивных методов)
         adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
+        normal_layer_*: Параметры нормально-слоевого сэмплинга
         geom_type: Тип геометрии (только 'airfoil')
         geom_name: Имя конфигурации (например, 'VMFL010')
     """
@@ -201,6 +221,24 @@ class SamplerConfig:
     sampling_method: str = "regular"
     adaptive_alpha: float = 1.0
     adaptive_epsilon_factor: float = 0.01
+    normal_layer_mode: str = "manual"
+    normal_layer_profile_step: float = 0.005
+    normal_layer_first_height: float = 1.0e-4
+    normal_layer_y_plus: float = 1.0
+    normal_layer_re_chord: Optional[float] = None
+    normal_layer_cf_model: str = "auto"
+    normal_layer_count: int = 14
+    normal_layer_growth_mode: str = "manual"
+    normal_layer_growth_ratio: float = 1.25
+    normal_layer_delta_mode: str = "estimated"
+    normal_layer_delta: Optional[float] = None
+    normal_layer_use_eta_levels: bool = False
+    normal_layer_eta_levels: Optional[Tuple[float, ...]] = None
+    normal_layer_open_sides: str = "both"
+    normal_layer_endpoint_skip: float = 0.0
+    normal_layer_min_point_distance_factor: float = 0.0
+    normal_layer_max_points: Optional[int] = None
+    normal_layer_fill_remaining: bool = True
 
     # Тип геометрии (только 'airfoil')
     geom_type: str = "airfoil"
@@ -254,7 +292,25 @@ class SamplerConfig:
             bottom_boundary_type=self.bottom_boundary_type,
             sampling_method=self.sampling_method,  # type: ignore
             adaptive_alpha=self.adaptive_alpha,
-            adaptive_epsilon_factor=self.adaptive_epsilon_factor
+            adaptive_epsilon_factor=self.adaptive_epsilon_factor,
+            normal_layer_mode=self.normal_layer_mode,
+            normal_layer_profile_step=self.normal_layer_profile_step,
+            normal_layer_first_height=self.normal_layer_first_height,
+            normal_layer_y_plus=self.normal_layer_y_plus,
+            normal_layer_re_chord=self.normal_layer_re_chord,
+            normal_layer_cf_model=self.normal_layer_cf_model,
+            normal_layer_count=self.normal_layer_count,
+            normal_layer_growth_mode=self.normal_layer_growth_mode,
+            normal_layer_growth_ratio=self.normal_layer_growth_ratio,
+            normal_layer_delta_mode=self.normal_layer_delta_mode,
+            normal_layer_delta=self.normal_layer_delta,
+            normal_layer_use_eta_levels=self.normal_layer_use_eta_levels,
+            normal_layer_eta_levels=self.normal_layer_eta_levels,
+            normal_layer_open_sides=self.normal_layer_open_sides,
+            normal_layer_endpoint_skip=self.normal_layer_endpoint_skip,
+            normal_layer_min_point_distance_factor=self.normal_layer_min_point_distance_factor,
+            normal_layer_max_points=self.normal_layer_max_points,
+            normal_layer_fill_remaining=self.normal_layer_fill_remaining,
         )
 
 
@@ -440,9 +496,11 @@ class CollocationPoints:
         self.foil_metadata: Dict[str, Any] = {}
         self.next_id = 0
         self.foil_coords: Optional[np.ndarray] = None
+        self.mesh_foil_coords: Optional[np.ndarray] = None
         self.domain_coords: Optional[np.ndarray] = None
         self.foil_is_closed = False
         self.output_base: Optional[str] = None
+        self._last_normal_layer_stats: Dict[str, Any] = {}
 
         # Загрузка конфигурации геометрии
         self.load_geometry_config()
@@ -646,6 +704,51 @@ class CollocationPoints:
         return all(cls._point_to_polyline_distance(pt, parent_arr) <= tol
                    for pt in child_arr)
 
+    def _build_normal_layer_config(self) -> NormalLayerConfig:
+        """Создаёт единый config для WALL-точек и нормальных слоёв."""
+        eta_levels = None
+        if self.config.normal_layer_use_eta_levels:
+            eta_levels = self.config.normal_layer_eta_levels or DEFAULT_ETA_LEVELS
+
+        return NormalLayerConfig(
+            mode=self.config.normal_layer_mode,
+            profile_step=self.config.normal_layer_profile_step,
+            first_layer_height=self.config.normal_layer_first_height,
+            y_plus=self.config.normal_layer_y_plus,
+            re_chord=self.config.normal_layer_re_chord,
+            cf_model=self.config.normal_layer_cf_model,
+            layer_count=self.config.normal_layer_count,
+            growth_mode=self.config.normal_layer_growth_mode,
+            growth_ratio=self.config.normal_layer_growth_ratio,
+            delta_mode=self.config.normal_layer_delta_mode,
+            delta=self.config.normal_layer_delta,
+            eta_levels=eta_levels,
+            open_profile_sides=self.config.normal_layer_open_sides,
+            endpoint_skip=self.config.normal_layer_endpoint_skip,
+            min_point_distance_factor=self.config.normal_layer_min_point_distance_factor,
+            max_points=self.config.normal_layer_max_points,
+        )
+
+    def _normal_layer_surface_reference(
+        self,
+        foil: np.ndarray,
+        config: NormalLayerConfig,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Возвращает surface-точки normal-layer и замкнутый reference для Mesh2D."""
+        surface, _ = resample_profile_by_step(
+            foil,
+            config.profile_step,
+            closed=self.foil_is_closed,
+            endpoint_skip=0.0 if self.foil_is_closed else max(float(config.endpoint_skip), 0.0),
+        )
+        if len(surface) == 0:
+            return surface, surface
+        if self.foil_is_closed:
+            reference = np.vstack([surface, surface[0]])
+        else:
+            reference = surface.copy()
+        return surface, reference
+
     # ------------------------------------------------------------------
     # Генерация точек на внешнем контуре (прямоугольник)
     # ------------------------------------------------------------------
@@ -789,7 +892,12 @@ class CollocationPoints:
     # ------------------------------------------------------------------
     # Генерация точек на профиле (WALL)
     # ------------------------------------------------------------------
-    def sample_boundary_foil(self, foil: np.ndarray, step: float) -> List[CollocationPoint]:
+    def sample_boundary_foil(
+        self,
+        foil: np.ndarray,
+        step: float,
+        normal_layer_config: Optional[NormalLayerConfig] = None,
+    ) -> List[CollocationPoint]:
         """
         Точки на профиле (равномерно по длине).
 
@@ -800,6 +908,27 @@ class CollocationPoints:
         Returns:
             Список точек на профиле с типом WALL
         """
+        if normal_layer_config is not None:
+            surface, reference = self._normal_layer_surface_reference(foil, normal_layer_config)
+            points = [
+                CollocationPoint(
+                    id=self._get_next_id(),
+                    x=float(x),
+                    y=float(y),
+                    boundary_type=BoundaryType.WALL,
+                    on_airfoil=True,
+                    on_boundary=True,
+                )
+                for x, y in surface
+            ]
+            self.mesh_foil_coords = reference
+            logger.info(
+                "✅ Профиль (WALL, normal_layer-aligned): %d точек, шаг=%.3e м",
+                len(points),
+                float(normal_layer_config.profile_step),
+            )
+            return points
+
         line = LineString(foil)
         length = line.length
         if self.foil_is_closed:
@@ -1099,6 +1228,86 @@ class CollocationPoints:
             logger.warning(f"⚠️ Сгенерировано только {len(points)} из {num_points}")
         return points
 
+    def sample_interior_irregular_outside_wall_distance(
+        self,
+        domain: np.ndarray,
+        num_points: int,
+        wall_points: np.ndarray,
+        min_wall_distance: float,
+        hole: Optional[np.ndarray] = None,
+    ) -> List[CollocationPoint]:
+        """Равномерные interior-точки вне уже разрешённого пристенного слоя."""
+        if num_points <= 0:
+            return []
+
+        wall_xy = np.asarray(wall_points, dtype=np.float64).reshape(-1, 2)
+        if len(wall_xy) == 0 or min_wall_distance <= 0.0:
+            return self.sample_interior_irregular(domain, num_points)
+
+        path = Path(domain)
+        hole_path = None
+        if hole is not None and len(hole) >= 3:
+            hole_arr = np.asarray(hole, dtype=np.float64)
+            if np.allclose(hole_arr[0], hole_arr[-1]):
+                hole_path = Path(hole_arr)
+        minx, miny, maxx, maxy = path.get_extents().bounds
+        wall_tree = cKDTree(wall_xy)
+        points: List[CollocationPoint] = []
+        attempts = 0
+        max_attempts = max(num_points * MAX_ATTEMPTS_MULTIPLIER * 3, DEFAULT_BATCH_SIZE)
+
+        if TQDM_AVAILABLE and self.config.show_progress:
+            pbar = tqdm(total=num_points, desc="Дальнее поле (вне слоя)")
+        else:
+            pbar = None
+            last_log = time.time()
+
+        while len(points) < num_points and attempts < max_attempts:
+            batch_size = min(DEFAULT_BATCH_SIZE, max_attempts - attempts)
+            xs = np.random.uniform(minx, maxx, batch_size)
+            ys = np.random.uniform(miny, maxy, batch_size)
+            candidates = np.column_stack((xs, ys))
+            attempts += batch_size
+
+            inside = path.contains_points(candidates)
+            if hole_path is not None:
+                inside &= ~hole_path.contains_points(candidates)
+            candidates = candidates[inside]
+            if len(candidates) == 0:
+                continue
+
+            dist, _ = wall_tree.query(candidates, k=1)
+            valid = candidates[np.asarray(dist) > float(min_wall_distance)]
+            for x, y in valid:
+                if len(points) >= num_points:
+                    break
+                points.append(CollocationPoint(
+                    id=self._get_next_id(),
+                    x=float(x),
+                    y=float(y),
+                    boundary_type=BoundaryType.INTERIOR,
+                    on_airfoil=False,
+                    on_boundary=False,
+                ))
+                if pbar:
+                    pbar.update(1)
+
+            if not pbar and self.config.show_progress and time.time() - last_log > QUEUE_TIMEOUT:
+                logger.info(
+                    "⏳ Дальнее поле: %d/%d точек вне слоя %.3e м",
+                    len(points), num_points, float(min_wall_distance),
+                )
+                last_log = time.time()
+
+        if pbar:
+            pbar.close()
+        if len(points) < num_points:
+            logger.warning(
+                "⚠️ Дальнее поле: сгенерировано только %d из %d точек вне слоя %.3e м",
+                len(points), num_points, float(min_wall_distance),
+            )
+        return points
+
     def _sample_interior_irregular_parallel(self, domain: np.ndarray,
                                             num_points: int) -> List[CollocationPoint]:
         path = Path(domain)
@@ -1385,6 +1594,93 @@ class CollocationPoints:
         return points
 
     # ------------------------------------------------------------------
+    # Внутренние точки: нормально-слоевой метод у профиля
+    # ------------------------------------------------------------------
+    def sample_interior_normal_layer(
+        self,
+        domain: np.ndarray,
+        foil: Optional[np.ndarray],
+        num_interior_target: int,
+    ) -> List[CollocationPoint]:
+        """
+        Генерирует interior-точки в нормальных слоях от профиля.
+
+        Слои строятся только в допустимую часть расчётной области. Для
+        замкнутого профиля выбирается внешняя нормаль, для разомкнутого могут
+        использоваться обе стороны.
+        """
+        self._last_normal_layer_stats = {}
+        if foil is None or len(foil) < 2:
+            logger.warning("⚠️ Для normal_layer нужен профиль. Использую нерегулярный метод.")
+            return self.sample_interior_irregular(domain, num_interior_target)
+
+        layer_cfg = self._build_normal_layer_config()
+
+        try:
+            result = generate_normal_layer_points(domain, foil, layer_cfg)
+        except Exception as exc:
+            logger.error("❌ normal_layer: ошибка генерации (%s). Использую нерегулярный метод.", exc)
+            return self.sample_interior_irregular(domain, num_interior_target)
+
+        self._last_normal_layer_stats = result.stats
+        if self.mesh_foil_coords is None and len(result.surface_points) > 0:
+            if self.foil_is_closed:
+                self.mesh_foil_coords = np.vstack([result.surface_points, result.surface_points[0]])
+            else:
+                self.mesh_foil_coords = result.surface_points.copy()
+
+        layer_points = [
+            CollocationPoint(
+                id=self._get_next_id(),
+                x=float(x),
+                y=float(y),
+                boundary_type=BoundaryType.INTERIOR,
+                on_airfoil=False,
+                on_boundary=False,
+            )
+            for x, y in result.points
+        ]
+
+        logger.info(
+            "✅ Внутренних точек normal_layer: %d (profile_samples=%s, first_layer=%.3e м)",
+            len(layer_points),
+            result.stats.get("profile_samples", "-"),
+            float(result.stats.get("first_layer_height", 0.0) or 0.0),
+        )
+
+        if self.config.normal_layer_fill_remaining:
+            outer_layer = 0.0
+            if len(result.offsets) > 0:
+                outer_layer = float(np.max(result.offsets))
+            wall_reference = (
+                self.mesh_foil_coords[:-1]
+                if self.mesh_foil_coords is not None
+                and len(self.mesh_foil_coords) > 1
+                and np.allclose(self.mesh_foil_coords[0], self.mesh_foil_coords[-1])
+                else self.mesh_foil_coords
+            )
+            if wall_reference is None or len(wall_reference) == 0:
+                wall_reference = result.surface_points
+
+            logger.info(
+                "   Добор дальнего поля вне normal-layer: %d точек, r_min=%.3e м",
+                num_interior_target,
+                outer_layer,
+            )
+            far_field_points = self.sample_interior_irregular_outside_wall_distance(
+                domain,
+                num_interior_target,
+                np.asarray(wall_reference, dtype=np.float64),
+                outer_layer,
+                hole=foil if self.foil_is_closed else None,
+            )
+            layer_points.extend(far_field_points)
+            self._last_normal_layer_stats["far_field_points"] = int(len(far_field_points))
+            self._last_normal_layer_stats["far_field_min_wall_distance"] = float(outer_layer)
+
+        return layer_points
+
+    # ------------------------------------------------------------------
     # Основной метод генерации всех точек
     # ------------------------------------------------------------------
     def _log_sdf_statistics(self, chord: Optional[float]) -> Optional[Dict[str, object]]:
@@ -1476,6 +1772,11 @@ class CollocationPoints:
         foil_on_domain = self._polyline_lies_on_polyline(
             foil, domain, max(step_m * CLASSIFICATION_TOLERANCE_FACTOR, 1e-9)
         )
+        normal_layer_cfg = (
+            self._build_normal_layer_config()
+            if self.config.sampling_method == 'normal_layer' and foil is not None
+            else None
+        )
 
         # 1. Точки на внешнем контуре
         logger.info("\n📌 Внешний контур:")
@@ -1483,11 +1784,21 @@ class CollocationPoints:
             domain,
             step_m,
             bounds,
-            foil=foil if foil_on_domain else None,
+            foil=foil if foil_on_domain and normal_layer_cfg is None else None,
         )
 
         # 2. Точки на профиле (если есть)
-        if foil is not None and not foil_on_domain:
+        if foil is not None and normal_layer_cfg is not None:
+            if self.points_boundary:
+                n_before = len(self.points_boundary)
+                self.points_boundary = [p for p in self.points_boundary if not p.on_airfoil]
+                n_removed = n_before - len(self.points_boundary)
+                if n_removed:
+                    logger.info("   Удалено %d глобальных WALL-точек профиля перед normal_layer", n_removed)
+            logger.info("\n📌 Профиль (WALL):")
+            foil_points = self.sample_boundary_foil(foil, step_m, normal_layer_cfg)
+            self.points_boundary.extend(foil_points)
+        elif foil is not None and not foil_on_domain:
             logger.info("\n📌 Профиль (WALL):")
             foil_points = self.sample_boundary_foil(foil, step_m)
             self.points_boundary.extend(foil_points)
@@ -1533,6 +1844,8 @@ class CollocationPoints:
                                                      self.config.adaptive_alpha,
                                                      self.config.adaptive_epsilon_factor,
                                                      'all')
+        elif self.config.sampling_method == 'normal_layer':
+            interior = self.sample_interior_normal_layer(domain, foil, num_interior)
         else:
             raise ValueError(f"Неизвестный метод: {self.config.sampling_method}")
 
@@ -1568,6 +1881,7 @@ class CollocationPoints:
             'sampling_method': self.config.sampling_method,
             'adaptive_alpha': self.config.adaptive_alpha,
             'adaptive_epsilon_factor': self.config.adaptive_epsilon_factor,
+            'normal_layer': self._last_normal_layer_stats if self._last_normal_layer_stats else None,
             'sdf_statistics': sdf_summary,
         }
 
@@ -1610,6 +1924,9 @@ class CollocationPoints:
         colors = {
             BoundaryType.INLET: 'blue',
             BoundaryType.OUTLET: 'cyan',
+            BoundaryType.FARFIELD: 'navy',
+            BoundaryType.SLIP: 'orange',
+            BoundaryType.VELOCITY_DIRICHLET: 'dodgerblue',
             BoundaryType.WALL: 'red',
             BoundaryType.SYMMETRY: 'purple',
             BoundaryType.AXIS_SYMMETRY: 'magenta',
@@ -1618,6 +1935,9 @@ class CollocationPoints:
         sizes = {
             BoundaryType.INLET: 10,
             BoundaryType.OUTLET: 10,
+            BoundaryType.FARFIELD: 10,
+            BoundaryType.SLIP: 10,
+            BoundaryType.VELOCITY_DIRICHLET: 10,
             BoundaryType.WALL: 15,
             BoundaryType.SYMMETRY: 10,
             BoundaryType.AXIS_SYMMETRY: 10,
@@ -1642,6 +1962,13 @@ class CollocationPoints:
         step_info = f"шаг={self.config.step_size}{self.config.step_units}, метод={self.config.sampling_method}"
         if 'adaptive' in self.config.sampling_method:
             step_info += f", α={self.config.adaptive_alpha}, ε_factor={self.config.adaptive_epsilon_factor}"
+        if self.config.sampling_method == 'normal_layer' and self._last_normal_layer_stats:
+            first_h = self._last_normal_layer_stats.get('first_layer_height')
+            layers = self._last_normal_layer_stats.get('layer_count')
+            if first_h is not None:
+                step_info += f", y1={float(first_h):.2e}м"
+            if layers is not None:
+                step_info += f", слоёв={layers}"
         plt.title(f"Точки коллокации (всего: {self.metadata['num_points']}, {step_info})", fontsize=14)
         plt.xlabel('X, м')
         plt.ylabel('Y, м')
@@ -1837,43 +2164,67 @@ def S2DR() -> None:
             "   2 - outlet        (выход потока)\n"
             "   3 - symmetry      (плоская симметрия)\n"
             "   4 - axis_symmetry (осевая симметрия)\n"
-            "   5 - wall          (твёрдая стенка)"
+            "   5 - wall          (твёрдая стенка)\n"
+            "   6 - farfield      (мягкая скорость U_inf)\n"
+            "   7 - slip          (непроникание + слабая скорость)\n"
+            "   8 - velocity_dirichlet (жёсткая скорость U_inf)"
         )
         _BOUNDARY_MAP = {'1': 'inlet', '2': 'outlet', '3': 'symmetry',
-                         '4': 'axis_symmetry', '5': 'wall'}
+                         '4': 'axis_symmetry', '5': 'wall',
+                         '6': 'farfield', '7': 'slip',
+                         '8': 'velocity_dirichlet'}
 
         print("\nТип ЛЕВОЙ границы (x = x_min):")
         print(_BOUNDARY_MENU)
-        left_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'inlet')
+        left_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-8): ").strip(), 'inlet')
 
         print("\nТип ПРАВОЙ границы (x = x_max):")
         print(_BOUNDARY_MENU)
-        right_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'outlet')
+        right_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-8): ").strip(), 'outlet')
 
         print("\nТип ВЕРХНЕЙ границы (y = y_max):")
         print(_BOUNDARY_MENU)
-        top_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'outlet')
+        top_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-8): ").strip(), 'outlet')
 
         print("\nТип НИЖНЕЙ границы (y = y_min):")
         print(_BOUNDARY_MENU)
-        bottom_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-5): ").strip(), 'symmetry')
+        bottom_boundary_type = _BOUNDARY_MAP.get(input("Выберите (1-8): ").strip(), 'symmetry')
 
         print("\nМетод генерации внутренних точек:")
         print("   1 - регулярный (равномерная сетка)")
         print("   2 - нерегулярный (равномерный случайный)")
         print("   3 - адаптивный (сгущение к профилю)")
         print("   4 - адаптивный (сгущение ко всем границам)")
-        method_choice = input("Выберите (1/2/3/4): ").strip()
+        print("   5 - нормально-слоевой (слои по нормалям к профилю)")
+        method_choice = input("Выберите (1/2/3/4/5): ").strip()
         method_map = {
             '1': 'regular',
             '2': 'irregular',
             '3': 'adaptive_foil',
-            '4': 'adaptive_all'
+            '4': 'adaptive_all',
+            '5': 'normal_layer',
         }
         sampling_method = method_map.get(method_choice, 'regular')
 
         adaptive_alpha = 1.0
         adaptive_epsilon_factor = 0.01
+        normal_layer_mode = "manual"
+        normal_layer_profile_step = step
+        normal_layer_first_height = max(step * 0.05, 1.0e-6)
+        normal_layer_y_plus = 1.0
+        normal_layer_re_chord = None
+        normal_layer_cf_model = "auto"
+        normal_layer_count = 14
+        normal_layer_growth_mode = "manual"
+        normal_layer_growth_ratio = 1.25
+        normal_layer_delta_mode = "estimated"
+        normal_layer_delta = None
+        normal_layer_open_sides = "both"
+        normal_layer_endpoint_skip = 0.0
+        normal_layer_min_point_distance_factor = 0.0
+        normal_layer_max_points = None
+        normal_layer_fill_remaining = True
+
         if sampling_method in ('adaptive_foil', 'adaptive_all'):
             print("\nДля адаптивных методов используются два параметра:")
             print("  - alpha (степень сгущения): чем больше, тем сильнее концентрация у границ.")
@@ -1888,6 +2239,75 @@ def S2DR() -> None:
             eps_input = input("epsilon_factor (по умолчанию 0.01): ").strip()
             if eps_input:
                 adaptive_epsilon_factor = float(eps_input)
+
+        if sampling_method == 'normal_layer':
+            unit_to_m = 0.001 if step_units == 'mm' else 1.0
+            print("\nНормально-слоевой сэмплинг строит точки только внутрь расчётной области.")
+            profile_step_input = input(f"Шаг точек вдоль профиля ({step_units}) [{step:g}]: ").strip()
+            if profile_step_input:
+                normal_layer_profile_step = float(profile_step_input)
+            normal_layer_profile_step *= unit_to_m
+
+            print("\nТолщина первого слоя:")
+            print("   1 - вручную")
+            print("   2 - по y+")
+            layer_mode_choice = input("Выберите (1/2): ").strip()
+            if layer_mode_choice == '2':
+                normal_layer_mode = "y_plus"
+                y_plus_input = input("Целевой y+ [1.0]: ").strip()
+                if y_plus_input:
+                    normal_layer_y_plus = float(y_plus_input)
+                re_input = input("Re по хорде (обязательно для y+) []: ").strip()
+                if not re_input:
+                    raise ValueError("Для режима y+ необходимо задать Re по хорде")
+                normal_layer_re_chord = float(re_input)
+                cf_model_input = input("Модель Cf (auto/laminar/turbulent) [auto]: ").strip().lower()
+                if cf_model_input in ('auto', 'laminar', 'turbulent'):
+                    normal_layer_cf_model = cf_model_input
+            else:
+                first_default = normal_layer_first_height
+                first_input = input(f"Толщина первого слоя ({step_units}) [{first_default:g}]: ").strip()
+                if first_input:
+                    normal_layer_first_height = float(first_input)
+                normal_layer_first_height *= unit_to_m
+
+            layers_input = input(f"Количество слоёв [{normal_layer_count}]: ").strip()
+            if layers_input:
+                normal_layer_count = int(layers_input)
+
+            print("\nКоэффициент роста слоёв:")
+            print("   1 - вручную")
+            print("   2 - рассчитать по оценке толщины пограничного слоя")
+            growth_choice = input("Выберите (1/2): ").strip()
+            if growth_choice == '2':
+                normal_layer_growth_mode = "boundary_layer_estimate"
+                if normal_layer_re_chord is None:
+                    re_input = input("Re по хорде для оценки delta []: ").strip()
+                    if re_input:
+                        normal_layer_re_chord = float(re_input)
+                delta_manual = input(f"Задать толщину погранслоя вручную ({step_units})? Enter - оценка: ").strip()
+                if delta_manual:
+                    normal_layer_delta_mode = "manual"
+                    normal_layer_delta = float(delta_manual) * unit_to_m
+            else:
+                growth_input = input(f"Коэффициент роста [{normal_layer_growth_ratio}]: ").strip()
+                if growth_input:
+                    normal_layer_growth_ratio = float(growth_input)
+
+            sides_input = input("Стороны разомкнутого профиля (both/upper/lower/auto) [both]: ").strip().lower()
+            if sides_input in ('both', 'upper', 'lower', 'auto', 'positive', 'negative'):
+                normal_layer_open_sides = sides_input
+
+            endpoint_input = input(f"Отступ от концов разомкнутого профиля ({step_units}) [0]: ").strip()
+            if endpoint_input:
+                normal_layer_endpoint_skip = float(endpoint_input) * unit_to_m
+
+            max_points_input = input("Максимум normal-layer точек (Enter - без ограничения): ").strip()
+            if max_points_input:
+                normal_layer_max_points = int(max_points_input)
+
+            fill_input = input("Добрать дальнее поле случайными interior-точками? (Y/n): ").strip().lower()
+            normal_layer_fill_remaining = fill_input == '' or fill_input in ('y', 'yes')
 
         use_mp_input = input("\nИспользовать многопроцессорность? (Y/n): ").strip().lower()
         use_mp = use_mp_input == '' or use_mp_input in ('y', 'yes')
@@ -1908,6 +2328,22 @@ def S2DR() -> None:
             sampling_method=sampling_method,
             adaptive_alpha=adaptive_alpha,
             adaptive_epsilon_factor=adaptive_epsilon_factor,
+            normal_layer_mode=normal_layer_mode,
+            normal_layer_profile_step=normal_layer_profile_step,
+            normal_layer_first_height=normal_layer_first_height,
+            normal_layer_y_plus=normal_layer_y_plus,
+            normal_layer_re_chord=normal_layer_re_chord,
+            normal_layer_cf_model=normal_layer_cf_model,
+            normal_layer_count=normal_layer_count,
+            normal_layer_growth_mode=normal_layer_growth_mode,
+            normal_layer_growth_ratio=normal_layer_growth_ratio,
+            normal_layer_delta_mode=normal_layer_delta_mode,
+            normal_layer_delta=normal_layer_delta,
+            normal_layer_open_sides=normal_layer_open_sides,
+            normal_layer_endpoint_skip=normal_layer_endpoint_skip,
+            normal_layer_min_point_distance_factor=normal_layer_min_point_distance_factor,
+            normal_layer_max_points=normal_layer_max_points,
+            normal_layer_fill_remaining=normal_layer_fill_remaining,
             geom_name=selected_geom,
         )
 

@@ -192,7 +192,7 @@ class SamplerConfigDict(TypedDict, total=False):
         right_boundary_type: Тип правой границы (x=x_max)
         top_boundary_type: Тип верхней границы (y=y_max)
         bottom_boundary_type: Тип нижней границы (y=y_min)
-        sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all')
+        sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all', 'normal_layer')
         adaptive_alpha: Степень сгущения (для адаптивных методов)
         adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
     """
@@ -212,9 +212,27 @@ class SamplerConfigDict(TypedDict, total=False):
     right_boundary_type: str
     top_boundary_type: str
     bottom_boundary_type: str
-    sampling_method: Literal['regular', 'irregular', 'adaptive_foil', 'adaptive_all']
+    sampling_method: Literal['regular', 'irregular', 'adaptive_foil', 'adaptive_all', 'normal_layer']
     adaptive_alpha: float
     adaptive_epsilon_factor: float
+    normal_layer_mode: str
+    normal_layer_profile_step: float
+    normal_layer_first_height: float
+    normal_layer_y_plus: float
+    normal_layer_re_chord: Optional[float]
+    normal_layer_cf_model: str
+    normal_layer_count: int
+    normal_layer_growth_mode: str
+    normal_layer_growth_ratio: float
+    normal_layer_delta_mode: str
+    normal_layer_delta: Optional[float]
+    normal_layer_use_eta_levels: bool
+    normal_layer_eta_levels: Optional[Tuple[float, ...]]
+    normal_layer_open_sides: str
+    normal_layer_endpoint_skip: float
+    normal_layer_min_point_distance_factor: float
+    normal_layer_max_points: Optional[int]
+    normal_layer_fill_remaining: bool
 
 
 # =============================================================================
@@ -399,6 +417,15 @@ class LossWeightsConfigDict(TypedDict, total=False):
     sa_apply_to_bc: bool
     integral_condition: bool
     integral_weight: float
+    fvm: 'FVMLossConfigDict'
+
+
+class FVMLossConfigDict(TypedDict, total=False):
+    """FVM mass-loss configuration."""
+    enabled: bool
+    weight: float
+    batch_interval: int
+    reduction: str
 
 
 class TrainingConfigDict(TypedDict, total=False):
@@ -456,6 +483,10 @@ class CheckpointConfigDict(TypedDict, total=False):
     interval: int
     name_pattern: str
     model_name_pattern: str
+    save_flow_images: bool
+    save_flow_npy: bool
+    flow_plot_physical: bool
+    flow_plot_subdir: str
 
 
 class ProcessConfigDict(TypedDict, total=False):
@@ -604,6 +635,7 @@ __all__ = [
     'PDEConfigDict',
     'BoundaryConditionsConfigDict',
     'LossWeightsConfigDict',
+    'FVMLossConfigDict',
     'TrainingConfigDict',
     'EarlyStoppingDict',
     'OutputConfigDict',

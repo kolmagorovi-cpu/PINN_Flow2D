@@ -240,6 +240,7 @@ class Trainer:
             )
         else:
             u, v, p = u_raw, v_raw, p_raw
+        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
 
         # Вычисление невязок PDE
         res = self.loss_computer.compute_pde_residuals(u, v, p, x, y)
@@ -356,14 +357,18 @@ class Trainer:
                 x_fvm, y_fvm, sdf_fvm, bt_fvm = self._get_fvm_tensors()
                 inp_fvm  = self.loss_computer.build_input_tensor(x_fvm, y_fvm, sdf_fvm, bt_fvm)
                 out_fvm  = self.model(inp_fvm)
+                u_fvm, v_fvm, p_fvm = out_fvm[:, 0:1], out_fvm[:, 1:2], out_fvm[:, 2:3]
                 if self.loss_computer.bc_type == 'hard' and bt_fvm is not None:
                     u_fvm, v_fvm, p_fvm = self._apply_hard_constraints_from_boundary_types(
-                        out_fvm[:, 0:1],
-                        out_fvm[:, 1:2],
-                        out_fvm[:, 2:3],
+                        u_fvm,
+                        v_fvm,
+                        p_fvm,
                         bt_fvm,
                     )
-                    out_fvm = torch.cat([u_fvm, v_fvm, p_fvm], dim=1)
+                u_fvm, v_fvm = self.loss_computer.apply_velocity_dirichlet_constraint(
+                    u_fvm, v_fvm, bt_fvm
+                )
+                out_fvm = torch.cat([u_fvm, v_fvm, p_fvm], dim=1)
             else:
                 logger.warning("FVM/integral: fvm-тензоры не подготовлены, глобальный сеточный проход пропущен.")
 
@@ -481,7 +486,7 @@ class Trainer:
             if not bool(mask.any()):
                 continue
 
-            if name == 'inlet':
+            if name in ('inlet', 'farfield', 'velocity_dirichlet'):
                 point_loss = (
                     (u - self.data_handler.inlet_u_norm) ** 2
                     + (v - self.data_handler.inlet_v_norm) ** 2
@@ -490,6 +495,8 @@ class Trainer:
                 point_loss = p ** 2
             elif name == 'wall':
                 point_loss = u ** 2 + v ** 2
+            elif name == 'slip':
+                point_loss = (v - self.data_handler.inlet_v_norm) ** 2
             elif name == 'symmetry':
                 point_loss = v ** 2
             elif name == 'axis_symmetry':
@@ -523,7 +530,7 @@ class Trainer:
             if not bool(mask.any()):
                 continue
 
-            if name == 'inlet':
+            if name in ('inlet', 'velocity_dirichlet'):
                 u = torch.where(mask, torch.ones_like(u) * self.data_handler.inlet_u_norm, u)
                 v = torch.where(mask, torch.ones_like(v) * self.data_handler.inlet_v_norm, v)
             elif name == 'outlet':
@@ -619,7 +626,7 @@ class Trainer:
 
             point_loss = torch.zeros_like(u)
             extra_point_loss = torch.zeros_like(u)
-            if name == 'inlet':
+            if name in ('inlet', 'farfield', 'velocity_dirichlet'):
                 point_loss = (
                     (u - self.data_handler.inlet_u_norm) ** 2
                     + (v - self.data_handler.inlet_v_norm) ** 2
@@ -628,6 +635,55 @@ class Trainer:
                 point_loss = p ** 2
             elif name == 'wall':
                 point_loss = u ** 2 + v ** 2
+            elif name == 'slip':
+                tol = getattr(self.loss_computer, 'tol', 1e-6)
+                x_min = getattr(self.loss_computer, 'x_min', 0.0)
+                x_max = getattr(self.loss_computer, 'x_max', 0.0)
+                y_min = getattr(self.loss_computer, 'y_min', 0.0)
+                y_max = getattr(self.loss_computer, 'y_max', 0.0)
+                left = mask & (x <= x_min + tol)
+                right = mask & (x >= x_max - tol)
+                bottom = mask & (y <= y_min + tol)
+                top = mask & (y >= y_max - tol)
+                vertical = left | right
+                horizontal = bottom | top
+                if bool(horizontal.any()) or bool(vertical.any()):
+                    point_loss = torch.where(
+                        horizontal,
+                        (v - self.data_handler.inlet_v_norm) ** 2,
+                        point_loss,
+                    )
+                    point_loss = torch.where(
+                        vertical,
+                        (u - self.data_handler.inlet_u_norm) ** 2,
+                        point_loss,
+                    )
+                    slip_velocity = self.loss_computer.loss_weights.get('slip_velocity', 0.1)
+                    slip_tangent_grad = self.loss_computer.loss_weights.get('slip_tangent_grad', 1.0)
+                    if bool(horizontal.any()):
+                        du_dy = self._grad(u, y, create_graph=True, silent=True)
+                        extra_point_loss = torch.where(
+                            horizontal,
+                            extra_point_loss + slip_tangent_grad * du_dy ** 2
+                            + slip_velocity * (u - self.data_handler.inlet_u_norm) ** 2,
+                            extra_point_loss,
+                        )
+                    if bool(vertical.any()):
+                        dv_dx = self._grad(v, x, create_graph=True, silent=True)
+                        extra_point_loss = torch.where(
+                            vertical,
+                            extra_point_loss + slip_tangent_grad * dv_dx ** 2
+                            + slip_velocity * (v - self.data_handler.inlet_v_norm) ** 2,
+                            extra_point_loss,
+                        )
+                else:
+                    point_loss = (v - self.data_handler.inlet_v_norm) ** 2
+                    du_dy = self._grad(u, y, create_graph=True, silent=True)
+                    extra_point_loss = (
+                        self.loss_computer.loss_weights.get('slip_tangent_grad', 1.0) * du_dy ** 2
+                        + self.loss_computer.loss_weights.get('slip_velocity', 0.1)
+                        * (u - self.data_handler.inlet_u_norm) ** 2
+                    )
             elif name == 'symmetry':
                 # create_graph=True keeps the training graph intact for the
                 # subsequent total_loss.backward().
@@ -808,6 +864,7 @@ class Trainer:
                     )
                 else:
                     u, v, p = u_raw, v_raw, p_raw
+                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -1351,16 +1408,22 @@ class Trainer:
             mesh = self.data_handler.build_mesh_from_current_points(verbose=False)
             self.data_handler.set_mesh_from_mesh2d(mesh)
             self.loss_computer.fvm.rebuild_from_mesh(mesh)
-            self.loss_computer.fvm.set_inlet_velocity(
-                torch.tensor(
-                    [
-                        getattr(self.data_handler, 'inlet_u_norm', 1.0),
-                        getattr(self.data_handler, 'inlet_v_norm', 0.0),
-                    ],
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+            velocity_bc = torch.tensor(
+                [
+                    getattr(self.data_handler, 'inlet_u_norm', 1.0),
+                    getattr(self.data_handler, 'inlet_v_norm', 0.0),
+                ],
+                dtype=self.dtype,
+                device=self.device,
             )
+            self.loss_computer.fvm.set_inlet_velocity(velocity_bc)
+            try:
+                from airfoil_pinn.physics.fvm import BC_CODES
+                code = BC_CODES.get('velocity_dirichlet')
+                if code is not None and bool((self.loss_computer.fvm.bnd_type == code).any()):
+                    self.loss_computer.fvm.set_bc_velocity('velocity_dirichlet', velocity_bc)
+            except Exception:
+                logger.debug("Adaptive RAR: velocity_dirichlet не задан для FVM.", exc_info=True)
             self._fvm_tensor_cache = None
             self._rar_new_points_since_fvm = 0
             self._save_rar_mesh_volume_plot(mesh)
@@ -1457,6 +1520,7 @@ class Trainer:
             )
         else:
             u, v = u_raw, v_raw
+        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
 
         return self.loss_computer.compute_integral_loss(u, v, bt, x, y)
 

@@ -294,6 +294,7 @@ class MetricsCollector:
 
         if self.loss_computer.bc_type == 'hard' and bt is not None:
             u, v = self._apply_hard_velocity_constraints(u, v, bt)
+        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
         return torch.cat([u, v], dim=1)
 
     def _apply_hard_velocity_constraints(
@@ -311,7 +312,7 @@ class MetricsCollector:
             mask = bt[:, idx].view(-1, 1) > 0.5
             if not bool(mask.any()):
                 continue
-            if name == 'inlet':
+            if name in ('inlet', 'velocity_dirichlet'):
                 u = torch.where(mask, torch.ones_like(u) * self.data_handler.inlet_u_norm, u)
                 v = torch.where(mask, torch.ones_like(v) * self.data_handler.inlet_v_norm, v)
             elif name == 'wall':
@@ -400,6 +401,7 @@ class MetricsCollector:
                 v = out[:, 1:2]
                 if self.loss_computer.bc_type == 'hard':
                     u, v = self._apply_hard_velocity_constraints(u, v, bt)
+                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
 
                 if 'inlet' in self.data_handler.boundary_type_names:
                     inlet_idx = self.data_handler.boundary_type_names.index('inlet')
@@ -778,6 +780,9 @@ class MetricsCollector:
                         )
                     else:
                         u_pred_t, v_pred_t, p_pred_t = u_raw, v_raw, p_raw
+                    u_pred_t, v_pred_t = self.loss_computer.apply_velocity_dirichlet_constraint(
+                        u_pred_t, v_pred_t, bt
+                    )
 
                     p_dyn = 0.5 * self.data_handler.rho * self.data_handler.U_inf ** 2
                     u_pred = (u_pred_t * self.data_handler.U_inf).cpu().numpy().flatten()

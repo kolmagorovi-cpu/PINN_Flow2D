@@ -43,10 +43,14 @@ BC_CODES: Dict[str, int] = {
     'symmetry':      3,
     'axis_symmetry': 4,
     'interior':      5,
+    'farfield':      6,
+    'slip':          7,
+    'velocity_dirichlet': 8,
 }
 _WALL_CODE: int          = BC_CODES['wall']
 _SYMMETRY_CODE: int      = BC_CODES['symmetry']
 _AXIS_SYMMETRY_CODE: int = BC_CODES['axis_symmetry']
+_SLIP_CODE: int          = BC_CODES['slip']
 
 # Нижняя граница объёма КО — защита от деления на ноль при вырожденной сетке.
 # Значение много меньше любого физически реального объёма (< 1e-10 м²).
@@ -136,6 +140,7 @@ class FVMResiduals:
                 (self.bnd_type == _WALL_CODE)
                 | (self.bnd_type == _SYMMETRY_CODE)
                 | (self.bnd_type == _AXIS_SYMMETRY_CODE)
+                | (self.bnd_type == _SLIP_CODE)
             ).unsqueeze(1)                                   # (B, 1)
         else:
             self._zero_flux_mask = torch.zeros(0, 1, dtype=torch.bool)
@@ -253,7 +258,7 @@ class FVMResiduals:
         """
         return self._compute_residual(u, apply_boundary_conditions=True)
 
-    def mass_loss(self, u: torch.Tensor) -> torch.Tensor:
+    def mass_loss(self, u: torch.Tensor, reduction: str = "legacy") -> torch.Tensor:
         """
         Среднеквадратичная невязка (скаляр), готовая для сложения с total_loss.
 
@@ -265,7 +270,35 @@ class FVMResiduals:
         Возвращает:
             Скалярный тензор потерь
         """
-        return torch.mean(self.compute_residual(u) ** 2)
+        residual = self.compute_residual(u)
+        mode = str(reduction or "legacy").strip().lower().replace("-", "_")
+
+        volumes = self.V.to(device=residual.device, dtype=residual.dtype)
+        denom = torch.clamp(volumes.sum(), min=torch.finfo(residual.dtype).tiny)
+        # residual is Phi_i / V_i. For finite-volume mass balance we penalize
+        # the face-flux imbalance Phi_i, not the divergence-like residual itself.
+        flux_balance = residual * volumes
+
+        if mode in {"legacy", "mean", "node_mean", "unweighted"}:
+            return torch.mean(residual ** 2)
+
+        if mode in {"volume", "volume_weighted", "cell_volume"}:
+            return torch.sum(flux_balance ** 2) / denom
+
+        if mode in {"flux", "flux_volume", "flux_weighted", "balance"}:
+            return torch.sum(flux_balance ** 2) / denom
+
+        if mode in {"flux_mean", "mean_flux"}:
+            return torch.mean(flux_balance ** 2)
+
+        if mode in {"divergence_volume", "divergence_volume_weighted", "old_volume_weighted"}:
+            return torch.sum(volumes * residual ** 2) / denom
+
+        raise ValueError(
+            "FVMResiduals.mass_loss: unknown reduction "
+            f"{reduction!r}. Use 'legacy', 'volume_weighted', 'flux', "
+            "'flux_mean', or 'divergence_volume_weighted'."
+        )
 
     # ── Вспомогательные методы ────────────────────────────────────────────────
 

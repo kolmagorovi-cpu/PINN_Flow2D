@@ -76,6 +76,12 @@ class ConfigManager:
                 'bc_weights': {
                     'inlet': 1.0,
                     'outlet': 1.0,
+                    'outlet_grad': 1.0,
+                    'farfield': 1.0,
+                    'slip': 1.0,
+                    'slip_tangent_grad': 1.0,
+                    'slip_velocity': 0.1,
+                    'velocity_dirichlet': 1.0,
                     'wall': 1.0,
                     'symmetry': 1.0,
                     'axis_symmetry': 1.0,
@@ -91,6 +97,7 @@ class ConfigManager:
                     'enabled': False,
                     'weight': 1.0,
                     'batch_interval': 1,
+                    'reduction': 'volume_weighted',
                 },
             },
             'training': {
@@ -176,6 +183,10 @@ class ConfigManager:
                 'interval': 500,
                 'name_pattern': '{project_name}_{timestamp}',
                 'model_name_pattern': '{project_name}_{timestamp}',
+                'save_flow_images': True,
+                'save_flow_npy': False,
+                'flow_plot_physical': False,
+                'flow_plot_subdir': 'flow',
             },
             'process': {
                 'load_model_path': None,
@@ -360,7 +371,11 @@ class ConfigManager:
         fvm_enabled = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
         fvm_weight = fvm_cfg.get('weight', 1.0) if isinstance(fvm_cfg, dict) else float(fvm_cfg)
         fvm_bi = fvm_cfg.get('batch_interval', 1) if isinstance(fvm_cfg, dict) else 1
-        print(f"  fvm_mass_flow   : {fvm_enabled} (weight={fvm_weight}, batch_interval={fvm_bi})")
+        fvm_red = fvm_cfg.get('reduction', 'legacy') if isinstance(fvm_cfg, dict) else 'legacy'
+        print(
+            f"  fvm_mass_flow   : {fvm_enabled} "
+            f"(weight={fvm_weight}, batch_interval={fvm_bi}, reduction={fvm_red})"
+        )
         print()
 
         tr = self.config['training']
@@ -420,6 +435,10 @@ class ConfigManager:
         print(f"  interval       : {ck['interval']}")
         print(f"  name_pattern   : {ck['name_pattern']}")
         print(f"  model_name_pattern: {ck['model_name_pattern']}")
+        print(f"  save_flow_images: {ck.get('save_flow_images', True)}")
+        print(f"  save_flow_npy  : {ck.get('save_flow_npy', False)}")
+        print(f"  flow_plot_physical: {ck.get('flow_plot_physical', False)}")
+        print(f"  flow_plot_subdir: {ck.get('flow_plot_subdir', 'flow')}")
         print()
 
         proc = self.config['process']

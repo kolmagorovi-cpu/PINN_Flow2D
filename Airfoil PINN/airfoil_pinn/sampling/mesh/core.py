@@ -709,10 +709,13 @@ class Mesh2D:
         Args:
             sampler: экземпляр CollocationPoints после generate_all_points()
         """
+        mesh_foil_coords = getattr(sampler, "mesh_foil_coords", None)
+        if mesh_foil_coords is None:
+            mesh_foil_coords = getattr(sampler, "foil_coords", None)
         return cls(
             sampler.points,
             domain_coords=getattr(sampler, "domain_coords", None),
-            airfoil_coords=getattr(sampler, "foil_coords", None),
+            airfoil_coords=mesh_foil_coords,
             **kwargs,
         )
 
@@ -1034,6 +1037,8 @@ class Mesh2D:
 
         _bc_colors = {
             "inlet": "blue", "outlet": "cyan", "wall": "red",
+            "farfield": "navy", "slip": "orange",
+            "velocity_dirichlet": "dodgerblue",
             "symmetry": "purple", "axis_symmetry": "magenta", "interior": "green",
         }
         by_key: Dict[str, list] = {}
@@ -1218,6 +1223,9 @@ class Mesh2D:
             "_domain": 1,
             "outlet": 2,
             "inlet": 2,
+            "farfield": 2,
+            "slip": 2,
+            "velocity_dirichlet": 2,
             "symmetry": 2,
             "axis_symmetry": 2,
             "wall": 3,
@@ -1325,11 +1333,9 @@ class Mesh2D:
         boundary_refs: List[np.ndarray] = []
         if self._domain_coords is not None and len(self._domain_coords) >= 2:
             boundary_refs.append(np.asarray(self._domain_coords, dtype=np.float64))
-        if self._airfoil_coords is not None and len(self._airfoil_coords) >= 2:
-            boundary_refs.append(np.asarray(self._airfoil_coords, dtype=np.float64))
 
         raw_boundary = np.array(
-            [[float(p.x), float(p.y)] for p in self._raw_points if p.on_boundary],
+            [[float(p.x), float(p.y)] for p in self._raw_points if p.on_boundary and not p.on_airfoil],
             dtype=np.float64,
         )
         if len(raw_boundary) >= 2:
@@ -1340,33 +1346,7 @@ class Mesh2D:
             boundary_step = float(np.median(_bdist[:, 1]))
         else:
             boundary_step = 1.0
-        airfoil_ref = (
-            np.asarray(self._airfoil_coords, dtype=np.float64)
-            if self._airfoil_coords is not None and len(self._airfoil_coords) >= 2
-            else None
-        )
-        raw_airfoil = np.array(
-            [[float(p.x), float(p.y)] for p in self._raw_points if p.on_airfoil],
-            dtype=np.float64,
-        )
-        if len(raw_airfoil) >= 2:
-            raw_airfoil = np.unique(np.round(raw_airfoil, decimals=12), axis=0)
-        if len(raw_airfoil) >= 2:
-            _atree = cKDTree(raw_airfoil)
-            _adist, _ = _atree.query(raw_airfoil, k=2)
-            airfoil_step = float(np.median(_adist[:, 1]))
-        elif airfoil_ref is not None and len(airfoil_ref) >= 2:
-            _seg = np.linalg.norm(np.diff(airfoil_ref, axis=0), axis=1)
-            _seg = _seg[_seg > EPS]
-            airfoil_step = float(np.median(_seg)) if len(_seg) else boundary_step
-        else:
-            airfoil_step = boundary_step
-
         near_boundary_tol = max(EPS * 10.0, boundary_step * 0.02)
-        # Boundary-layer RAR deliberately adds interior points close to the wall.
-        # Keep only a near-duplicate guard here; a wider exclusion erases the first eta layers.
-        near_airfoil_tol = max(EPS * 10.0, airfoil_step * 0.02)
-
         def _point_to_chain_distance(xy: np.ndarray, ref: np.ndarray) -> float:
             best = float("inf")
             for i_ref in range(len(ref) - 1):
@@ -1392,18 +1372,10 @@ class Mesh2D:
 
         n_merged = 0
         n_skipped_near_boundary = 0
-        n_skipped_near_airfoil = 0
         for p in self._raw_points:
             bt = p.boundary_type.value if hasattr(p.boundary_type, "value") else str(p.boundary_type)
             nt = "boundary" if p.on_boundary else "interior"
             xy = np.array([float(p.x), float(p.y)], dtype=np.float64)
-            if (
-                nt == "interior"
-                and airfoil_ref is not None
-                and _point_to_chain_distance(xy, airfoil_ref) <= near_airfoil_tol
-            ):
-                n_skipped_near_airfoil += 1
-                continue
             if (
                 nt == "interior"
                 and boundary_refs
@@ -1428,11 +1400,6 @@ class Mesh2D:
             logger.info(
                 "Mesh2D: skipped %d interior points closer than %.3e m to a boundary",
                 n_skipped_near_boundary, near_boundary_tol,
-            )
-        if n_skipped_near_airfoil:
-            logger.info(
-                "Mesh2D: skipped %d interior points closer than %.3e m to the airfoil",
-                n_skipped_near_airfoil, near_airfoil_tol,
             )
 
         self._domain_idx = []
@@ -1932,10 +1899,17 @@ class Mesh2D:
             except Exception:
                 foil_seed = np.mean(np.asarray(self._airfoil_coords, dtype=np.float64), axis=0)
             tris_ff = _flood_fill_remove(tris, self._coords, [foil_seed], foil_ce)
-            if len(tris_ff) == 0 and len(tris) > 0:
+            removed_ff = n_before - len(tris_ff)
+            # If the constrained foil loop is even slightly open, flood-fill can leak
+            # through the airfoil and mark almost the whole domain as a hole. In that
+            # case keep the CDT triangles and let the geometric Shapely filter below
+            # remove only centroids that are really inside the foil.
+            leak_like = len(tris) > 0 and removed_ff / max(1, n_before) > 0.95
+            if (len(tris_ff) == 0 and len(tris) > 0) or leak_like:
                 logger.warning(
-                    "Hole removal (flood-fill, профиль): удалил все треугольники; "
+                    "Hole removal (flood-fill, профиль): удалил %.1f%% треугольников; "
                     "оставляю исходную триангуляцию для Shapely-фильтрации"
+                    % (100.0 * removed_ff / max(1, n_before))
                 )
             else:
                 tris = tris_ff

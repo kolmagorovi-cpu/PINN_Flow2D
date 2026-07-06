@@ -61,6 +61,32 @@ def test_fvm_checks(handler: DataHandler) -> None:
     residual = fvm.compute_residual(zeros)
     assert residual.shape == (fvm.N,)
     assert torch.isfinite(residual).all()
+    assert torch.isfinite(fvm.mass_loss(zeros, reduction="legacy"))
+    assert torch.isfinite(fvm.mass_loss(zeros, reduction="volume_weighted"))
+    assert torch.isfinite(fvm.mass_loss(zeros, reduction="flux"))
+    volumes = fvm.V.to(device=residual.device, dtype=residual.dtype)
+    flux_balance = residual * volumes
+    flux_volume_loss = torch.sum(flux_balance ** 2) / torch.clamp(
+        volumes.sum(),
+        min=torch.finfo(residual.dtype).tiny,
+    )
+    old_divergence_volume_loss = torch.sum(volumes * residual ** 2) / torch.clamp(
+        volumes.sum(),
+        min=torch.finfo(residual.dtype).tiny,
+    )
+    assert torch.allclose(
+        fvm.mass_loss(zeros, reduction="volume_weighted"),
+        flux_volume_loss,
+    )
+    assert torch.allclose(fvm.mass_loss(zeros, reduction="flux"), flux_volume_loss)
+    assert torch.allclose(
+        fvm.mass_loss(zeros, reduction="flux_mean"),
+        torch.mean(flux_balance ** 2),
+    )
+    assert torch.allclose(
+        fvm.mass_loss(zeros, reduction="divergence_volume_weighted"),
+        old_divergence_volume_loss,
+    )
 
     if torch.cuda.is_available():
         fvm_cuda = FVMResiduals.from_mesh_data(handler.mesh_data).to("cuda", dtype=torch.float32)

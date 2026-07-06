@@ -245,10 +245,10 @@ class PINNDataset(Dataset):
             for i, bt in enumerate(data['boundary_type']):
                 bt_str = str(bt).lower()
 
-                if bt_str == 'inlet':
+                if bt_str in ('inlet', 'velocity_dirichlet'):
                     self.mask_u_fixed[i] = True
                     self.mask_v_fixed[i] = True
-                    # u_bc/v_bc для inlet остаются 0 до вызова set_inlet_values() из DataHandler
+                    # u_bc/v_bc остаются 0 до вызова set_inlet_values() из DataHandler
 
                 elif bt_str == 'outlet':
                     self.mask_p_fixed[i] = True
@@ -296,18 +296,28 @@ class PINNDataset(Dataset):
             logger.warning("Нет информации о границах, невозможно установить значения на inlet.")
             return
 
-        inlet_idx = self.type_to_idx.get('inlet')
-        if inlet_idx is None:
-            logger.warning("Тип 'inlet' отсутствует в данных.")
-            return
+        target_types = ('inlet', 'farfield', 'velocity_dirichlet')
+        applied = False
+        for type_name in target_types:
+            type_idx = self.type_to_idx.get(type_name)
+            if type_idx is None:
+                continue
 
-        if inlet_idx >= self.boundary_types.shape[1]:
-            logger.error(f"Индекс inlet ({inlet_idx}) выходит за пределы размерности boundary_types ({self.boundary_types.shape[1]})")
-            return
+            if type_idx >= self.boundary_types.shape[1]:
+                logger.error(
+                    f"Индекс {type_name} ({type_idx}) выходит за пределы "
+                    f"размерности boundary_types ({self.boundary_types.shape[1]})"
+                )
+                continue
 
-        mask = self.boundary_types[:, inlet_idx] > 0.5
-        self.u_bc[mask] = u_norm
-        self.v_bc[mask] = v_norm
+            mask = self.boundary_types[:, type_idx] > 0.5
+            if bool(mask.any()):
+                self.u_bc[mask] = u_norm
+                self.v_bc[mask] = v_norm
+                applied = True
+
+        if not applied:
+            logger.warning("Типы 'inlet/farfield/velocity_dirichlet' отсутствуют в данных.")
 
     def __len__(self) -> int:
         """

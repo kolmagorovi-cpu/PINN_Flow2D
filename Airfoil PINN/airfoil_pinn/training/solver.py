@@ -448,14 +448,16 @@ class PINNSolver:
             return
 
         try:
-            from airfoil_pinn.physics.fvm import FVMResiduals
+            from airfoil_pinn.physics.fvm import BC_CODES, FVMResiduals
             fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
             fvm.to(self.device, dtype=self.dtype)
             inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
             inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
-            fvm.set_inlet_velocity(
-                torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
-            )
+            velocity_bc = torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
+            fvm.set_inlet_velocity(velocity_bc)
+            code = BC_CODES.get('velocity_dirichlet')
+            if code is not None and bool((fvm.bnd_type == code).any()):
+                fvm.set_bc_velocity('velocity_dirichlet', velocity_bc)
             self.loss_computer.fvm = fvm
             logger.info("FVMResiduals подключён: %d узлов", fvm.N)
         except Exception as e:
@@ -618,6 +620,46 @@ class PINNSolver:
             }
         )
 
+    def _save_checkpoint_flow_images(self, identifier: Union[int, str]) -> None:
+        """Saves predicted flow-field maps next to periodic checkpoints."""
+        checkpoint_cfg = self.config.get('checkpoint', {})
+        if not checkpoint_cfg.get('save_flow_images', True):
+            return
+
+        try:
+            pred_norm = self._get_predictions_norm()
+            plots_subdir = str(checkpoint_cfg.get('flow_plot_subdir', 'flow') or 'flow')
+            savedir = os.path.join(self._get_plots_dir(), plots_subdir)
+
+            def as_column_tensor(name: str) -> torch.Tensor:
+                return torch.from_numpy(pred_norm[name]).reshape(-1, 1)
+
+            dataset = self.data_handler.dataset
+            boundary_types = getattr(dataset, 'boundary_types', None)
+            self.visualizer.plot_final_fields_from_tensors(
+                as_column_tensor('u_norm'),
+                as_column_tensor('v_norm'),
+                as_column_tensor('p_norm'),
+                as_column_tensor('x_norm'),
+                as_column_tensor('y_norm'),
+                self.data_handler,
+                savedir,
+                identifier,
+                boundary_types=boundary_types,
+                boundary_type_names=self.data_handler.boundary_type_names,
+                save_npy=bool(checkpoint_cfg.get('save_flow_npy', False)),
+                plot_physical=bool(checkpoint_cfg.get('flow_plot_physical', False)),
+                config=self.config,
+            )
+            logger.info("Картины потока для чекпоинта %s сохранены в %s", identifier, savedir)
+        except Exception as exc:
+            logger.warning(
+                "Не удалось сохранить картины потока для чекпоинта %s: %s",
+                identifier,
+                exc,
+                exc_info=True,
+            )
+
     # ------------------------------------------------------------------
     # Диагностическая процедура
     # ------------------------------------------------------------------
@@ -779,6 +821,7 @@ class PINNSolver:
                     )
                 else:
                     u, v, p = u_raw, v_raw, p_raw
+                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -950,6 +993,7 @@ class PINNSolver:
                 if checkpoint_interval > 0 and epoch % checkpoint_interval == 0:
                     self._save_checkpoint(epoch)
                     self.visualizer.save_plots(self._get_plots_dir(), epoch)
+                    self._save_checkpoint_flow_images(epoch)
 
                 # Диагностика
                 if epoch % self.diagnostics_interval == 0:

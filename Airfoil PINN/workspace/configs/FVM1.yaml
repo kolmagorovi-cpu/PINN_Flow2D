@@ -64,14 +64,21 @@ loss_weights:
   bc_weights:
     axis_symmetry: 1.0
     axis_symmetry_grad: 1.0
+    farfield: 1.0
     inlet: 100.0
     outlet: 1.0
+    outlet_grad: 1.0
+    slip: 1.0
+    slip_tangent_grad: 1.0
+    slip_velocity: 0.1
     symmetry: 1.0
     symmetry_grad: 1.0
+    velocity_dirichlet: 1.0
     wall: 1.0
   fvm:
     batch_interval: 1
     enabled: true
+    reduction: volume_weighted
     weight: 25.0
   integral_condition: false
   integral_weight: 0.0
@@ -112,7 +119,7 @@ training:
   batch_size: 1000
   boundary_rar:
     alpha: 1.5
-    contour_samples: 300
+    contour_samples: 1000
     delta_max: 5.0
     delta_mode: estimated
     enabled: true
@@ -135,9 +142,9 @@ training:
     - 2.0
     - 3.0
     - 5.0
-    fraction: 0.1
+    fraction: 0.4
     min_distance_factor: 0.02
-    num_points: null
+    num_points: 2500
     score_batch_size: 2048
     uniform_contour_weight: 0.5
   early_stopping:
@@ -161,7 +168,7 @@ training:
   lr_detector_recovery: 50
   lr_schedule: constant
   rar_candidate_multiplier: 12
-  rar_enable: true
+  rar_enable: false
   rar_error_quantile: 0.75
   rar_fvm_min_new_points: 1
   rar_fvm_rebuild_every: 1
