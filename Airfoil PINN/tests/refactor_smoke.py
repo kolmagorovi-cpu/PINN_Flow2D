@@ -39,7 +39,8 @@ def _input_dim(cfg: dict, handler: DataHandler) -> int:
         dim += 2
     if inp.get("sdf", True):
         dim += 1
-    dim += len(handler.boundary_type_names)
+    if inp.get("boundary_types", True):
+        dim += len(handler.boundary_type_names)
     if inp.get("inlet_velocity", False):
         dim += 2
     if inp.get("viscosity", False):
@@ -47,6 +48,65 @@ def _input_dim(cfg: dict, handler: DataHandler) -> int:
     if inp.get("density", False):
         dim += 1
     return dim
+
+
+def _make_loss_computer_for_input_flag(boundary_types_enabled: bool) -> LossComputer:
+    """Creates a minimal LossComputer to test input assembly without loading a dataset."""
+    device = torch.device("cpu")
+    dtype = torch.float32
+    cfg = {
+        "input_params": {
+            "coordinates": True,
+            "sdf": True,
+            "boundary_types": boundary_types_enabled,
+            "inlet_velocity": False,
+            "viscosity": False,
+            "density": False,
+        },
+        "pde": {"flow_type": "2d", "system": "incompressible_navier_stokes"},
+        "boundary_conditions": {"type": "soft"},
+        "loss_weights": {
+            "pde_weights": {"cont": 1.0, "mom_x": 1.0, "mom_y": 1.0},
+            "bc_weights": {"wall": 1.0, "inlet": 1.0, "outlet": 1.0},
+            "use_sa_weights": False,
+            "sa_apply_to_bc": False,
+            "adaptive_bc": False,
+            "integral_condition": False,
+            "integral_weight": 0.0,
+            "fvm": {"enabled": False, "weight": 0.0},
+        },
+        "diagnostics": {"strict_autograd": True},
+    }
+    handler = SimpleNamespace(
+        inlet_u_norm=1.0,
+        inlet_v_norm=0.0,
+        boundary_type_names=["inlet", "wall", "interior"],
+    )
+    return LossComputer(
+        config=cfg,
+        data_handler=handler,
+        rho_norm=torch.tensor(1.0, device=device, dtype=dtype),
+        mu_norm=torch.tensor(1.0, device=device, dtype=dtype),
+        x_min=-1.0,
+        x_max=1.0,
+        y_min=-1.0,
+        y_max=1.0,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def test_boundary_types_optional_model_input() -> None:
+    x = torch.zeros(4, 1)
+    y = torch.zeros(4, 1)
+    sdf = torch.zeros(4, 1)
+    boundary_types = torch.zeros(4, 3)
+
+    enabled = _make_loss_computer_for_input_flag(True)
+    disabled = _make_loss_computer_for_input_flag(False)
+
+    assert enabled.build_input_tensor(x, y, sdf, boundary_types).shape[1] == 6
+    assert disabled.build_input_tensor(x, y, sdf, boundary_types).shape[1] == 3
 
 
 def test_fvm_checks(handler: DataHandler) -> None:
@@ -266,6 +326,7 @@ def main() -> None:
     test_fvm_schedule()
     test_sdf_chunk()
     test_safe_grad_strict_mode()
+    test_boundary_types_optional_model_input()
     test_rar_score_respects_pde_mask()
     test_one_train_batch(cfg, handler)
     print("OK refactor smoke tests")

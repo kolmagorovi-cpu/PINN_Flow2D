@@ -37,6 +37,7 @@ from airfoil_pinn.training.models import PINNIncompressible, SelfAdaptiveWeights
 from airfoil_pinn.training.checkpoint import CheckpointManager
 from airfoil_pinn.training.key_listener import KeyListener
 from airfoil_pinn.training.visualizer import Visualizer
+from airfoil_pinn.training.boundary_layer_diagnostics import run_boundary_layer_diagnostics
 from airfoil_pinn.training.reference import (
     compute_l2_errors,
     interpolate_reference,
@@ -778,6 +779,30 @@ class PINNSolver:
         # 5. Гистограмма RAR
         if self.diagnostics_config.get('save_rar_history', True) and hasattr(self.trainer, 'rar_history') and self.trainer.rar_history:
             self.visualizer.plot_rar_histogram(self.trainer.rar_history, self.data_handler.boundary_type_names, plots_dir, epoch)
+
+        # 6. Диагностика пограничного слоя по нормальным лучам от профиля.
+        # Этот блок ничего не добавляет в loss: он только сохраняет профили,
+        # Cp/Cf и численные признаки разрешённости пристенного слоя.
+        bl_result = run_boundary_layer_diagnostics(
+            model=self.model,
+            loss_computer=self.loss_computer,
+            data_handler=self.data_handler,
+            device=self.device,
+            dtype=self.dtype,
+            savedir=plots_dir,
+            epoch=epoch,
+            config=self.diagnostics_config.get('boundary_layer', {}),
+        )
+        if bl_result is not None:
+            s = bl_result.summary
+            self.metrics.save_log(
+                "BL diagnostics: "
+                f"profiles={int(s.get('profile_count', 0))}, "
+                f"unresolved={int(s.get('unresolved_profiles', 0))}, "
+                f"u_first/Uedge max={s.get('u_first_over_Uedge_max', float('nan')):.3e}, "
+                f"delta99 mean={s.get('delta99_mean', float('nan')):.3e}, "
+                f"Cf rms={s.get('Cf_rms', float('nan')):.3e}"
+            )
 
     def _get_predictions_norm(self) -> Dict[str, np.ndarray]:
         """

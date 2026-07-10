@@ -34,14 +34,19 @@ def visualize_network(config: dict[str, Any], filename: str) -> None:
     output_dim = arch.get("output_dim", 3)
 
     # Подписи входов должны соответствовать флагам из input_params.
-    input_labels = ["x", "y", "sdf"]
+    input_labels = []
+    if input_params.get("coordinates", True):
+        input_labels.extend(["x", "y"])
+    if input_params.get("sdf", True):
+        input_labels.append("sdf")
+    if input_params.get("boundary_types", True):
+        input_labels.append("boundary (one-hot)")
     if input_params.get("inlet_velocity", False):
         input_labels.extend(["u_in", "v_in"])
     if input_params.get("viscosity", False):
         input_labels.append("mu")
     if input_params.get("density", False):
         input_labels.append("rho")
-    input_labels.append("boundary (one-hot)")
 
     input_dim = len(input_labels)
 

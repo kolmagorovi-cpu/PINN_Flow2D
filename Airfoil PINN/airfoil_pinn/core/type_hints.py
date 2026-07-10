@@ -373,6 +373,7 @@ class InputParamsDict(TypedDict, total=False):
     """Параметры входа модели."""
     coordinates: bool
     sdf: bool
+    boundary_types: bool
     inlet_velocity: bool
     viscosity: bool
     density: bool

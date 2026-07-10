@@ -555,13 +555,16 @@ class LossComputer:
     ) -> torch.Tensor:
         """
         Собирает входной тензор для модели на основе координат, SDF,
-        one-hot границ и дополнительных параметров (скорость на входе,
-        вязкость, плотность), если они включены в конфигурацию.
+        опционального one-hot типа границы и дополнительных параметров
+        (скорость на входе, вязкость, плотность), если они включены
+        в конфигурацию.
 
         Args:
             x, y: координаты (тензоры)
             sdf: нормализованное расстояние до стенки
-            boundary_types: one-hot тензор типов границ (или None)
+            boundary_types: one-hot тензор типов границ (или None).
+                Для loss-масок он передается всегда, но во вход модели
+                попадает только при input_params.boundary_types=True.
 
         Returns:
             тензор формы (batch_size, input_dim)
@@ -571,7 +574,11 @@ class LossComputer:
             inputs.extend([x, y])
         if self.input_params.get('sdf', True):
             inputs.append(sdf)
-        if boundary_types is not None and boundary_types.shape[1] > 0:
+        if (
+            self.input_params.get('boundary_types', True)
+            and boundary_types is not None
+            and boundary_types.shape[1] > 0
+        ):
             inputs.append(boundary_types)
 
         if self.input_params.get('inlet_velocity', False):

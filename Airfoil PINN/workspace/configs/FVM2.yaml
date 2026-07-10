@@ -34,6 +34,39 @@ data:
   points_file: workspace/initial/fields/initial.npy
   prefetch_factor: 2
 diagnostics:
+  boundary_layer:
+    edge_threshold: 0.99
+    enabled: true
+    eval_batch_size: 8192
+    first_layer_height_fraction: 1.0e-5
+    fit_points: 8
+    growth_ratio: 1.12
+    interval: 50
+    layer_count: 80
+    max_normal_distance_fraction: 0.08
+    max_surface_points_per_side: 120
+    plot_cf: true
+    plot_cp: true
+    plot_deficit: true
+    plot_delta99: true
+    plot_profiles: true
+    profile_step_fraction: 0.01
+    save_metrics_csv: true
+    save_profiles_npz: true
+    sections:
+    - 0.05
+    - 0.1
+    - 0.2
+    - 0.4
+    - 0.6
+    - 0.8
+    - 0.95
+    sides:
+    - upper
+    - lower
+    unresolved_threshold: 0.8
+    x_max_c: 0.98
+    x_min_c: 0.02
   compute_grad_cosine: false
   compute_ntk_condition: false
   interval: 50
@@ -53,6 +86,7 @@ diagnostics:
   strict_autograd: true
 enable_key_listener: true
 input_params:
+  boundary_types: true
   coordinates: true
   density: true
   fluid_file: null

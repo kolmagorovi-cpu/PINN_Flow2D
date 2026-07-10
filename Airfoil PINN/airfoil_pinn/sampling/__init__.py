@@ -16,8 +16,10 @@ from airfoil_pinn.sampling.core import (
     SamplerConfig,
 )
 from airfoil_pinn.sampling.normal_layer import (
+    NormalLayerColumnsResult,
     NormalLayerConfig,
     NormalLayerResult,
+    generate_normal_layer_columns,
     generate_normal_layer_points,
 )
 
@@ -27,7 +29,9 @@ __all__ = [
     "CollocationPoints",
     "S2DR",
     "SamplerConfig",
+    "NormalLayerColumnsResult",
     "NormalLayerConfig",
     "NormalLayerResult",
+    "generate_normal_layer_columns",
     "generate_normal_layer_points",
 ]

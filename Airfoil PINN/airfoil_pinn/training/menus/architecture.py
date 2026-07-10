@@ -36,9 +36,13 @@ def _configure_input_params(cfg: ConfigManager) -> None:
 
     inp['coordinates'] = yes_no("Использовать координаты x,y", inp.get('coordinates', True))
     inp['sdf'] = yes_no("Использовать SDF", inp.get('sdf', True))
-    inp['inlet_velocity'] = yes_no("Использовать компоненты скорости на входе", inp['inlet_velocity'])
-    inp['viscosity'] = yes_no("Использовать вязкость жидкости", inp['viscosity'])
-    inp['density'] = yes_no("Использовать плотность жидкости", inp['density'])
+    inp['boundary_types'] = yes_no(
+        "Использовать one-hot тип границы как вход сети",
+        inp.get('boundary_types', True),
+    )
+    inp['inlet_velocity'] = yes_no("Использовать компоненты скорости на входе", inp.get('inlet_velocity', False))
+    inp['viscosity'] = yes_no("Использовать вязкость жидкости", inp.get('viscosity', False))
+    inp['density'] = yes_no("Использовать плотность жидкости", inp.get('density', False))
 
     if inp['viscosity'] or inp['density']:
         fluids = [f.replace('.json', '') for f in os.listdir(ConfigManager.FLUIDS_DIR) if f.endswith('.json')]

@@ -45,6 +45,7 @@ class ConfigManager:
             'input_params': {
                 'coordinates': True,
                 'sdf': True,
+                'boundary_types': True,
                 'inlet_velocity': False,
                 'viscosity': False,
                 'density': False,
@@ -226,6 +227,31 @@ class ConfigManager:
                 'strict_autograd': True,
                 'save_rar_history': True,
                 'mass_metrics_interval': 1,
+                'boundary_layer': {
+                    'enabled': False,
+                    'interval': 50,
+                    'sections': [0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 0.95],
+                    'sides': ['upper', 'lower'],
+                    'profile_step_fraction': 0.01,
+                    'first_layer_height_fraction': 1.0e-5,
+                    'layer_count': 80,
+                    'growth_ratio': 1.12,
+                    'max_normal_distance_fraction': 0.08,
+                    'edge_threshold': 0.99,
+                    'fit_points': 8,
+                    'x_min_c': 0.02,
+                    'x_max_c': 0.98,
+                    'max_surface_points_per_side': 120,
+                    'unresolved_threshold': 0.8,
+                    'eval_batch_size': 8192,
+                    'save_profiles_npz': True,
+                    'save_metrics_csv': True,
+                    'plot_profiles': True,
+                    'plot_cp': True,
+                    'plot_cf': True,
+                    'plot_delta99': True,
+                    'plot_deficit': True,
+                },
             },
             'enable_key_listener': True,
             'checkpoint_dir': project_relative(PATHS.experiments_dir),
@@ -337,9 +363,10 @@ class ConfigManager:
         inp = self.config['input_params']
         print(f"  coordinates     : {inp.get('coordinates', True)}")
         print(f"  sdf             : {inp.get('sdf', True)}")
-        print(f"  inlet_velocity  : {inp['inlet_velocity']}")
-        print(f"  viscosity       : {inp['viscosity']}")
-        print(f"  density         : {inp['density']}")
+        print(f"  boundary_types  : {inp.get('boundary_types', True)}")
+        print(f"  inlet_velocity  : {inp.get('inlet_velocity', False)}")
+        print(f"  viscosity       : {inp.get('viscosity', False)}")
+        print(f"  density         : {inp.get('density', False)}")
         print(f"  fluid_file      : {inp.get('fluid_file', '-')}")
         print()
 

@@ -62,6 +62,27 @@ class NormalLayerResult:
     stats: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class NormalLayerColumnsResult:
+    """Normal columns with enough metadata for boundary-layer diagnostics.
+
+    The sampler originally only needed the flattened point cloud.  Diagnostics
+    need the inverse mapping as well: every generated point must know which
+    surface station, tangent, outward normal and wall-normal offset produced it.
+    """
+
+    points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.float64))
+    surface_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.float64))
+    tangents: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.float64))
+    normals: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.float64))
+    offsets: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.float64))
+    points_by_column: np.ndarray = field(default_factory=lambda: np.empty((0, 0, 2), dtype=np.float64))
+    valid_mask: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=bool))
+    side_names: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=object))
+    x_c: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.float64))
+    stats: Dict[str, Any] = field(default_factory=dict)
+
+
 def generate_normal_layer_points(
     domain: np.ndarray,
     foil: np.ndarray,
@@ -153,6 +174,122 @@ def generate_normal_layer_points(
         points=arr,
         surface_points=base_points.astype(np.float64, copy=False),
         offsets=offsets.astype(np.float64, copy=False),
+        stats=stats,
+    )
+
+
+def generate_normal_layer_columns(
+    domain: np.ndarray,
+    foil: np.ndarray,
+    config: NormalLayerConfig,
+) -> NormalLayerColumnsResult:
+    """Generate normal columns and preserve their wall-reference metadata.
+
+    This function intentionally uses the same geometry, offset and filtering
+    helpers as ``generate_normal_layer_points``.  It is therefore suitable for
+    post-processing the very same near-wall structure that the sampler uses,
+    while still exposing columns for profile plots and Cp/Cf diagnostics.
+    """
+
+    domain = _as_xy(domain)
+    foil = _remove_adjacent_duplicates(_as_xy(foil))
+    if len(domain) < 3 or len(foil) < 2:
+        return NormalLayerColumnsResult(stats={"reason": "empty geometry"})
+
+    closed = _is_closed(foil)
+    chord = _chord(foil)
+    offsets, offset_stats = _build_offsets(config, chord)
+    if len(offsets) == 0:
+        return NormalLayerColumnsResult(stats={"reason": "empty offsets", **offset_stats})
+
+    base_points, tangents = resample_profile_by_step(
+        foil,
+        config.profile_step,
+        closed=closed,
+        endpoint_skip=0.0 if closed else max(float(config.endpoint_skip), 0.0),
+    )
+    if len(base_points) == 0:
+        return NormalLayerColumnsResult(stats={"reason": "empty profile samples", **offset_stats})
+
+    normals_a = _normalize(np.column_stack([-tangents[:, 1], tangents[:, 0]]))
+    normals_b = -normals_a
+    domain_path = Path(domain)
+    foil_path = Path(foil) if closed and len(foil) >= 4 else None
+
+    surface_cols = []
+    tangent_cols = []
+    normal_cols = []
+    point_cols = []
+    valid_cols = []
+    side_cols = []
+    x_c_cols = []
+    accepted_normals = {"upper": 0, "lower": 0}
+    x0 = float(np.min(foil[:, 0]))
+
+    for base, tangent, normal_a, normal_b in zip(base_points, tangents, normals_a, normals_b):
+        candidates = _candidate_normals(
+            base,
+            normal_a,
+            normal_b,
+            offsets[0],
+            closed,
+            config.open_profile_sides,
+            domain_path,
+            foil_path,
+        )
+        for _, normal in candidates:
+            column = base + offsets[:, None] * normal[None, :]
+            valid = _valid_flow_points(column, domain_path, foil_path)
+            if not np.any(valid):
+                continue
+
+            side = _physical_side_from_normal(normal)
+            surface_cols.append(base)
+            tangent_cols.append(_orient_tangent_downstream(tangent))
+            normal_cols.append(normal)
+            point_cols.append(column)
+            valid_cols.append(valid)
+            side_cols.append(side)
+            x_c_cols.append((float(base[0]) - x0) / chord)
+            accepted_normals[side] += 1
+
+    if not point_cols:
+        return NormalLayerColumnsResult(
+            surface_points=base_points.astype(np.float64, copy=False),
+            offsets=offsets.astype(np.float64, copy=False),
+            stats={
+                "reason": "all candidates filtered",
+                "closed_profile": bool(closed),
+                "profile_samples": int(len(base_points)),
+                **offset_stats,
+            },
+        )
+
+    points_by_column = np.asarray(point_cols, dtype=np.float64)
+    valid_mask = np.asarray(valid_cols, dtype=bool)
+    flat_points = points_by_column[valid_mask]
+    stats = {
+        "closed_profile": bool(closed),
+        "profile_samples": int(len(base_points)),
+        "accepted_normal_columns": int(len(point_cols)),
+        "accepted_upper_columns": int(accepted_normals["upper"]),
+        "accepted_lower_columns": int(accepted_normals["lower"]),
+        "valid_points": int(len(flat_points)),
+        "profile_step": float(config.profile_step),
+        "open_profile_sides": str(config.open_profile_sides),
+        **offset_stats,
+    }
+
+    return NormalLayerColumnsResult(
+        points=flat_points.astype(np.float64, copy=False),
+        surface_points=np.asarray(surface_cols, dtype=np.float64),
+        tangents=np.asarray(tangent_cols, dtype=np.float64),
+        normals=np.asarray(normal_cols, dtype=np.float64),
+        offsets=offsets.astype(np.float64, copy=False),
+        points_by_column=points_by_column,
+        valid_mask=valid_mask,
+        side_names=np.asarray(side_cols, dtype=object),
+        x_c=np.asarray(x_c_cols, dtype=np.float64),
         stats=stats,
     )
 
@@ -468,13 +605,32 @@ def _chord(foil: np.ndarray) -> float:
     return max(chord, 1e-12)
 
 
+def _orient_tangent_downstream(tangent: np.ndarray) -> np.ndarray:
+    """Return a unit tangent whose x-component points with the freestream."""
+
+    t = np.asarray(tangent, dtype=np.float64)
+    if t[0] < 0.0:
+        t = -t
+    norm = float(np.linalg.norm(t))
+    return t / norm if norm > 1e-14 else np.array([1.0, 0.0], dtype=np.float64)
+
+
+def _physical_side_from_normal(normal: np.ndarray) -> str:
+    """Classify a normal column as upper or lower by its wall-normal direction."""
+
+    n = np.asarray(normal, dtype=np.float64)
+    return "upper" if float(n[1]) >= 0.0 else "lower"
+
+
 __all__ = [
     "DEFAULT_ETA_LEVELS",
+    "NormalLayerColumnsResult",
     "NormalLayerConfig",
     "NormalLayerResult",
     "estimate_boundary_layer_thickness",
     "estimate_first_layer_height_y_plus",
     "estimate_skin_friction_coefficient",
+    "generate_normal_layer_columns",
     "generate_normal_layer_points",
     "resample_profile_by_step",
 ]
