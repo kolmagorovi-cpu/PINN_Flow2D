@@ -1,0 +1,61 @@
+# Python кэш
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Виртуальные окружения
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.suo
+
+# Логи и чекпоинты
+logs/
+Checkpoints/
+
+# Временные файлы
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# Архивы
+*.zip
+*.rar
+*.7z
+*.tar.gz
+
+# Сгенерированные графики
+Figure_*.png
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Прочее
+.vscode/
+*.log
+
+# Данные (сгенерированные файлы)
+Fluids/
+Conditions/
+Configs/
+Geometry/Data/
+Geometry/*.png
+Sampler/Data/
+Initial/Data/
+Initial/Plots/
+Pictures/
+*.msh
+*.npz
+*.csv

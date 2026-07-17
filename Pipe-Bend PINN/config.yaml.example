@@ -1,0 +1,66 @@
+# Пример конфигурационного файла для Pipe-Bend PINN
+# Скопируйте в config.yaml и настройте под свою задачу
+
+data_paths:
+  points_file: null
+
+model_params:
+  layers:
+    - 50
+    - 50
+    - 50
+    - 50
+  use_boundary_encoding: true
+
+output_bias: !!python/tuple
+  - 0.1
+  - 0.0
+  - 0.1
+
+epochs: 2000
+batch_size: 1200
+gradient_accumulation_steps: 50
+
+optimizer_params:
+  lr: 0.001
+
+use_lbfgs: false
+
+two_stage: true
+stage1_epochs: 100
+stage2_pde_weight_start: 1.0
+stage2_pde_weight_end: 10000.0
+stage2_ramp_epochs: 500
+
+loss_weights:
+  cont: 1.0
+  mom_x: 1.0
+  mom_y: 1.0
+  inlet: 5000.0
+  outlet: 5000.0
+  wall: 5000.0
+
+use_sa_weights: false
+sa_apply_to_bc: true
+sa_lr: 0.001
+adaptive_weights: false
+
+integral_condition: true
+integral_weight: 1000000.0
+
+rar_enable: false
+reset_interval: 0
+
+device: auto
+num_gpus: 1
+dtype: float32
+use_amp: true
+
+plot_frequency: 1
+checkpoint_dir: Checkpoints
+checkpoint_interval: 100
+
+enable_key_listener: true
+
+flow_type: planar
+grad_clip: null

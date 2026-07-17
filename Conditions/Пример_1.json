@@ -1,0 +1,11 @@
+{
+    "fluid_name": "Вода (20°C)",
+    "inlet_pressure": 101325.0,
+    "outlet_pressure": 100000.0,
+    "inlet_u": 1.0,
+    "inlet_v": 0.0,
+    "velocity_profile_mode": "parabolic",
+    "pipe_width": 0.5,
+    "symmetry_type": null,
+    "description": "Ламинарное течение в отводе, профиль Пуазейля"
+}

@@ -1,0 +1,7 @@
+{
+    "name": "Воздух (20°C)",
+    "density": 1.204,
+    "kinematic_viscosity": 1.516e-05,
+    "dynamic_viscosity": 1.825264e-05,
+    "description": "Сухой воздух при 20°C"
+}

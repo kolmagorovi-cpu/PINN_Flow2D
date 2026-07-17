@@ -1,0 +1,11 @@
+{
+    "fluid_name": "Вода (20°C)",
+    "inlet_pressure": 101325.0,
+    "outlet_pressure": 101000.0,
+    "inlet_u": 0.5,
+    "inlet_v": 0.0,
+    "velocity_profile_mode": "uniform",
+    "pipe_width": 0.5,
+    "symmetry_type": null,
+    "description": "Равномерный профиль, малый перепад давления"
+}

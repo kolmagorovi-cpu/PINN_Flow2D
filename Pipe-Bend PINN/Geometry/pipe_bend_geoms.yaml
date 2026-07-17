@@ -1,0 +1,53 @@
+# ============================================================================
+# БИБЛИОТЕКА КОНФИГУРАЦИЙ ОТВОДОВ (PIPE BENDS)
+# ============================================================================
+#
+# Этот файл содержит параметрические конфигурации отводов 90°.
+# Параметры:
+#   name:            Уникальное имя конфигурации
+#   inlet_length:    Длина входного прямого участка [м]
+#   outlet_length:   Длина выходного прямого участка [м]
+#   bend_radius:     Радиус изгиба по оси канала [м]
+#   pipe_width:      Ширина канала (диаметр трубы) [м]
+#   bend_angle:      Угол изгиба [°]
+
+pipe_bends:
+  - name: 'PB_R100'
+    description: 'Отвод 90°, R/D=2.0, L_in=2.0м, L_out=2.0м'
+    inlet_length: 2.0
+    outlet_length: 2.0
+    bend_radius: 1.0
+    pipe_width: 0.5
+    bend_angle: 90
+
+  - name: 'PB_R200'
+    description: 'Отвод 90°, R/D=4.0, L_in=3.0м, L_out=3.0м'
+    inlet_length: 3.0
+    outlet_length: 3.0
+    bend_radius: 2.0
+    pipe_width: 0.5
+    bend_angle: 90
+
+  - name: 'PB_R050'
+    description: 'Отвод 90°, R/D=1.0, L_in=1.5м, L_out=1.5м'
+    inlet_length: 1.5
+    outlet_length: 1.5
+    bend_radius: 0.5
+    pipe_width: 0.5
+    bend_angle: 90
+
+  - name: 'PB_wide_R300'
+    description: 'Отвод 90°, R/D=3.0, широкий канал D=0.8м'
+    inlet_length: 3.0
+    outlet_length: 3.0
+    bend_radius: 1.2
+    pipe_width: 0.8
+    bend_angle: 90
+
+  - name: 'PB_tight_R075'
+    description: 'Отвод 90°, R/D=1.5, L_in=1.0м, L_out=1.0м'
+    inlet_length: 1.0
+    outlet_length: 1.0
+    bend_radius: 0.375
+    pipe_width: 0.5
+    bend_angle: 90
