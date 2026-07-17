@@ -70,6 +70,13 @@ from airfoil_pinn.data.sdf_diagnostics import (
     compute_sdf_summary,
     estimate_boundary_layer_delta,
     format_sdf_summary,
+    resolve_boundary_layer_model,
+)
+from airfoil_pinn.data.normalization import (
+    build_geometry_reference,
+    compute_reynolds_number,
+    extract_geometry_reference,
+    load_companion_metadata,
 )
 
 # Инициализатор связывает артефакты geometry/sampling с обучающими полями.
@@ -219,6 +226,7 @@ class Initializer:
         self.mu: Optional[float] = None
         self.delta_bl_est: Optional[float] = None
         self.delta_bl_est_norm: Optional[float] = None
+        self.boundary_layer_model: str = "laminar"
 
         self.pressure_mode: Optional[str] = None
         self.velocity_initial_mode: Optional[str] = None
@@ -228,6 +236,10 @@ class Initializer:
 
         self.domain_coords: Optional[np.ndarray] = None
         self.foil_coords: Optional[np.ndarray] = None
+        self.sampler_points_file: Optional[str] = None
+        self.sampler_metadata: Optional[Dict[str, Any]] = None
+        self.geometry_reference: Optional[Dict[str, Any]] = None
+        self.chord_source: Optional[str] = None
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
         """
@@ -259,7 +271,9 @@ class Initializer:
             print(f"Использую файл точек: {os.path.basename(filename)}")
         else:
             filename = str(resolve_project_path(filename))
-        data = np.load(filename, allow_pickle=True)
+        self.sampler_points_file = str(filename)
+        self.sampler_metadata = load_companion_metadata(self.sampler_points_file)
+        data = np.load(self.sampler_points_file, allow_pickle=True)
 
         if data.dtype.names is not None:
             self.points = data
@@ -378,7 +392,52 @@ class Initializer:
             logger.info("Загружены координаты профиля для визуализации.")
 
     def _load_chord_from_metadata(self) -> float:
-        """Определяет хорду из метаданных геометрии или оценивает по разбросу x."""
+        """Определяет хорду из артефактов, связанных с загруженными точками."""
+        sampler_reference = extract_geometry_reference(self.sampler_metadata)
+        sampler_count = (
+            self.sampler_metadata.get("num_points")
+            if isinstance(self.sampler_metadata, dict)
+            else None
+        )
+        sampler_matches = (
+            sampler_count is None
+            or self.points is None
+            or int(sampler_count) == len(self.points)
+        )
+        if sampler_reference is not None and sampler_matches:
+            chord = float(sampler_reference["chord"])
+            self.geometry_reference = dict(sampler_reference)
+            self.chord_source = str(sampler_reference.get("source", "sampler geometry_reference"))
+            logger.info(
+                "Хорда загружена из metadata текущих collocation-точек: %.6g м (%s)",
+                chord,
+                self.chord_source,
+            )
+            return chord
+        if sampler_reference is not None and not sampler_matches:
+            logger.warning(
+                "Metadata сэмплера содержит %s точек, а загружено %s; "
+                "этот геометрический масштаб пропущен.",
+                sampler_count,
+                len(self.points) if self.points is not None else "нет",
+            )
+
+        # WALL-точки принадлежат тому же массиву, поэтому это безопаснее, чем
+        # metadata другой геометрии из изменённого после сэмплинга geom_config.
+        if self.wall_points is not None and len(self.wall_points) >= 2:
+            wall_reference = build_geometry_reference(self.wall_points)
+            if wall_reference is not None:
+                chord = float(wall_reference["chord"])
+                wall_reference["source"] = "loaded WALL-point extent"
+                self.geometry_reference = wall_reference
+                self.chord_source = str(wall_reference["source"])
+                logger.warning(
+                    "В metadata сэмплера нет хорды; используется диапазон WALL-точек: %.6g м. "
+                    "Для точного масштаба пересоздайте collocation metadata.",
+                    chord,
+                )
+                return chord
+
         metadata_dir = GEOMETRY_METADATA_DIR
         search_dirs = [metadata_dir, self.geometry_dir]
         geom_name = self._current_geom_name()
@@ -404,6 +463,14 @@ class Initializer:
                 meta = np.load(meta_path, allow_pickle=True).item()
                 chord = meta.get('chord', None)
                 if chord is not None:
+                    self.chord_source = f"geometry metadata: {os.path.basename(meta_path)}"
+                    self.geometry_reference = {
+                        "geom_name": geom_name,
+                        "length_scale": "chord",
+                        "coordinate_units": "m",
+                        "chord": float(chord),
+                        "source": self.chord_source,
+                    }
                     logger.info(f"Хорда загружена из {os.path.basename(meta_path)}: {chord:.4f} м")
                     return float(chord)
                 else:
@@ -415,6 +482,10 @@ class Initializer:
         if foil is not None and len(foil) >= 2:
             chord = float(np.max(foil[:, 0]) - np.min(foil[:, 0]))
             if chord > 0.0:
+                self.geometry_reference = build_geometry_reference(foil, geom_name=geom_name)
+                self.chord_source = "active geometry coordinates"
+                if self.geometry_reference is not None:
+                    self.geometry_reference["source"] = self.chord_source
                 logger.warning(
                     "Хорда оценена по координатам профиля, metadata не использованы: "
                     f"{chord:.4f} м"
@@ -426,6 +497,13 @@ class Initializer:
             f"Файлы метаданных не найдены или не содержат хорду. "
             f"Используется приближение по разбросу x точек (включает домен, не только хорду): {x_range:.4f} м"
         )
+        self.chord_source = "collocation domain x extent"
+        self.geometry_reference = {
+            "length_scale": "domain_x_extent",
+            "coordinate_units": "m",
+            "chord": float(x_range),
+            "source": self.chord_source,
+        }
         return float(x_range)
 
     def select_fluid(self) -> str:
@@ -492,8 +570,34 @@ class Initializer:
         self.p_ref = self.conditions.outlet_pressure
         self.rho = self.fluid.density
         self.mu = self.fluid.dynamic_viscosity
-        nu = self.fluid.kinematic_viscosity
-        self.Re = self.U_inf * self.chord / nu
+        self.Re = compute_reynolds_number(
+            self.U_inf,
+            self.chord,
+            self.rho,
+            self.mu,
+        )
+
+        normal_layer = (
+            self.sampler_metadata.get("normal_layer")
+            if isinstance(self.sampler_metadata, dict)
+            else None
+        )
+        sampled_model = normal_layer.get("cf_model") if isinstance(normal_layer, dict) else None
+        self.boundary_layer_model = resolve_boundary_layer_model(
+            self.Re,
+            str(sampled_model or self.boundary_layer_model),
+        )
+        sampled_re = normal_layer.get("re_chord") if isinstance(normal_layer, dict) else None
+        if sampled_re is not None and float(sampled_re) > 0.0:
+            relative_error = abs(float(sampled_re) - self.Re) / self.Re
+            if relative_error > 0.01:
+                logger.warning(
+                    "Normal-layer сетка построена для Re_c=%.6g, а выбранные условия дают "
+                    "Re_c=%.6g (расхождение %.1f%%). Нормировка использует физический Re_c условий.",
+                    float(sampled_re),
+                    self.Re,
+                    100.0 * relative_error,
+                )
 
         logger.info(f"Хорда: {self.chord:.4f} м")
         logger.info(f"U_inf = {self.U_inf:.4f} м/с")
@@ -517,15 +621,21 @@ class Initializer:
         self.delta_bl_est, self.delta_bl_est_norm = estimate_boundary_layer_delta(
             self.chord,
             self.Re,
+            model=self.boundary_layer_model,
         )
 
         print("\n" + "=" * 60)
         print("SDF-ДИАГНОСТИКА ПРИСТЕННОЙ СЕТКИ".center(60))
         print("=" * 60)
         if self.delta_bl_est is not None and self.delta_bl_est_norm is not None:
+            delta_formula = (
+                "0.37/Re^0.2"
+                if self.boundary_layer_model == "turbulent"
+                else "5/sqrt(Re)"
+            )
             print(
                 "Оценка толщины слоя: "
-                f"delta_99/c ~= 5/sqrt(Re) = {self.delta_bl_est_norm:.6g}, "
+                f"delta_99/c ~= {delta_formula} = {self.delta_bl_est_norm:.6g}, "
                 f"delta_99 = {self.delta_bl_est:.6g} м"
             )
         else:
@@ -609,6 +719,7 @@ class Initializer:
         self.delta_bl_est, self.delta_bl_est_norm = estimate_boundary_layer_delta(
             self.chord,
             self.Re,
+            model=self.boundary_layer_model,
         )
 
         N = len(self.points)
@@ -771,8 +882,21 @@ class Initializer:
             'Re': self.Re,
             'delta_bl_99_est': self.delta_bl_est,
             'delta_bl_99_est_norm': self.delta_bl_est_norm,
+            'delta_bl_model': self.boundary_layer_model,
             'normalized': True,
             'sdf_norm_factor': self.chord,
+            'geometry_reference': self.geometry_reference,
+            'normalization': {
+                'coordinate_length_scale': 'chord',
+                'coordinate_norm_factor': self.chord,
+                'sdf_norm_factor': self.chord,
+                'chord_source': self.chord_source,
+            },
+            'sampling_points_file': (
+                os.path.basename(self.sampler_points_file)
+                if self.sampler_points_file
+                else None
+            ),
             'inlet_u_norm': inlet_u_norm,
             'inlet_v_norm': inlet_v_norm,
         }

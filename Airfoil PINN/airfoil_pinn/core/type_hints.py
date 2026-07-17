@@ -341,6 +341,10 @@ class InitializerMetadataDict(TypedDict, total=False):
         Re: Число Рейнольдса
         normalized: Флаг нормализации данных
         sdf_norm_factor: Фактор нормализации SDF
+        geometry_reference: Физический масштаб активной геометрии
+        normalization: Описание масштабов безразмеривания
+        sampling_points_file: Имя исходного файла collocation-точек
+        delta_bl_model: Модель оценки толщины пограничного слоя
         inlet_u_norm: Нормированная скорость U на входе
         inlet_v_norm: Нормированная скорость V на входе
     """
@@ -361,6 +365,10 @@ class InitializerMetadataDict(TypedDict, total=False):
     Re: float
     normalized: bool
     sdf_norm_factor: float
+    geometry_reference: Dict[str, object]
+    normalization: Dict[str, object]
+    sampling_points_file: str
+    delta_bl_model: str
     inlet_u_norm: float
     inlet_v_norm: float
 

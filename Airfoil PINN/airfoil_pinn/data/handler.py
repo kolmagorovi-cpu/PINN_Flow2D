@@ -36,6 +36,15 @@ from airfoil_pinn.app.paths import (
     resolve_project_path,
 )
 from airfoil_pinn.core.type_hints import PointDtypeDict
+from airfoil_pinn.data.normalization import (
+    compute_reynolds_number,
+    extract_geometry_reference,
+    load_companion_metadata,
+)
+from airfoil_pinn.data.sdf_diagnostics import (
+    estimate_boundary_layer_delta,
+    resolve_boundary_layer_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -452,10 +461,13 @@ class DataHandler:
         self.mesh_file = str(resolve_project_path(mesh_file)) if mesh_file is not None else None
         self.mesh_domain_coords: Optional[np.ndarray] = None
         self.mesh_airfoil_coords: Optional[np.ndarray] = None
+        self.sampler_metadata: Optional[Dict[str, Any]] = None
+        self.geometry_reference: Optional[Dict[str, Any]] = None
 
         self.dataset = PINNDataset(self.points_file)
         self.load_metadata()
         self._load_sampler_point_metadata()
+        self._reconcile_geometry_normalization()
         self.load_mesh_geometry_from_geom_config()
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
@@ -493,14 +505,20 @@ class DataHandler:
         if not os.path.exists(meta_path):
             raise FileNotFoundError(f"Файл метаданных {meta_path} не найден")
         meta = np.load(meta_path, allow_pickle=True).item()
+        self.initial_metadata = dict(meta)
         self.fluid_name = meta.get('fluid_name')
         self.conditions_name = meta.get('conditions_name')
-        self.chord = meta.get('chord', 1.0)
-        self.U_inf = meta.get('U_inf', 1.0)
-        self.p_ref = meta.get('p_ref', 0.0)
-        self.rho = meta.get('rho', 1.0)
-        self.mu = meta.get('mu', 1.0)
-        self.Re = meta.get('Re', 1.0)
+        self.chord = float(meta.get('chord', 1.0))
+        self.U_inf = float(meta.get('U_inf', 1.0))
+        self.p_ref = float(meta.get('p_ref', 0.0))
+        self.rho = float(meta.get('rho', 1.0))
+        self.mu = float(meta.get('mu', 1.0))
+        self.Re = float(meta.get('Re', 1.0))
+        self.sdf_norm_factor = float(meta.get('sdf_norm_factor', self.chord))
+        self.delta_bl_99_est = meta.get('delta_bl_99_est')
+        self.delta_bl_99_est_norm = meta.get('delta_bl_99_est_norm')
+        self.boundary_layer_model = str(meta.get('delta_bl_model', 'laminar'))
+        self.geometry_reference = meta.get('geometry_reference')
         self.inlet_u_norm = meta.get('inlet_u_norm', 1.0)
         self.inlet_v_norm = meta.get('inlet_v_norm', 0.0)
         # Границы области (нормированные)
@@ -570,6 +588,19 @@ class DataHandler:
                 np.ascontiguousarray(arr['y']),
                 dtype=torch.float64
             )
+            self.sampler_metadata = load_companion_metadata(path)
+
+            airfoil_mask = np.asarray(arr['on_airfoil'], dtype=bool)
+            if np.any(airfoil_mask):
+                foil = np.column_stack([arr['x'][airfoil_mask], arr['y'][airfoil_mask]])
+                foil_closed = bool(
+                    isinstance(self.sampler_metadata, dict)
+                    and self.sampler_metadata.get('foil_closed', False)
+                )
+                if foil_closed and not np.allclose(foil[0], foil[-1], atol=1e-12):
+                    foil = np.vstack([foil, foil[0]])
+                self.mesh_airfoil_coords = np.asarray(foil, dtype=np.float64)
+
             logger.info("Геометрические флаги точек загружены из %s", path)
             return
 
@@ -580,6 +611,115 @@ class DataHandler:
                 "on_airfoil восстановлен эвристически по boundary_type='wall' "
                 "(collocation_points.npy не найден или не совпал)."
             )
+
+    def _reconcile_geometry_normalization(self) -> None:
+        """Align legacy normalized fields with the sampled geometry reference."""
+        reference = extract_geometry_reference(self.sampler_metadata)
+        if reference is None:
+            return
+
+        new_chord = float(reference['chord'])
+        old_chord = float(self.chord)
+        old_sdf_factor = float(self.sdf_norm_factor)
+        self.geometry_reference = dict(reference)
+
+        if not np.isclose(old_chord, new_chord, rtol=1e-10, atol=1e-12):
+            physical_x = getattr(self.dataset, 'mesh_x_phys', None)
+            physical_y = getattr(self.dataset, 'mesh_y_phys', None)
+            if physical_x is None or physical_y is None:
+                logger.warning(
+                    "Хорда initial metadata (%.6g м) отличается от sampler metadata (%.6g м), "
+                    "но физические координаты недоступны; runtime-нормировка не изменена.",
+                    old_chord,
+                    new_chord,
+                )
+                return
+
+            self.dataset.x = (
+                physical_x.reshape(-1, 1) / new_chord
+            ).to(dtype=self.dataset.x.dtype)
+            self.dataset.y = (
+                physical_y.reshape(-1, 1) / new_chord
+            ).to(dtype=self.dataset.y.dtype)
+            logger.warning(
+                "Исправлена устаревшая нормировка координат: chord %.6g -> %.6g м (%s).",
+                old_chord,
+                new_chord,
+                reference.get('source', 'sampler metadata'),
+            )
+
+        sdf_scale = old_sdf_factor / new_chord
+        if not np.isclose(sdf_scale, 1.0, rtol=1e-10, atol=1e-12):
+            self.dataset.sdf = self.dataset.sdf * float(sdf_scale)
+            logger.warning(
+                "Исправлена нормировка SDF: factor %.6g -> %.6g м.",
+                old_sdf_factor,
+                new_chord,
+            )
+
+        self.chord = new_chord
+        self.sdf_norm_factor = new_chord
+        self.Re = compute_reynolds_number(
+            self.U_inf,
+            self.chord,
+            self.rho,
+            self.mu,
+        )
+        normal_layer = (
+            self.sampler_metadata.get('normal_layer')
+            if isinstance(self.sampler_metadata, dict)
+            else None
+        )
+        sampled_model = normal_layer.get('cf_model') if isinstance(normal_layer, dict) else None
+        self.boundary_layer_model = resolve_boundary_layer_model(
+            self.Re,
+            str(sampled_model or self.boundary_layer_model),
+        )
+        self.delta_bl_99_est, self.delta_bl_99_est_norm = estimate_boundary_layer_delta(
+            self.chord,
+            self.Re,
+            model=self.boundary_layer_model,
+        )
+        self.x_min = self.dataset.x.min().item()
+        self.x_max = self.dataset.x.max().item()
+        self.y_min = self.dataset.y.min().item()
+        self.y_max = self.dataset.y.max().item()
+
+        sampled_re = normal_layer.get('re_chord') if isinstance(normal_layer, dict) else None
+        if sampled_re is not None and float(sampled_re) > 0.0:
+            relative_error = abs(float(sampled_re) - self.Re) / self.Re
+            if relative_error > 0.01:
+                logger.warning(
+                    "Normal-layer точки построены для Re_c=%.6g, текущие физические условия "
+                    "дают Re_c=%.6g (расхождение %.1f%%).",
+                    float(sampled_re),
+                    self.Re,
+                    100.0 * relative_error,
+                )
+
+        sampled_delta = normal_layer.get('delta') if isinstance(normal_layer, dict) else None
+        if (
+            sampled_delta is not None
+            and float(sampled_delta) > 0.0
+            and self.delta_bl_99_est is not None
+        ):
+            delta_error = abs(float(sampled_delta) - self.delta_bl_99_est) / self.delta_bl_99_est
+            if delta_error > 0.01:
+                logger.warning(
+                    "Normal-layer сетка покрывает delta/c=%.6g, текущий reference delta/c=%.6g "
+                    "(расхождение %.1f%%). Для полного согласования сетку нужно пересоздать.",
+                    float(sampled_delta) / self.chord,
+                    self.delta_bl_99_est_norm,
+                    100.0 * delta_error,
+                )
+
+        logger.info(
+            "Единые reference scales: chord=%.6g м, Re_c=%.6g, delta_99/c=%.6g (%s)",
+            self.chord,
+            self.Re,
+            self.delta_bl_99_est_norm or float('nan'),
+            self.boundary_layer_model,
+        )
 
     def load_mesh_geometry_from_geom_config(self, config_path: str = GEOM_CONFIG_PATH) -> bool:
         """
@@ -643,7 +783,19 @@ class DataHandler:
             domain = np.vstack([domain, domain[0]])
 
         self.mesh_domain_coords = domain
-        self.mesh_airfoil_coords = foil if foil is not None and len(foil) >= 2 else None
+        config_foil = foil if foil is not None and len(foil) >= 2 else None
+        if self.mesh_airfoil_coords is None:
+            self.mesh_airfoil_coords = config_foil
+        elif config_foil is not None:
+            sampler_chord = float(np.ptp(self.mesh_airfoil_coords[:, 0]))
+            config_chord = float(np.ptp(config_foil[:, 0]))
+            if not np.isclose(sampler_chord, config_chord, rtol=0.02, atol=1e-12):
+                logger.warning(
+                    "Профиль из текущего geom_config имеет хорду %.6g м, а collocation-точки "
+                    "%.6g м; для диагностики сохранён контур collocation-точек.",
+                    config_chord,
+                    sampler_chord,
+                )
         logger.info(
             "Геометрия для FVM rebuild загружена: domain=%d, foil=%s",
             len(domain),

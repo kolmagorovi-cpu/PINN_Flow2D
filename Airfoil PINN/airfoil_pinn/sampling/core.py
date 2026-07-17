@@ -89,6 +89,7 @@ from airfoil_pinn.data.sdf_diagnostics import (
     compute_sdf_summary,
     format_sdf_summary,
 )
+from airfoil_pinn.data.normalization import build_geometry_reference
 from airfoil_pinn.sampling.normal_layer import (
     DEFAULT_ETA_LEVELS,
     NormalLayerConfig,
@@ -1857,11 +1858,15 @@ class CollocationPoints:
         for p in self.points:
             type_counts[p.boundary_type] = type_counts.get(p.boundary_type, 0) + 1
 
-        chord_for_sdf = None
-        if foil is not None and len(foil) >= 2:
-            chord_for_sdf = float(np.max(foil[:, 0]) - np.min(foil[:, 0]))
-            if chord_for_sdf <= 0.0:
-                chord_for_sdf = None
+        geometry_reference = build_geometry_reference(
+            foil,
+            geom_name=self.config.geom_name,
+        )
+        chord_for_sdf = (
+            float(geometry_reference["chord"])
+            if geometry_reference is not None
+            else None
+        )
         sdf_summary = self._log_sdf_statistics(chord_for_sdf)
 
         self.metadata = {
@@ -1879,6 +1884,8 @@ class CollocationPoints:
             'top_boundary_type': self.config.top_boundary_type,
             'bottom_boundary_type': self.config.bottom_boundary_type,
             'sampling_method': self.config.sampling_method,
+            'geom_name': self.config.geom_name,
+            'geometry_reference': geometry_reference,
             'adaptive_alpha': self.config.adaptive_alpha,
             'adaptive_epsilon_factor': self.config.adaptive_epsilon_factor,
             'normal_layer': self._last_normal_layer_stats if self._last_normal_layer_stats else None,

@@ -1154,7 +1154,13 @@ class Trainer:
                 return
             chord = float(getattr(self.data_handler, 'chord', 1.0))
             re = float(getattr(self.data_handler, 'Re', 0.0))
-            delta, _ = estimate_boundary_layer_delta(chord, re)
+            delta = getattr(self.data_handler, 'delta_bl_99_est', None)
+            if delta is None:
+                delta, _ = estimate_boundary_layer_delta(
+                    chord,
+                    re,
+                    model=str(getattr(self.data_handler, 'boundary_layer_model', 'laminar')),
+                )
             sdf_m = ds.sdf.cpu().numpy().reshape(-1)[mask].astype(np.float64) * chord
             summary = compute_sdf_summary(sdf_m, chord=chord, delta=delta)
             for line in format_sdf_summary(

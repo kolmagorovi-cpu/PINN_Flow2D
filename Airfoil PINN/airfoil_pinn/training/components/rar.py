@@ -678,6 +678,9 @@ class BoundaryLayerRAR:
 
 
 def _estimate_delta_norm(data_handler: Any) -> Optional[float]:
+    stored = getattr(data_handler, "delta_bl_99_est_norm", None)
+    if stored is not None and float(stored) > 0.0 and np.isfinite(float(stored)):
+        return float(stored)
     re = float(getattr(data_handler, "Re", 0.0))
     if re <= 0.0 or not np.isfinite(re):
         return None

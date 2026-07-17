@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+
+from airfoil_pinn.data.sdf_diagnostics import estimate_boundary_layer_delta
 from matplotlib.path import Path
 from scipy.spatial import cKDTree
 
@@ -396,15 +398,22 @@ def estimate_boundary_layer_thickness(
     re = float(re_chord)
     if re <= 0.0 or not np.isfinite(re):
         return None
-    _, model = estimate_skin_friction_coefficient(re, cf_model)
-    if model == "turbulent":
-        return float(0.37 * chord / (re ** 0.2))
-    return float(5.0 * chord / np.sqrt(re))
+    delta, _ = estimate_boundary_layer_delta(chord, re, model=cf_model)
+    return delta
 
 
 def _build_offsets(config: NormalLayerConfig, chord: float) -> Tuple[np.ndarray, Dict[str, Any]]:
     mode = str(config.mode or "manual").lower()
     stats: Dict[str, Any] = {"mode": mode, "chord": float(chord)}
+    if config.re_chord is not None and float(config.re_chord) > 0.0:
+        _, resolved_model = estimate_skin_friction_coefficient(
+            float(config.re_chord),
+            config.cf_model,
+        )
+        stats.update({
+            "re_chord": float(config.re_chord),
+            "cf_model": resolved_model,
+        })
     if mode == "y_plus":
         if config.re_chord is None:
             raise ValueError("normal_layer_re_chord is required for y_plus mode")

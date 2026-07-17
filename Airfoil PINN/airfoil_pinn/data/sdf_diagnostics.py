@@ -55,18 +55,20 @@ __all__ = [
     "compute_sdf_summary",
     "estimate_boundary_layer_delta",
     "format_sdf_summary",
+    "resolve_boundary_layer_model",
 ]
 
 
 def estimate_boundary_layer_delta(
     chord: Optional[float],
     re: Optional[float],
+    model: str = "laminar",
 ) -> Tuple[Optional[float], Optional[float]]:
     """
-    Грубая оценка толщины ламинарного пограничного слоя по хорде.
+    Грубая оценка толщины пограничного слоя по хорде.
 
-    Используется инженерная оценка delta_99 / c ~= 5 / sqrt(Re). Это не
-    подменяет расчёт, но хорошо показывает требуемый масштаб пристенной сетки.
+    Для laminar используется delta_99/c ~= 5/sqrt(Re), для turbulent —
+    delta_99/c ~= 0.37/Re^0.2. Модель должна совпадать с моделью normal-layer.
     """
     if chord is None or re is None:
         return None, None
@@ -74,8 +76,20 @@ def estimate_boundary_layer_delta(
     re_f = float(re)
     if chord_f <= 0.0 or re_f <= 0.0 or not np.isfinite(re_f):
         return None, None
-    delta_over_chord = 5.0 / np.sqrt(re_f)
+    resolved_model = resolve_boundary_layer_model(re_f, model)
+    if resolved_model == "turbulent":
+        delta_over_chord = 0.37 / (re_f ** 0.2)
+    else:
+        delta_over_chord = 5.0 / np.sqrt(re_f)
     return chord_f * delta_over_chord, float(delta_over_chord)
+
+
+def resolve_boundary_layer_model(re: float, model: str = "auto") -> str:
+    """Resolve the flat-plate delta estimate model used by all diagnostics."""
+    model_l = str(model or "auto").lower()
+    if model_l == "auto":
+        return "laminar" if float(re) < 5.0e5 else "turbulent"
+    return "turbulent" if model_l == "turbulent" else "laminar"
 
 
 def compute_nearest_wall_distances(
