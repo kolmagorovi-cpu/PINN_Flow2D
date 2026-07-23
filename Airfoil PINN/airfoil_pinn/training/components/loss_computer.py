@@ -350,13 +350,18 @@ class LossComputer:
     # ------------------------------------------------------------------
     # FVM-потеря (закон сохранения массы)
     # ------------------------------------------------------------------
-    def compute_fvm_loss(self, u_fvm: torch.Tensor) -> torch.Tensor:
+    def compute_fvm_loss(
+        self,
+        u_fvm: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Вычисляет взвешенную FVM-потерю закона сохранения массы.
 
         Args:
             u_fvm: тензор (N, 2) — нормированная скорость [u, v] во всех
                    N узлах сетки (порядок совпадает с точками коллокации)
+            freestream_velocity: case-local ``(cos(alpha), sin(alpha))``
 
         Returns:
             Скалярный тензор fvm_weight * mean(R_i²),
@@ -367,6 +372,7 @@ class LossComputer:
         return self.fvm_weight * self.fvm.mass_loss(
             u_fvm,
             reduction=self.fvm_loss_reduction,
+            freestream_velocity=freestream_velocity,
         )
 
     def _setup_pde_components(self) -> List[str]:

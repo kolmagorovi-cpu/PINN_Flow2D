@@ -443,6 +443,17 @@ class PINNSolver:
         integral_enabled = bool(lw.get('integral_condition', False))
         need_fvm_geometry = fvm_enabled or integral_enabled or self.data_handler.mesh_data is not None
 
+        if (
+            fvm_enabled
+            and self.loss_computer.flow_type == "axisymmetric"
+        ):
+            raise ValueError(
+                "Axisymmetric FVM loss is not supported by the current "
+                "planar dual-cell operator. Disable loss_weights.fvm or use "
+                "the pointwise axisymmetric PDE/integral constraint; silently "
+                "using planar face fluxes would violate conservation."
+            )
+
         if not need_fvm_geometry:
             self.loss_computer.fvm = None
             return
@@ -465,6 +476,7 @@ class PINNSolver:
             from airfoil_pinn.physics.fvm import BC_CODES, FVMResiduals
             fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
             fvm.to(self.device, dtype=self.dtype)
+            fvm.nondimensionalize_geometry(self.data_handler.chord)
             inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
             inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
             velocity_bc = torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)

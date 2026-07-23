@@ -388,43 +388,50 @@ class Trainer:
                 or (add_integral and self.loss_computer.integral_condition)
             )
         )
-        out_fvm = None
+        fvm_case_outputs = []
         x_fvm = None
         if needs_fvm_forward:
             if hasattr(self.data_handler, 'fvm_x'):
                 x_fvm, y_fvm, sdf_fvm, bt_fvm = self._get_fvm_tensors()
-                inp_fvm  = self.loss_computer.build_input_tensor(x_fvm, y_fvm, sdf_fvm, bt_fvm)
-                out_fvm  = self.model(inp_fvm)
-                u_fvm, v_fvm, p_fvm = out_fvm[:, 0:1], out_fvm[:, 1:2], out_fvm[:, 2:3]
-                if self.loss_computer.bc_type == 'hard' and bt_fvm is not None:
-                    u_fvm, v_fvm, p_fvm = self._apply_hard_constraints_from_boundary_types(
-                        u_fvm,
-                        v_fvm,
-                        p_fvm,
-                        bt_fvm,
-                    )
-                u_fvm, v_fvm = self.loss_computer.apply_velocity_dirichlet_constraint(
-                    u_fvm, v_fvm, bt_fvm
+                fvm_case_outputs = self._forward_fvm_cases(
+                    x_fvm,
+                    y_fvm,
+                    sdf_fvm,
+                    bt_fvm,
                 )
-                out_fvm = torch.cat([u_fvm, v_fvm, p_fvm], dim=1)
             else:
                 logger.warning("FVM/integral: fvm-тензоры не подготовлены, глобальный сеточный проход пропущен.")
 
         if add_integral and self.loss_computer.integral_condition:
-            if out_fvm is not None and self.loss_computer.fvm is not None:
-                integral_raw_t = self.loss_computer.compute_mesh_integral_loss(
-                    out_fvm[:, :2],
-                    self.loss_computer.fvm.bnd_node,
-                    self.loss_computer.fvm.bnd_S,
-                    self.loss_computer.fvm.bnd_type,
-                    node_x=x_fvm,
-                )
+            if fvm_case_outputs and self.loss_computer.fvm is not None:
+                case_integrals = [
+                    self.loss_computer.compute_mesh_integral_loss(
+                        output[:, :2],
+                        self.loss_computer.fvm.bnd_node,
+                        self.loss_computer.fvm.bnd_S,
+                        self.loss_computer.fvm.bnd_type,
+                        node_x=x_fvm,
+                    )
+                    for _, output, _ in fvm_case_outputs
+                ]
+                integral_raw_t = torch.stack(case_integrals).mean()
             else:
                 integral_raw_t = self._compute_global_integral_loss_from_dataset()
             integral_t = integral_raw_t * self.loss_computer.integral_weight * float(integral_scale)
 
-        if add_fvm and out_fvm is not None and self.loss_computer.fvm_weight > 0.0:
-            fvm_weighted_t = self.loss_computer.compute_fvm_loss(out_fvm[:, :2])
+        if (
+            add_fvm
+            and fvm_case_outputs
+            and self.loss_computer.fvm_weight > 0.0
+        ):
+            case_fvm_losses = [
+                self.loss_computer.compute_fvm_loss(
+                    output[:, :2],
+                    freestream_velocity=freestream_velocity,
+                )
+                for _, output, freestream_velocity in fvm_case_outputs
+            ]
+            fvm_weighted_t = torch.stack(case_fvm_losses).mean()
             fvm_loss_val = fvm_weighted_t.item()
             fvm_t = fvm_weighted_t * float(fvm_scale)
 
@@ -1560,6 +1567,67 @@ class Trainer:
         _, x_fvm, y_fvm, sdf_fvm, bt_fvm = self._fvm_tensor_cache
         return x_fvm, y_fvm, sdf_fvm, bt_fvm
 
+    def _forward_fvm_cases(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sdf: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+    ) -> List[Tuple[int, torch.Tensor, torch.Tensor]]:
+        """Evaluate one shared FVM mesh independently for every flow case.
+
+        Returns:
+            Tuples ``(case_id, [u, v, p], freestream_velocity)``.  Averaging
+            losses over these tuples gives every operating point equal weight
+            and prevents fluxes from unrelated cases from cancelling.
+        """
+        outputs = []
+        flow_cases = getattr(self.data_handler, "flow_cases", {0: None})
+        for case_id in sorted(flow_cases):
+            case_ids = torch.full(
+                (x.shape[0],),
+                int(case_id),
+                device=x.device,
+                dtype=torch.long,
+            )
+            inputs = self.loss_computer.build_input_tensor(
+                x,
+                y,
+                sdf,
+                boundary_types,
+                case_ids=case_ids,
+            )
+            raw = self.model(inputs)
+            u, v, p = raw[:, 0:1], raw[:, 1:2], raw[:, 2:3]
+            if (
+                self.loss_computer.bc_type == "hard"
+                and boundary_types is not None
+            ):
+                u, v, p = self._apply_hard_constraints_from_boundary_types(
+                    u,
+                    v,
+                    p,
+                    boundary_types,
+                    case_ids=case_ids,
+                )
+            u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                u,
+                v,
+                boundary_types,
+                case_ids=case_ids,
+            )
+            target_u, target_v = (
+                self.loss_computer.get_freestream_targets(
+                    x[:1],
+                    case_ids[:1],
+                )
+            )
+            freestream = torch.cat((target_u, target_v), dim=1).reshape(2)
+            outputs.append(
+                (int(case_id), torch.cat((u, v, p), dim=1), freestream)
+            )
+        return outputs
+
     def _compute_global_integral_loss_from_dataset(self) -> torch.Tensor:
         """Fallback integral loss по полной выборке inlet/outlet, если FVM-сетки нет."""
         if not self.loss_computer.integral_condition:
@@ -1617,8 +1685,25 @@ class Trainer:
             bt,
             case_ids=ds.case_id[mask],
         )
-
-        return self.loss_computer.compute_integral_loss(u, v, bt, x, y)
+        selected_case_ids = ds.case_id[mask].to(
+            self.device,
+            dtype=torch.long,
+        )
+        case_losses = []
+        for case_id in torch.unique(selected_case_ids, sorted=True):
+            case_mask = selected_case_ids == case_id
+            case_losses.append(
+                self.loss_computer.compute_integral_loss(
+                    u[case_mask],
+                    v[case_mask],
+                    bt[case_mask],
+                    x[case_mask],
+                    y[case_mask],
+                )
+            )
+        if not case_losses:
+            return torch.zeros((), device=self.device, dtype=self.dtype)
+        return torch.stack(case_losses).mean()
 
     # ------------------------------------------------------------------
     # FVM-шаг (полный датасет, отдельный от батч-цикла)
@@ -1650,11 +1735,21 @@ class Trainer:
         # Это корректно даже если датасет и сетка имеют разный размер.
         x_all, y_all, sdf_all, bt_all = self._get_fvm_tensors()
 
-        input_all = self.loss_computer.build_input_tensor(x_all, y_all, sdf_all, bt_all)
-        out_all   = self.model(input_all)          # (N_mesh, output_dim)
-        u_fvm     = out_all[:, :2]                  # (N_mesh, 2) — u и v
-
-        fvm_loss = self.loss_computer.compute_fvm_loss(u_fvm)
+        case_outputs = self._forward_fvm_cases(
+            x_all,
+            y_all,
+            sdf_all,
+            bt_all,
+        )
+        fvm_loss = torch.stack(
+            [
+                self.loss_computer.compute_fvm_loss(
+                    output[:, :2],
+                    freestream_velocity=freestream,
+                )
+                for _, output, freestream in case_outputs
+            ]
+        ).mean()
 
         fvm_loss.backward()
         if self.grad_clip is not None:

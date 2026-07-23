@@ -88,6 +88,8 @@ class FVMResiduals:
     def __init__(self, mesh) -> None:
         self._device = torch.device('cpu')
         self._dtype = torch.float64
+        self._geometry_is_dimensionless = False
+        self._geometry_length_scale = 1.0
         self._build_from_mesh(mesh)
 
     # ── Инициализация ─────────────────────────────────────────────────────────
@@ -168,8 +170,19 @@ class FVMResiduals:
                 f"({u.dtype} != {self._dtype}). Вызовите fvm.to(u.device, u.dtype)."
             )
 
-    def _compute_residual(self, u: torch.Tensor, apply_boundary_conditions: bool) -> torch.Tensor:
-        """Внутренняя реализация FVM-невязки с опциональным применением BC."""
+    def _compute_residual(
+        self,
+        u: torch.Tensor,
+        apply_boundary_conditions: bool,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Evaluate a finite-volume residual with optional case-local BC.
+
+        ``freestream_velocity`` overrides stored values on ``inlet`` and
+        ``velocity_dirichlet`` faces without mutating the FVM object.  Unlike
+        :meth:`set_bc_velocity`, this path preserves autograd with respect to
+        a continuous flow parameter.
+        """
         self._validate_velocity(u)
         res = u.new_zeros(self.N)
 
@@ -186,6 +199,31 @@ class FVMResiduals:
             u_b = u[self.bnd_node]
             if apply_boundary_conditions:
                 u_face_b = torch.where(self._prescribed_mask, self._u_prescribed, u_b)
+                if freestream_velocity is not None:
+                    velocity = torch.as_tensor(
+                        freestream_velocity,
+                        device=u.device,
+                        dtype=u.dtype,
+                    )
+                    if velocity.shape == (2,):
+                        velocity = velocity.view(1, 2)
+                    if velocity.shape != (1, 2):
+                        raise ValueError(
+                            "freestream_velocity must have shape (2,) or "
+                            f"(1, 2), received {tuple(velocity.shape)}"
+                        )
+                    freestream_mask = (
+                        (self.bnd_type == BC_CODES["inlet"])
+                        | (
+                            self.bnd_type
+                            == BC_CODES["velocity_dirichlet"]
+                        )
+                    ).view(-1, 1)
+                    u_face_b = torch.where(
+                        freestream_mask,
+                        velocity.expand(self.B, 2),
+                        u_face_b,
+                    )
                 u_face_b = u_face_b.masked_fill(self._zero_flux_mask, 0.0)
             else:
                 u_face_b = u_b
@@ -236,7 +274,11 @@ class FVMResiduals:
 
     # ── Основные методы ───────────────────────────────────────────────────────
 
-    def compute_residual(self, u: torch.Tensor) -> torch.Tensor:
+    def compute_residual(
+        self,
+        u: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Невязка уравнения неразрывности R_i = Φ_i / V_i для каждого КО.
 
@@ -256,9 +298,18 @@ class FVMResiduals:
         Возвращает:
             R: тензор невязок (N,), [с⁻¹]
         """
-        return self._compute_residual(u, apply_boundary_conditions=True)
+        return self._compute_residual(
+            u,
+            apply_boundary_conditions=True,
+            freestream_velocity=freestream_velocity,
+        )
 
-    def mass_loss(self, u: torch.Tensor, reduction: str = "legacy") -> torch.Tensor:
+    def mass_loss(
+        self,
+        u: torch.Tensor,
+        reduction: str = "legacy",
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Среднеквадратичная невязка (скаляр), готовая для сложения с total_loss.
 
@@ -270,7 +321,10 @@ class FVMResiduals:
         Возвращает:
             Скалярный тензор потерь
         """
-        residual = self.compute_residual(u)
+        residual = self.compute_residual(
+            u,
+            freestream_velocity=freestream_velocity,
+        )
         mode = str(reduction or "legacy").strip().lower().replace("-", "_")
 
         volumes = self.V.to(device=residual.device, dtype=residual.dtype)
@@ -374,6 +428,8 @@ class FVMResiduals:
             'M': self.M,
             'B': self.B,
             'device': str(self._device),
+            'geometry_is_dimensionless': self._geometry_is_dimensionless,
+            'geometry_length_scale': self._geometry_length_scale,
             'cv_volume_min':  float(self.V.min()),
             'cv_volume_max':  float(self.V.max()),
             'cv_volume_mean': float(self.V.mean()),
@@ -516,6 +572,46 @@ class FVMResiduals:
         self._dtype = self.V.dtype
         return self
 
+    def nondimensionalize_geometry(
+        self,
+        length_scale: float,
+    ) -> "FVMResiduals":
+        """Scale all planar FVM measures with one reference length.
+
+        Face vectors are divided by ``length_scale`` and dual-cell areas by
+        ``length_scale**2``.  Calling the method repeatedly with the same
+        scale is idempotent; changing scales on an already normalized operator
+        is rejected to avoid silent double normalization.
+        """
+        scale = float(length_scale)
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError(
+                "FVM geometry length_scale must be finite and positive"
+            )
+        if self._geometry_is_dimensionless:
+            if not np.isclose(
+                scale,
+                self._geometry_length_scale,
+                rtol=1e-12,
+                atol=0.0,
+            ):
+                raise ValueError(
+                    "FVM geometry is already normalized with a different "
+                    f"length scale: {self._geometry_length_scale} != {scale}"
+                )
+            return self
+
+        self.edge_S.div_(scale)
+        self.bnd_S.div_(scale)
+        self.V.div_(scale ** 2)
+        self._geometry_is_dimensionless = True
+        self._geometry_length_scale = scale
+        logger.info(
+            "FVM geometry normalized: S/c, V/c^2 with c=%.9g",
+            scale,
+        )
+        return self
+
     def rebuild_from_mesh(self, new_mesh) -> None:
         """
         Пересчитывает геометрические тензоры из новой сетки (для RAR-адаптации).
@@ -526,8 +622,14 @@ class FVMResiduals:
         """
         device = self._device
         dtype = self._dtype
+        was_dimensionless = self._geometry_is_dimensionless
+        length_scale = self._geometry_length_scale
         self._build_from_mesh(new_mesh)
         self.to(device, dtype=dtype)
+        self._geometry_is_dimensionless = False
+        self._geometry_length_scale = 1.0
+        if was_dimensionless:
+            self.nondimensionalize_geometry(length_scale)
         logger.info("FVMResiduals перестроен: N=%d, M=%d, B=%d", self.N, self.M, self.B)
 
     # ── Фабрики ───────────────────────────────────────────────────────────────

@@ -297,9 +297,14 @@ def test_one_train_batch(cfg: dict, handler: DataHandler) -> None:
     assert isinstance(batch, PINNBatch)
     assert torch.equal(batch.case_id, torch.zeros_like(batch.case_id))
     assert np.isclose(handler.flow_cases[0].reynolds, handler.Re)
-    result = trainer.train_batch_adam(batch, accum_step=True)
+    result = trainer.train_batch_adam(
+        batch,
+        accum_step=True,
+        add_fvm=loss_computer.fvm_weight > 0.0,
+    )
     assert result["total"] >= 0.0
     assert torch.isfinite(torch.tensor(result["total"]))
+    assert np.isfinite(result["fvm_loss"])
 
 
 def main() -> None:

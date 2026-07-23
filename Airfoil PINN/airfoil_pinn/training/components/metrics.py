@@ -274,7 +274,11 @@ class MetricsCollector:
             result = self._compute_mass_flow_from_boundary_points()
         return result
 
-    def _predict_velocity_on_fvm_nodes(self) -> Optional[torch.Tensor]:
+    def _predict_velocity_on_fvm_nodes(
+        self,
+        case_id: int = 0,
+    ) -> Optional[torch.Tensor]:
+        """Predict dimensionless FVM-node velocity for one operating point."""
         if self.loss_computer.fvm is None or not hasattr(self.data_handler, 'fvm_x'):
             return None
 
@@ -287,14 +291,36 @@ class MetricsCollector:
             else None
         )
 
-        inp = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        case_ids = torch.full(
+            (x.shape[0],),
+            int(case_id),
+            device=self.device,
+            dtype=torch.long,
+        )
+        inp = self.loss_computer.build_input_tensor(
+            x,
+            y,
+            sdf,
+            bt,
+            case_ids=case_ids,
+        )
         out = self.model(inp)
         u = out[:, 0:1]
         v = out[:, 1:2]
 
         if self.loss_computer.bc_type == 'hard' and bt is not None:
-            u, v = self._apply_hard_velocity_constraints(u, v, bt)
-        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
+            u, v = self._apply_hard_velocity_constraints(
+                u,
+                v,
+                bt,
+                case_ids=case_ids,
+            )
+        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+            u,
+            v,
+            bt,
+            case_ids=case_ids,
+        )
         return torch.cat([u, v], dim=1)
 
     def _apply_hard_velocity_constraints(
@@ -341,35 +367,78 @@ class MetricsCollector:
             inlet_code = BC_CODES['inlet']
             outlet_code = BC_CODES['outlet']
 
+            case_metrics = {}
             with torch.no_grad():
-                velocity = self._predict_velocity_on_fvm_nodes()
-                if velocity is None or fvm.bnd_node.numel() == 0:
-                    return None
-
                 bnd_node = fvm.bnd_node.to(self.device)
+                if bnd_node.numel() == 0:
+                    return None
                 bnd_area = fvm.bnd_S.to(self.device, dtype=self.dtype)
                 bnd_type = fvm.bnd_type.to(self.device)
-                flux = (velocity[bnd_node] * bnd_area).sum(dim=1)
-
-                if self.loss_computer.flow_type == 'axisymmetric':
-                    x = self.data_handler.fvm_x.to(self.device, dtype=self.dtype).flatten()
-                    two_pi = torch.as_tensor(2.0 * np.pi, device=self.device, dtype=self.dtype)
-                    flux = flux * two_pi * torch.clamp(x[bnd_node], min=0.0)
-
                 inlet_mask = bnd_type == inlet_code
                 outlet_mask = bnd_type == outlet_code
-                q_in = -flux[inlet_mask].sum().item() if bool(inlet_mask.any()) else 0.0
-                q_out = flux[outlet_mask].sum().item() if bool(outlet_mask.any()) else 0.0
+                flow_cases = getattr(
+                    self.data_handler,
+                    "flow_cases",
+                    {0: None},
+                )
+                for case_id in sorted(flow_cases):
+                    velocity = self._predict_velocity_on_fvm_nodes(case_id)
+                    if velocity is None:
+                        return None
+                    flux = (velocity[bnd_node] * bnd_area).sum(dim=1)
+
+                    if self.loss_computer.flow_type == 'axisymmetric':
+                        x = self.data_handler.fvm_x.to(
+                            self.device,
+                            dtype=self.dtype,
+                        ).flatten()
+                        two_pi = torch.as_tensor(
+                            2.0 * np.pi,
+                            device=self.device,
+                            dtype=self.dtype,
+                        )
+                        flux = (
+                            flux
+                            * two_pi
+                            * torch.clamp(x[bnd_node], min=0.0)
+                        )
+
+                    q_in = (
+                        -flux[inlet_mask].sum().item()
+                        if bool(inlet_mask.any())
+                        else 0.0
+                    )
+                    q_out = (
+                        flux[outlet_mask].sum().item()
+                        if bool(outlet_mask.any())
+                        else 0.0
+                    )
+                    denominator = abs(q_in) + 1e-12
+                    case_metrics[int(case_id)] = {
+                        "mass_flux_in": q_in,
+                        "mass_flux_out": q_out,
+                        "mass_balance_error": (
+                            abs(q_in - q_out) / denominator
+                            if denominator > 0.0
+                            else 0.0
+                        ),
+                    }
         finally:
             if was_training:
                 self.model.train()
 
-        denom = abs(q_in) + 1e-12
-        return {
-            'mass_flux_in': q_in,
-            'mass_flux_out': q_out,
-            'mass_balance_error': abs(q_in - q_out) / denom if denom > 0 else 0.0,
+        result = {
+            key: float(np.mean([values[key] for values in case_metrics.values()]))
+            for key in (
+                "mass_flux_in",
+                "mass_flux_out",
+                "mass_balance_error",
+            )
         }
+        for case_id, values in case_metrics.items():
+            for key, value in values.items():
+                result[f"{key}_case_{case_id}"] = value
+        return result
 
     @staticmethod
     def _trapz_integral(values: np.ndarray, tangent: np.ndarray) -> float:
@@ -386,14 +455,22 @@ class MetricsCollector:
     def _compute_mass_flow_from_boundary_points(self) -> Dict[str, float]:
         was_training = self.model.training
         self.model.eval()
-        inlet_u, inlet_y = [], []
-        outlet_u, outlet_y = [], []
+        case_data: Dict[int, Dict[str, List[np.ndarray]]] = {}
 
         with torch.no_grad():
             dataloader = self.data_handler.get_boundary_eval_dataloader(('inlet', 'outlet'))
             for batch in dataloader:
                 idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
                 case_ids = getattr(batch, 'case_id', None)
+                if case_ids is None:
+                    case_ids = torch.zeros(
+                        x.shape[0],
+                        dtype=torch.long,
+                    )
+                case_ids = case_ids.to(
+                    self.device,
+                    dtype=torch.long,
+                ).reshape(-1)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
                 sdf = sdf.to(self.device, dtype=self.dtype)
@@ -425,36 +502,122 @@ class MetricsCollector:
                     case_ids=case_ids,
                 )
 
-                if 'inlet' in self.data_handler.boundary_type_names:
-                    inlet_idx = self.data_handler.boundary_type_names.index('inlet')
-                    mask = bt[:, inlet_idx] > 0.5
-                    if bool(mask.any()):
-                        inlet_u.append(u[mask].detach().cpu().numpy().reshape(-1))
-                        inlet_y.append(y[mask].detach().cpu().numpy().reshape(-1))
-                if 'outlet' in self.data_handler.boundary_type_names:
-                    outlet_idx = self.data_handler.boundary_type_names.index('outlet')
-                    mask = bt[:, outlet_idx] > 0.5
-                    if bool(mask.any()):
-                        outlet_u.append(u[mask].detach().cpu().numpy().reshape(-1))
-                        outlet_y.append(y[mask].detach().cpu().numpy().reshape(-1))
+                names = self.data_handler.boundary_type_names
+                inlet_idx = (
+                    names.index("inlet") if "inlet" in names else None
+                )
+                outlet_idx = (
+                    names.index("outlet") if "outlet" in names else None
+                )
+                for case_id in torch.unique(case_ids, sorted=True):
+                    value = int(case_id.item())
+                    storage = case_data.setdefault(
+                        value,
+                        {
+                            "inlet_u": [],
+                            "inlet_y": [],
+                            "outlet_u": [],
+                            "outlet_y": [],
+                        },
+                    )
+                    case_mask = case_ids == case_id
+                    if inlet_idx is not None:
+                        inlet_mask = (
+                            (bt[:, inlet_idx] > 0.5) & case_mask
+                        )
+                        if bool(inlet_mask.any()):
+                            storage["inlet_u"].append(
+                                u[inlet_mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .reshape(-1)
+                            )
+                            storage["inlet_y"].append(
+                                y[inlet_mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .reshape(-1)
+                            )
+                    if outlet_idx is not None:
+                        outlet_mask = (
+                            (bt[:, outlet_idx] > 0.5) & case_mask
+                        )
+                        if bool(outlet_mask.any()):
+                            storage["outlet_u"].append(
+                                u[outlet_mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .reshape(-1)
+                            )
+                            storage["outlet_y"].append(
+                                y[outlet_mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .reshape(-1)
+                            )
 
         if was_training:
             self.model.train()
 
-        q_in = self._trapz_integral(
-            np.concatenate(inlet_u) if inlet_u else np.array([], dtype=np.float64),
-            np.concatenate(inlet_y) if inlet_y else np.array([], dtype=np.float64),
-        )
-        q_out = self._trapz_integral(
-            np.concatenate(outlet_u) if outlet_u else np.array([], dtype=np.float64),
-            np.concatenate(outlet_y) if outlet_y else np.array([], dtype=np.float64),
-        )
-        denom = abs(q_in) + 1e-12
-        return {
-            'mass_flux_in': q_in,
-            'mass_flux_out': q_out,
-            'mass_balance_error': abs(q_in - q_out) / denom if denom > 0 else 0.0,
+        case_metrics = {}
+        empty = np.array([], dtype=np.float64)
+        for case_id, storage in case_data.items():
+            q_in = self._trapz_integral(
+                (
+                    np.concatenate(storage["inlet_u"])
+                    if storage["inlet_u"]
+                    else empty
+                ),
+                (
+                    np.concatenate(storage["inlet_y"])
+                    if storage["inlet_y"]
+                    else empty
+                ),
+            )
+            q_out = self._trapz_integral(
+                (
+                    np.concatenate(storage["outlet_u"])
+                    if storage["outlet_u"]
+                    else empty
+                ),
+                (
+                    np.concatenate(storage["outlet_y"])
+                    if storage["outlet_y"]
+                    else empty
+                ),
+            )
+            denominator = abs(q_in) + 1e-12
+            case_metrics[case_id] = {
+                "mass_flux_in": q_in,
+                "mass_flux_out": q_out,
+                "mass_balance_error": (
+                    abs(q_in - q_out) / denominator
+                    if denominator > 0.0
+                    else 0.0
+                ),
+            }
+        if not case_metrics:
+            return {
+                "mass_flux_in": 0.0,
+                "mass_flux_out": 0.0,
+                "mass_balance_error": 0.0,
+            }
+        result = {
+            key: float(np.mean([values[key] for values in case_metrics.values()]))
+            for key in (
+                "mass_flux_in",
+                "mass_flux_out",
+                "mass_balance_error",
+            )
         }
+        for case_id, values in case_metrics.items():
+            for key, value in values.items():
+                result[f"{key}_case_{case_id}"] = value
+        return result
 
     def _update_boundary_avg_velocities(self) -> None:
         """Вычисляет средние скорости на inlet/outlet с помощью модели (нормированные)."""
