@@ -55,6 +55,7 @@ from airfoil_pinn.app.paths import (
     resolve_project_path,
 )
 from airfoil_pinn.core.type_hints import InitializerMetadataDict
+from airfoil_pinn.data.flow import FlowCase
 from airfoil_pinn.geometry.sdf import PolylineDistanceField
 
 # Импортируем наши модули и классы
@@ -108,6 +109,7 @@ __all__ = [
 # Структура данных для точки с нормализованными полями
 point_dtype = np.dtype([
     ('id', 'i4'),
+    ('case_id', 'i4'),
     ('x_norm', 'f8'),
     ('y_norm', 'f8'),
     ('sdf_norm', 'f8'),
@@ -240,6 +242,7 @@ class Initializer:
         self.geometry_reference: Optional[Dict[str, Any]] = None
         self.chord_source: Optional[str] = None
         self.sdf_geometry_fingerprint: Optional[str] = None
+        self.flow_case: Optional[FlowCase] = None
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
         """
@@ -589,6 +592,13 @@ class Initializer:
         self.rho = self.reference_scales.density
         self.mu = self.reference_scales.dynamic_viscosity
         self.Re = self.reference_scales.reynolds
+        self.flow_case = FlowCase.from_freestream_components(
+            case_id=0,
+            reynolds=self.Re,
+            u_normalized=u_in / self.U_inf,
+            v_normalized=v_in / self.U_inf,
+            name=str(self.conditions_name or "case-0"),
+        )
 
         normal_layer = (
             self.sampler_metadata.get("normal_layer")
@@ -753,6 +763,7 @@ class Initializer:
 
         if 'id' not in self.points.dtype.names:
             arr_norm['id'] = np.arange(N)
+        arr_norm['case_id'] = 0
 
         arr_norm['x_norm'] = self.reference_scales.length_to_dimensionless(
             self.points['x']
@@ -923,6 +934,7 @@ class Initializer:
             'mu': self.mu,
             'Re': self.Re,
             'reference_scales': self.reference_scales.to_metadata(),
+            'flow_cases': [self.flow_case.to_metadata()],
             'sdf_geometry_fingerprint': self.sdf_geometry_fingerprint,
             'sdf_method': 'exact_polyline_segments',
             'delta_bl_99_est': self.delta_bl_est,

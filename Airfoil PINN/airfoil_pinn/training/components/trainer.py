@@ -208,8 +208,11 @@ class Trainer:
         и возвращает словарь с результатами, включая отдельные тензоры потерь.
         """
         idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+        case_ids = getattr(batch, 'case_id', None)
 
         idx = idx.to(self.device)
+        if case_ids is not None:
+            case_ids = case_ids.to(self.device, dtype=torch.long)
         x = x.to(self.device, dtype=self.dtype).requires_grad_(True)
         y = y.to(self.device, dtype=self.dtype).requires_grad_(True)
         sdf = sdf.to(self.device, dtype=self.dtype)
@@ -234,7 +237,13 @@ class Trainer:
         p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
 
         # Формируем входной тензор для модели
-        input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        input_tensor = self.loss_computer.build_input_tensor(
+            x,
+            y,
+            sdf,
+            bt,
+            case_ids=case_ids,
+        )
 
         # Прямой проход модели
         out = self.model(input_tensor)
@@ -785,6 +794,7 @@ class Trainer:
         self.model.eval()
 
         idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+        case_ids = getattr(batch, 'case_id', None)
         n = min(max_samples, x.shape[0])
         if n <= 1:
             if was_training:
@@ -803,7 +813,12 @@ class Trainer:
                 x[i:i + 1],
                 y[i:i + 1],
                 sdf[i:i + 1],
-                bt[i:i + 1] if bt is not None else None
+                bt[i:i + 1] if bt is not None else None,
+                case_ids=(
+                    case_ids[i:i + 1].to(self.device, dtype=torch.long)
+                    if case_ids is not None
+                    else None
+                ),
             )
             out_i = self.model(input_i).sum()
             grads = torch.autograd.grad(out_i, params, retain_graph=False, allow_unused=True)
@@ -845,6 +860,7 @@ class Trainer:
         with torch.no_grad():
             for batch in dataloader:
                 idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+                case_ids = getattr(batch, 'case_id', None)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
                 sdf = sdf.to(self.device, dtype=self.dtype)
@@ -853,7 +869,13 @@ class Trainer:
                 else:
                     bt = None
 
-                input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                input_tensor = self.loss_computer.build_input_tensor(
+                    x,
+                    y,
+                    sdf,
+                    bt,
+                    case_ids=case_ids,
+                )
                 out = self.model(input_tensor)
                 u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
@@ -984,7 +1006,13 @@ class Trainer:
         y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).requires_grad_(True)
         sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype)
         bt_pts = dataset.boundary_types[indices].to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
-        input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
+        input_tensor = self.loss_computer.build_input_tensor(
+            x_pts,
+            y_pts,
+            sdf_pts,
+            bt_pts,
+            case_ids=dataset.case_id[indices],
+        )
         out = self.model(input_tensor)
         u_vals = out[:, 0:1]
         # Обнуляем накопленные градиенты перед вычислением du/dy
@@ -1514,7 +1542,13 @@ class Trainer:
         sdf = ds.sdf[mask].to(self.device, dtype=self.dtype)
         bt = ds.boundary_types[mask].to(self.device, dtype=self.dtype)
 
-        inp = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        inp = self.loss_computer.build_input_tensor(
+            x,
+            y,
+            sdf,
+            bt,
+            case_ids=ds.case_id[mask],
+        )
         out = self.model(inp)
         u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 

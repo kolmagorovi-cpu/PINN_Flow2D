@@ -317,6 +317,7 @@ class PINNSolver:
         # Определяем фактическую размерность входа
         sample_batch = next(iter(self.data_handler.get_dataloader()))
         idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = sample_batch
+        case_ids = getattr(sample_batch, 'case_id', None)
         x = x.to(self.device)
         y = y.to(self.device)
         sdf = sdf.to(self.device)
@@ -324,8 +325,20 @@ class PINNSolver:
             bt = bt.to(self.device)
         else:
             bt = None
-        input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        input_tensor = self.loss_computer.build_input_tensor(
+            x,
+            y,
+            sdf,
+            bt,
+            case_ids=case_ids,
+        )
         actual_input_dim = input_tensor.shape[1]
+        if actual_input_dim != self.loss_computer.feature_manifest.input_dim:
+            raise RuntimeError(
+                "Sample input width disagrees with the feature manifest: "
+                f"{actual_input_dim} != "
+                f"{self.loss_computer.feature_manifest.input_dim}"
+            )
 
         # Получаем параметры масштабирования координат
         coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0}).copy()
@@ -821,6 +834,7 @@ class PINNSolver:
         with torch.no_grad():
             for batch in dataloader:
                 idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+                case_ids = getattr(batch, 'case_id', None)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
                 sdf = sdf.to(self.device, dtype=self.dtype)
@@ -829,7 +843,13 @@ class PINNSolver:
                 else:
                     bt = None
 
-                input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                input_tensor = self.loss_computer.build_input_tensor(
+                    x,
+                    y,
+                    sdf,
+                    bt,
+                    case_ids=case_ids,
+                )
                 out = self.model(input_tensor)
                 u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 

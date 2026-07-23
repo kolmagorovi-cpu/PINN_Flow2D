@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from airfoil_pinn.app.paths import PATHS
+from airfoil_pinn.data.batch import PINNBatch
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.data.initializer import SCIPY_AVAILABLE, _compute_sdf_chunk
 from airfoil_pinn.physics.fvm import FVMResiduals
@@ -30,24 +31,6 @@ def _load_config() -> dict:
     cfg["loss_weights"]["fvm"]["weight"] = 0.0
     cfg["diagnostics"]["mass_metrics_interval"] = 10**9
     return cfg
-
-
-def _input_dim(cfg: dict, handler: DataHandler) -> int:
-    dim = 0
-    inp = cfg["input_params"]
-    if inp.get("coordinates", True):
-        dim += 2
-    if inp.get("sdf", True):
-        dim += 1
-    if inp.get("boundary_types", True):
-        dim += len(handler.boundary_type_names)
-    if inp.get("inlet_velocity", False):
-        dim += 2
-    if inp.get("viscosity", False):
-        dim += 1
-    if inp.get("density", False):
-        dim += 1
-    return dim
 
 
 def _make_loss_computer_for_input_flag(boundary_types_enabled: bool) -> LossComputer:
@@ -292,7 +275,7 @@ def test_one_train_batch(cfg: dict, handler: DataHandler) -> None:
         == handler.fvm_sdf_geometry_fingerprint
     )
     model = PINNIncompressible(
-        input_dim=_input_dim(cfg, handler),
+        input_dim=loss_computer.feature_manifest.input_dim,
         layers=[16, 16],
         activation="tanh",
         output_dim=3,
@@ -311,6 +294,9 @@ def test_one_train_batch(cfg: dict, handler: DataHandler) -> None:
     )
 
     batch = next(iter(handler.get_dataloader()))
+    assert isinstance(batch, PINNBatch)
+    assert torch.equal(batch.case_id, torch.zeros_like(batch.case_id))
+    assert np.isclose(handler.flow_cases[0].reynolds, handler.Re)
     result = trainer.train_batch_adam(batch, accum_step=True)
     assert result["total"] >= 0.0
     assert torch.isfinite(torch.tensor(result["total"]))

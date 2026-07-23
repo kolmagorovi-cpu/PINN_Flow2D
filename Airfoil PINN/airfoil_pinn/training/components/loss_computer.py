@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from airfoil_pinn.geometry.sdf import PolylineDistanceField
+from airfoil_pinn.training.input_features import InputFeatureAssembler
 from airfoil_pinn.utils import safe_grad
 from airfoil_pinn.physics.pde import PDEResiduals
 
@@ -131,6 +132,19 @@ class LossComputer:
 
         # Входные параметры (для построения тензора)
         self.input_params = config['input_params']
+        self.feature_assembler = InputFeatureAssembler(
+            config,
+            getattr(data_handler, 'boundary_type_names', ()),
+        )
+        self.feature_manifest = self.feature_assembler.manifest
+        logger.info(
+            "Network input manifest: dim=%d, fingerprint=%s, features=%s",
+            self.feature_manifest.input_dim,
+            self.feature_manifest.fingerprint()[:12],
+            ", ".join(
+                feature.name for feature in self.feature_manifest.features
+            ),
+        )
         self.sdf_module: Optional[PolylineDistanceField] = None
         self.sdf_geometry_fingerprint: Optional[str] = None
         self.sdf_absolute_tie_tolerance = 1e-7
@@ -692,54 +706,46 @@ class LossComputer:
         x: torch.Tensor,
         y: torch.Tensor,
         sdf: torch.Tensor,
-        boundary_types: Optional[torch.Tensor]
+        boundary_types: Optional[torch.Tensor],
+        case_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Собирает входной тензор для модели на основе координат, SDF,
-        опционального one-hot типа границы и дополнительных параметров
-        (скорость на входе, вязкость, плотность), если они включены
-        в конфигурацию.
+        """Assemble the manifest-defined dimensionless network input.
 
         Args:
-            x, y: координаты (тензоры)
-            sdf: нормализованное расстояние до стенки
-            boundary_types: one-hot тензор типов границ (или None).
-                Для loss-масок он передается всегда, но во вход модели
-                попадает только при input_params.boundary_types=True.
+            x: Chord-normalized x coordinate.
+            y: Chord-normalized y coordinate.
+            sdf: Chord-normalized differentiable/cached distance.
+            boundary_types: Optional one-hot boundary categories.
+            case_ids: Per-point flow-case identifiers.  When omitted, the
+                legacy single case ``0`` is used.
 
         Returns:
-            тензор формы (batch_size, input_dim)
+            Tensor with exactly ``feature_manifest.input_dim`` columns.
         """
-        inputs = []
-        if self.input_params.get('coordinates', True):
-            inputs.extend([x, y])
-        if self.input_params.get('sdf', True):
-            inputs.append(sdf)
-        if (
-            self.input_params.get('boundary_types', True)
-            and boundary_types is not None
-            and boundary_types.shape[1] > 0
-        ):
-            inputs.append(boundary_types)
-
-        if self.input_params.get('inlet_velocity', False):
-            u_in = torch.ones_like(x) * self.data_handler.inlet_u_norm
-            v_in = torch.ones_like(x) * self.data_handler.inlet_v_norm
-            inputs.append(u_in)
-            inputs.append(v_in)
-
-        if self.input_params.get('viscosity', False):
-            mu = torch.ones_like(x) * self.mu_norm
-            inputs.append(mu)
-
-        if self.input_params.get('density', False):
-            rho = torch.ones_like(x) * self.rho_norm
-            inputs.append(rho)
-
-        if not inputs:
-            raise ValueError("build_input_tensor: не выбран ни один входной признак")
-
-        return torch.cat(inputs, dim=1)
+        flow = None
+        if self.feature_assembler.requires_flow:
+            if case_ids is None:
+                case_ids = torch.zeros(
+                    x.shape[0],
+                    device=x.device,
+                    dtype=torch.long,
+                )
+            if not hasattr(self.data_handler, 'get_flow_case_batch'):
+                raise RuntimeError(
+                    "Parametric inputs require DataHandler.get_flow_case_batch"
+                )
+            flow = self.data_handler.get_flow_case_batch(
+                case_ids,
+                device=x.device,
+                dtype=x.dtype,
+            )
+        return self.feature_assembler.build(
+            x,
+            y,
+            sdf,
+            boundary_types,
+            flow,
+        )
 
     # ------------------------------------------------------------------
     # Применение hard граничных условий

@@ -388,6 +388,7 @@ class MetricsCollector:
             dataloader = self.data_handler.get_boundary_eval_dataloader(('inlet', 'outlet'))
             for batch in dataloader:
                 idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+                case_ids = getattr(batch, 'case_id', None)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
                 sdf = sdf.to(self.device, dtype=self.dtype)
@@ -395,7 +396,13 @@ class MetricsCollector:
                 if bt is None:
                     continue
 
-                inp = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                inp = self.loss_computer.build_input_tensor(
+                    x,
+                    y,
+                    sdf,
+                    bt,
+                    case_ids=case_ids,
+                )
                 out = self.model(inp)
                 u = out[:, 0:1]
                 v = out[:, 1:2]
@@ -447,6 +454,7 @@ class MetricsCollector:
         with torch.no_grad():
             for batch in dataloader:
                 idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+                case_ids = getattr(batch, 'case_id', None)
                 # Приводим к нужному устройству и типу данных
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
@@ -461,7 +469,13 @@ class MetricsCollector:
                 u_bc = u_bc.to(self.device, dtype=self.dtype).view(-1, 1)
 
                 # Построение входного тензора
-                input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                input_tensor = self.loss_computer.build_input_tensor(
+                    x,
+                    y,
+                    sdf,
+                    bt,
+                    case_ids=case_ids,
+                )
                 out = self.model(input_tensor)
                 u_raw = out[:, 0:1]
 

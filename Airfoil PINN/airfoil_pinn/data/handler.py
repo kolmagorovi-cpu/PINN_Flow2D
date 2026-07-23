@@ -36,6 +36,12 @@ from airfoil_pinn.app.paths import (
     resolve_project_path,
 )
 from airfoil_pinn.core.type_hints import PointDtypeDict
+from airfoil_pinn.data.batch import PINNBatch, collate_pinn_batches
+from airfoil_pinn.data.flow import (
+    FlowCase,
+    FlowCaseBatch,
+    flow_cases_from_metadata,
+)
 from airfoil_pinn.data.normalization import (
     ReferenceScales,
     extract_geometry_reference,
@@ -152,9 +158,10 @@ class PINNDataset(Dataset):
     """
     Dataset для точек коллокации.
 
-    Возвращает кортеж: (idx, x, y, sdf, boundary_types,
-                        mask_u_fixed, mask_v_fixed, mask_p_fixed,
-                        u_bc, v_bc, p_bc)
+    Returns a :class:`PINNBatch` point sample.  Its iterator exposes the
+    historical tuple ``(idx, x, y, sdf, boundary_types, mask_u_fixed,
+    mask_v_fixed, mask_p_fixed, u_bc, v_bc, p_bc)`` while ``case_id`` remains
+    available as a named field.
     Все тензоры хранятся в float32.
 
     Attributes:
@@ -218,6 +225,7 @@ class PINNDataset(Dataset):
         self.on_boundary = torch.zeros(len(self.x), dtype=torch.bool)
         self.on_airfoil = torch.zeros(len(self.x), dtype=torch.bool)
         self.segment_id = torch.full((len(self.x),), -1, dtype=torch.long)
+        self.case_id = torch.zeros(len(self.x), dtype=torch.long)
 
         if 'on_boundary' in data.dtype.names:
             self.on_boundary = torch.tensor(
@@ -234,6 +242,13 @@ class PINNDataset(Dataset):
                 np.ascontiguousarray(data['segment_id']),
                 dtype=torch.long
             )
+        if 'case_id' in data.dtype.names:
+            self.case_id = torch.tensor(
+                np.ascontiguousarray(data['case_id']),
+                dtype=torch.long,
+            )
+            if bool((self.case_id < 0).any()):
+                raise ValueError("case_id values must be non-negative")
 
         if 'boundary_type' in data.dtype.names:
             # Приводим все уникальные значения к нижнему регистру
@@ -338,7 +353,7 @@ class PINNDataset(Dataset):
         """
         return self.n_points
 
-    def __getitem__(self, idx: int) -> Tuple:
+    def __getitem__(self, idx: int) -> PINNBatch:
         """
         Возвращает элемент датасета по индексу.
 
@@ -346,26 +361,27 @@ class PINNDataset(Dataset):
             idx: Индекс элемента
 
         Returns:
-            Кортеж с данными точки
+            Named point sample with legacy tuple iteration.
         """
-        # Базовые тензоры
-        result = (idx, self.x[idx], self.y[idx], self.sdf[idx])
-
-        # One-hot границ (если есть)
-        if self.boundary_types is not None:
-            result += (self.boundary_types[idx],)
-        else:
-            result += (torch.zeros(0),)
-
-        # Маски и значения
-        result += (self.mask_u_fixed[idx].view(1),
-                   self.mask_v_fixed[idx].view(1),
-                   self.mask_p_fixed[idx].view(1),
-                   self.u_bc[idx].view(1),
-                   self.v_bc[idx].view(1),
-                   self.p_bc[idx].view(1))
-
-        return result
+        boundary_types = (
+            self.boundary_types[idx]
+            if self.boundary_types is not None
+            else torch.zeros(0)
+        )
+        return PINNBatch(
+            index=torch.tensor(idx, dtype=torch.long),
+            x=self.x[idx],
+            y=self.y[idx],
+            sdf=self.sdf[idx],
+            boundary_types=boundary_types,
+            mask_u_fixed=self.mask_u_fixed[idx].view(1),
+            mask_v_fixed=self.mask_v_fixed[idx].view(1),
+            mask_p_fixed=self.mask_p_fixed[idx].view(1),
+            u_bc=self.u_bc[idx].view(1),
+            v_bc=self.v_bc[idx].view(1),
+            p_bc=self.p_bc[idx].view(1),
+            case_id=self.case_id[idx],
+        )
 
     def extend(self, indices: torch.Tensor) -> 'PINNDataset':
         """
@@ -384,7 +400,7 @@ class PINNDataset(Dataset):
                      'mask_u_fixed', 'mask_v_fixed', 'mask_p_fixed',
                      'u_bc', 'v_bc', 'p_bc', 'boundary_types',
                      'on_boundary', 'on_airfoil', 'segment_id',
-                     'mesh_x_phys', 'mesh_y_phys']:
+                     'case_id', 'mesh_x_phys', 'mesh_y_phys']:
             old = getattr(self, attr, None)
             if old is not None:
                 new = torch.cat([old, old[indices]], dim=0)
@@ -470,6 +486,7 @@ class DataHandler:
         self.load_metadata()
         self._load_sampler_point_metadata()
         self._reconcile_geometry_normalization()
+        self._log_flow_cases()
         self.load_mesh_geometry_from_geom_config()
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
@@ -490,6 +507,7 @@ class DataHandler:
             'shuffle': shuffle,
             'num_workers': self.num_workers,
             'pin_memory': self.pin_memory,
+            'collate_fn': collate_pinn_batches,
         }
         if self.num_workers > 0:
             kwargs['persistent_workers'] = self.persistent_workers
@@ -543,6 +561,22 @@ class DataHandler:
         self.geometry_reference = meta.get('geometry_reference')
         self.inlet_u_norm = meta.get('inlet_u_norm', 1.0)
         self.inlet_v_norm = meta.get('inlet_v_norm', 0.0)
+        self.has_explicit_flow_cases = meta.get('flow_cases') is not None
+        self.flow_cases = flow_cases_from_metadata(
+            meta,
+            fallback_reynolds=self.Re,
+            fallback_u_normalized=self.inlet_u_norm,
+            fallback_v_normalized=self.inlet_v_norm,
+        )
+        unknown_case_ids = (
+            set(int(value) for value in torch.unique(self.dataset.case_id))
+            - set(self.flow_cases)
+        )
+        if unknown_case_ids:
+            raise ValueError(
+                "Dataset references undefined flow case IDs: "
+                f"{sorted(unknown_case_ids)}"
+            )
         # Границы области (нормированные)
         self.x_min = self.dataset.x.min().item()
         self.x_max = self.dataset.x.max().item()
@@ -561,6 +595,91 @@ class DataHandler:
         logger.info(f"Вход: u_norm={self.inlet_u_norm:.3f}, v_norm={self.inlet_v_norm:.3f}")
         self.dataset.mesh_x_phys = (self.dataset.x.double().flatten() * float(self.chord)).clone()
         self.dataset.mesh_y_phys = (self.dataset.y.double().flatten() * float(self.chord)).clone()
+
+    def _log_flow_cases(self) -> None:
+        """Log the final case table after legacy geometry reconciliation."""
+        logger.info(
+            "Flow cases: %s",
+            ", ".join(
+                f"id={case.case_id}:Re={case.reynolds:.6g},"
+                f"alpha={case.angle_degrees:.6g}deg"
+                for case in self.flow_cases.values()
+            ),
+        )
+
+    def get_flow_case_batch(
+        self,
+        case_ids: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> FlowCaseBatch:
+        """Materialize dimensionless case parameters for point associations."""
+        ids = case_ids.to(device=device, dtype=torch.long).reshape(-1, 1)
+        batch_size = ids.shape[0]
+        reynolds = torch.empty((batch_size, 1), device=device, dtype=dtype)
+        cos_alpha = torch.empty_like(reynolds)
+        sin_alpha = torch.empty_like(reynolds)
+
+        pressure_defined = all(
+            case.pressure_drop_coefficient is not None
+            for case in self.flow_cases.values()
+        )
+        pressure_drop = (
+            torch.empty_like(reynolds)
+            if pressure_defined
+            else None
+        )
+        geometry_widths = {
+            len(case.geometry_parameters) for case in self.flow_cases.values()
+        }
+        if len(geometry_widths) != 1:
+            raise ValueError(
+                "All flow cases must use the same geometry parameter width"
+            )
+        geometry_width = geometry_widths.pop()
+        geometry = (
+            torch.empty(
+                (batch_size, geometry_width),
+                device=device,
+                dtype=dtype,
+            )
+            if geometry_width > 0
+            else None
+        )
+
+        assigned = torch.zeros((batch_size, 1), device=device, dtype=torch.bool)
+        for case_id, case in self.flow_cases.items():
+            mask = ids == int(case_id)
+            if not bool(mask.any()):
+                continue
+            reynolds[mask] = case.reynolds
+            cos_alpha[mask] = case.cos_alpha
+            sin_alpha[mask] = case.sin_alpha
+            assigned |= mask
+            if pressure_drop is not None:
+                pressure_drop[mask] = float(
+                    case.pressure_drop_coefficient
+                )
+            if geometry is not None:
+                row_mask = mask.reshape(-1)
+                geometry[row_mask] = torch.as_tensor(
+                    case.geometry_parameters,
+                    device=device,
+                    dtype=dtype,
+                )
+
+        if not bool(assigned.all()):
+            missing = torch.unique(ids[~assigned]).detach().cpu().tolist()
+            raise ValueError(f"Undefined flow case IDs in batch: {missing}")
+        return FlowCaseBatch(
+            case_id=ids,
+            reynolds=reynolds,
+            cos_alpha=cos_alpha,
+            sin_alpha=sin_alpha,
+            pressure_drop_coefficient=pressure_drop,
+            geometry_parameters=geometry,
+        )
 
     def _load_sampler_point_metadata(self) -> None:
         """
@@ -692,6 +811,18 @@ class DataHandler:
         self.sdf_norm_factor = new_chord
         self.reference_scales = self.reference_scales.with_chord(new_chord)
         self.Re = self.reference_scales.reynolds
+        if not self.has_explicit_flow_cases:
+            legacy_case = self.flow_cases[0]
+            self.flow_cases[0] = FlowCase(
+                case_id=0,
+                reynolds=self.Re,
+                angle_degrees=legacy_case.angle_degrees,
+                pressure_drop_coefficient=(
+                    legacy_case.pressure_drop_coefficient
+                ),
+                geometry_parameters=legacy_case.geometry_parameters,
+                name=legacy_case.name,
+            )
         normal_layer = (
             self.sampler_metadata.get('normal_layer')
             if isinstance(self.sampler_metadata, dict)
@@ -1122,6 +1253,7 @@ class DataHandler:
         x_norm: np.ndarray,
         y_norm: np.ndarray,
         sdf_norm: np.ndarray,
+        case_id: int = 0,
     ) -> int:
         """
         Добавляет новые interior-точки с уникальными координатами.
@@ -1137,6 +1269,8 @@ class DataHandler:
             return 0
         if not (len(y_norm) == n_new and len(sdf_norm) == n_new):
             raise ValueError("x_norm, y_norm и sdf_norm должны иметь одинаковую длину")
+        if int(case_id) not in self.flow_cases:
+            raise ValueError(f"Undefined flow case ID for RAR: {case_id}")
 
         ds = self.dataset
         if ds.boundary_types is None or 'interior' not in ds.type_to_idx:
@@ -1183,6 +1317,13 @@ class DataHandler:
         ds.on_boundary = torch.cat([ds.on_boundary, torch.zeros(n_new, dtype=torch.bool)], dim=0)
         ds.on_airfoil = torch.cat([ds.on_airfoil, torch.zeros(n_new, dtype=torch.bool)], dim=0)
         ds.segment_id = torch.cat([ds.segment_id, torch.full((n_new,), -1, dtype=torch.long)], dim=0)
+        ds.case_id = torch.cat(
+            [
+                ds.case_id,
+                torch.full((n_new,), int(case_id), dtype=torch.long),
+            ],
+            dim=0,
+        )
         ds.source_indices = torch.cat(
             [ds.source_indices, torch.arange(old_n, old_n + n_new, dtype=torch.long)],
             dim=0,
@@ -1200,7 +1341,8 @@ class DataHandler:
             'x', 'y', 'sdf', 'p_target', 'u_target', 'v_target',
             'boundary_types', 'mask_u_fixed', 'mask_v_fixed', 'mask_p_fixed',
             'u_bc', 'v_bc', 'p_bc', 'on_boundary', 'on_airfoil',
-            'segment_id', 'source_indices', 'mesh_x_phys', 'mesh_y_phys',
+            'segment_id', 'case_id', 'source_indices', 'mesh_x_phys',
+            'mesh_y_phys',
         ]
         dataset_state = {
             attr: getattr(ds, attr, None).detach().cpu().clone()
@@ -1258,6 +1400,11 @@ class DataHandler:
 
         if getattr(ds, 'source_indices', None) is None:
             ds.source_indices = torch.arange(ds.n_points, dtype=torch.long)
+        if (
+            getattr(ds, 'case_id', None) is None
+            or len(ds.case_id) != ds.n_points
+        ):
+            ds.case_id = torch.zeros(ds.n_points, dtype=torch.long)
         if getattr(ds, 'mesh_x_phys', None) is None:
             ds.mesh_x_phys = (ds.x.double().flatten() * float(self.chord)).clone()
         if getattr(ds, 'mesh_y_phys', None) is None:

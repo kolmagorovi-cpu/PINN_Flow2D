@@ -10,9 +10,12 @@
 
 __all__ = [
     "DataHandler",
+    "FlowCase",
+    "FlowCaseBatch",
     "Initializer",
     "MeshData",
     "MeshPointAdapter",
+    "PINNBatch",
     "PINNDataset",
     "initialize_menu",
 ]
@@ -42,6 +45,19 @@ def __getattr__(name: str):
             "PINNDataset": PINNDataset,
         }
         return exports[name]
+
+    if name in {"FlowCase", "FlowCaseBatch"}:
+        from airfoil_pinn.data.flow import FlowCase, FlowCaseBatch
+
+        return {
+            "FlowCase": FlowCase,
+            "FlowCaseBatch": FlowCaseBatch,
+        }[name]
+
+    if name == "PINNBatch":
+        from airfoil_pinn.data.batch import PINNBatch
+
+        return PINNBatch
 
     if name in {"Initializer", "initialize_menu"}:
         from airfoil_pinn.data.initializer import Initializer, initialize_menu
