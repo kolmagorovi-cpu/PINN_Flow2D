@@ -382,12 +382,23 @@ class ConfigManager:
         print(f"  viscosity       : {inp.get('viscosity', False)}")
         print(f"  density         : {inp.get('density', False)}")
         print(f"  fluid_file      : {inp.get('fluid_file', '-')}")
+        features = self.config.get('input_features')
+        if features:
+            print("  effective input_features:")
+            for name, value in features.items():
+                print(f"    {name:<20}: {value}")
         print()
 
         print("АРХИТЕКТУРА:")
         arch = self.config['architecture']
         print(f"  hidden_layers   : {arch['hidden_layers']}")
         print(f"  activation      : {arch.get('activation', 'tanh')}")
+        if arch.get('activation') == 'siren':
+            print(
+                "  SIREN omega_0    : "
+                f"first={arch.get('siren_first_omega_0', 30.0)}, "
+                f"hidden={arch.get('siren_hidden_omega_0', 30.0)}"
+            )
         print(f"  output_dim      : {arch['output_dim']}")
         print(f"  output_bias     : {arch['output_bias']}")
         print()

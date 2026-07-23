@@ -53,6 +53,10 @@ from airfoil_pinn.training.reference import (
     load_reference,
 )
 from airfoil_pinn.training.progress import build_epoch_progress
+from airfoil_pinn.training.reproducibility import (
+    capture_rng_state,
+    restore_rng_state,
+)
 from airfoil_pinn.training.telemetry import RunTelemetry
 
 # Компоненты тренировочного процесса.
@@ -429,7 +433,11 @@ class PINNSolver:
 
         # Получаем параметры масштабирования координат
         coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0}).copy()
-        coord_scaling['coord_dim'] = 2 if self.config.get('input_params', {}).get('coordinates', True) else 0
+        coord_scaling['coord_dim'] = (
+            2
+            if self.loss_computer.feature_assembler.coordinates_enabled
+            else 0
+        )
 
         return PINNIncompressible(
             input_dim=actual_input_dim,
@@ -748,6 +756,12 @@ class PINNSolver:
                 self.metrics.history = checkpoint['history']
             if 'epoch' in checkpoint and checkpoint['epoch'] is not None:
                 self.start_epoch = checkpoint['epoch']
+            restore_rng_state(checkpoint.get("rng_state"))
+            if "rng_state" not in checkpoint:
+                logger.warning(
+                    "Legacy checkpoint has no RNG state; graph compatibility "
+                    "is preserved, but stochastic continuation is not exact."
+                )
             logger.info(f"Чекпоинт загружен, продолжение с эпохи {self.start_epoch}")
         except Exception as e:
             logger.error("Ошибка загрузки чекпоинта: %s", e, exc_info=True)
@@ -792,6 +806,7 @@ class PINNSolver:
                 'data_handler_state': self.data_handler.get_state(),
                 'trainer_state': self.trainer.get_state(),
                 'using_lbfgs': self.using_lbfgs,
+                'rng_state': capture_rng_state(),
             }
         )
 

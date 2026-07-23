@@ -335,6 +335,30 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
                     "and strictly ordered"
                 )
 
+    geometry_cfg = (
+        features.get("geometry_parameters", {})
+        if isinstance(features, Mapping)
+        else {}
+    )
+    if isinstance(geometry_cfg, Mapping):
+        names = geometry_cfg.get("names", ())
+        enabled = bool(geometry_cfg.get("enabled", bool(names)))
+        if enabled:
+            if (
+                not isinstance(names, Sequence)
+                or isinstance(names, (str, bytes))
+                or not names
+                or any(not str(name).strip() for name in names)
+            ):
+                errors.append(
+                    "enabled input_features.geometry_parameters requires "
+                    "non-empty names"
+                )
+            elif len({str(name) for name in names}) != len(names):
+                errors.append(
+                    "input_features.geometry_parameters.names must be unique"
+                )
+
     _raise_errors(errors)
 
 
@@ -405,6 +429,48 @@ def validate_runtime_contract(
             errors.append(
                 "multiple pressure-drop coefficients require their input "
                 "feature"
+            )
+
+    if feature_assembler.reynolds_enabled:
+        outside = [
+            case.case_id
+            for case in cases
+            if not (
+                feature_assembler.reynolds_min
+                <= case.reynolds
+                <= feature_assembler.reynolds_max
+            )
+        ]
+        if outside:
+            errors.append(
+                "flow-case Reynolds numbers must lie inside "
+                "input_features.reynolds.range; outside case IDs "
+                f"{outside}"
+            )
+    if feature_assembler.pressure_drop_enabled:
+        missing_pressure = [
+            case.case_id
+            for case in cases
+            if case.pressure_drop_coefficient is None
+        ]
+        if missing_pressure:
+            errors.append(
+                "pressure_drop_coefficient input is enabled but missing for "
+                f"case IDs {missing_pressure}"
+            )
+    if feature_assembler.geometry_enabled:
+        expected_geometry = len(
+            feature_assembler.geometry_parameter_names
+        )
+        wrong_geometry = [
+            case.case_id
+            for case in cases
+            if len(case.geometry_parameters) != expected_geometry
+        ]
+        if wrong_geometry:
+            errors.append(
+                "geometry parameter count does not match configured names "
+                f"for case IDs {wrong_geometry}"
             )
 
     reference_scales = getattr(data_handler, "reference_scales", None)

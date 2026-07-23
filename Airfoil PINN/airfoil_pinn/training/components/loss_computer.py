@@ -206,7 +206,7 @@ class LossComputer:
         available, but a training call requesting differentiable SDF fails
         with a descriptive error in :meth:`prepare_sdf_for_pde`.
         """
-        if not self.input_params.get('sdf', True):
+        if not self.feature_assembler.sdf_enabled:
             return
 
         polyline = getattr(self.data_handler, 'mesh_airfoil_coords', None)
@@ -271,7 +271,7 @@ class LossComputer:
         Interior points receive the online distance, preserving all chain-rule
         terms from the network's SDF input to ``x`` and ``y``.
         """
-        if not self.input_params.get('sdf', True):
+        if not self.feature_assembler.sdf_enabled:
             return cached_sdf, torch.ones_like(x, dtype=torch.bool)
         if self.sdf_module is None:
             raise RuntimeError(

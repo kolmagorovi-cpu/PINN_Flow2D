@@ -66,6 +66,17 @@ class StaticValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, "reynolds"):
             validate_static_config(config)
 
+    def test_duplicate_geometry_names_are_rejected(self) -> None:
+        config = _default_config()
+        config["input_features"] = {
+            "geometry_parameters": {
+                "enabled": True,
+                "names": ["thickness", "thickness"],
+            }
+        }
+        with self.assertRaisesRegex(ConfigurationError, "unique"):
+            validate_static_config(config)
+
 
 class RuntimeValidationTests(unittest.TestCase):
     """Ensure varying case parameters are visible to the neural network."""
@@ -121,6 +132,30 @@ class RuntimeValidationTests(unittest.TestCase):
             assembler,
             sdf_geometry_fingerprint="geometry",
         )
+
+    def test_case_reynolds_must_be_inside_feature_range(self) -> None:
+        config = _default_config()
+        config["input_features"] = {
+            "coordinates": {"enabled": True},
+            "sdf": {"enabled": True},
+            "reynolds": {"enabled": True, "range": [1e4, 1e5]},
+        }
+        handler = SimpleNamespace(
+            flow_cases={
+                0: FlowCase(0, reynolds=2e5),
+            },
+            dataset=SimpleNamespace(case_id=torch.tensor([0])),
+            reference_scales=_reference_scales(),
+            fvm_sdf_geometry_fingerprint="geometry",
+        )
+        assembler = InputFeatureAssembler(config, ["interior"])
+        with self.assertRaisesRegex(ConfigurationError, "outside case IDs"):
+            validate_runtime_contract(
+                config,
+                handler,
+                assembler,
+                sdf_geometry_fingerprint="geometry",
+            )
 
 
 def _training_contract(angle: float = 0.0) -> TrainingContract:

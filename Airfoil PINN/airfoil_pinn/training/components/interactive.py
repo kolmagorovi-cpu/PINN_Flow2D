@@ -13,6 +13,7 @@ import torch
 import numpy as np
 
 from airfoil_pinn.training.contract import build_training_contract
+from airfoil_pinn.training.reproducibility import capture_rng_state
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +276,7 @@ class InteractiveHandler:
                 "data_handler_state": self.data_handler.get_state(),
                 "trainer_state": self.trainer.get_state(),
                 "using_lbfgs": self.trainer.using_lbfgs,
+                "rng_state": capture_rng_state(),
             },
         )
 

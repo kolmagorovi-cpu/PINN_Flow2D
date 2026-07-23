@@ -388,6 +388,32 @@ class InputParamsDict(TypedDict, total=False):
     fluid_file: Optional[str]
 
 
+class FeatureToggleDict(TypedDict, total=False):
+    """Enable/disable one manifest-driven input feature."""
+    enabled: bool
+
+
+class ReynoldsFeatureDict(FeatureToggleDict, total=False):
+    """Log-scaled chord Reynolds input configuration."""
+    range: List[float]
+
+
+class GeometryFeaturesDict(FeatureToggleDict, total=False):
+    """Ordered dimensionless geometry parameter configuration."""
+    names: List[str]
+
+
+class InputFeaturesDict(TypedDict, total=False):
+    """Modern manifest-driven neural-network input configuration."""
+    coordinates: Union[bool, FeatureToggleDict]
+    sdf: Union[bool, FeatureToggleDict]
+    reynolds: Union[bool, ReynoldsFeatureDict]
+    angle_of_attack: Union[bool, FeatureToggleDict]
+    boundary_types: Union[bool, FeatureToggleDict]
+    pressure_drop_coefficient: Union[bool, FeatureToggleDict]
+    geometry_parameters: Union[bool, GeometryFeaturesDict]
+
+
 class ArchitectureDict(TypedDict, total=False):
     """Архитектура нейронной сети."""
     hidden_layers: List[int]
@@ -560,6 +586,7 @@ class FullConfigDict(TypedDict, total=False):
     """
     project_name: str
     input_params: InputParamsDict
+    input_features: InputFeaturesDict
     architecture: ArchitectureDict
     pde: PDEConfigDict
     boundary_conditions: BoundaryConditionsConfigDict
@@ -646,6 +673,10 @@ __all__ = [
     'InitializerMetadataDict',
     # Конфигурация
     'InputParamsDict',
+    'FeatureToggleDict',
+    'ReynoldsFeatureDict',
+    'GeometryFeaturesDict',
+    'InputFeaturesDict',
     'ArchitectureDict',
     'CoordinateScalingDict',
     'PDEConfigDict',

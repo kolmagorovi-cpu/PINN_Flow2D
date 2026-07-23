@@ -8,15 +8,69 @@
 формирование PNG-файла со схемой входов, скрытых слоев и выходов сети.
 """
 
+import logging
 import os
 from typing import Any
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 
-from airfoil_pinn.app.paths import PICTURES_DIR
+from airfoil_pinn.app.paths import PICTURES_DIR, resolve_project_path
+from airfoil_pinn.data.handler import PINNDataset
+from airfoil_pinn.training.input_features import InputFeatureAssembler
 
 __all__ = ["PICTURES_DIR", "visualize_network"]
+
+logger = logging.getLogger(__name__)
+
+
+def _input_labels(config: dict[str, Any]) -> list[str]:
+    """Return labels in the exact manifest order used during training."""
+    boundary_names: list[str] = []
+    points_file = config.get("data", {}).get("points_file")
+    if points_file:
+        try:
+            dataset = PINNDataset(str(resolve_project_path(points_file)))
+            boundary_names = list(dataset.boundary_type_names)
+        except Exception as exc:
+            logger.warning(
+                "Cannot load boundary names for network diagram: %s",
+                exc,
+            )
+    if not boundary_names:
+        feature_config = config.get("input_features", {}) or {}
+        boundary_config = feature_config.get("boundary_types", {})
+        boundary_enabled = (
+            boundary_config.get("enabled", True)
+            if isinstance(boundary_config, dict)
+            else bool(boundary_config)
+        )
+        if boundary_enabled:
+            boundary_names = ["boundary_type"]
+
+    assembler = InputFeatureAssembler(config, boundary_names)
+    labels: list[str] = []
+    for feature in assembler.manifest.features:
+        if feature.name == "coordinates":
+            labels.extend(["x/c", "y/c"])
+        elif feature.name == "sdf":
+            labels.append("SDF/c")
+        elif feature.name == "reynolds":
+            labels.append("scaled log10(Re_c)")
+        elif feature.name == "angle_of_attack":
+            labels.extend(["cos(alpha)", "sin(alpha)"])
+        elif feature.name == "boundary_types":
+            labels.extend(f"bc:{name}" for name in boundary_names)
+        elif feature.name == "pressure_drop_coefficient":
+            labels.append("delta_p/q_inf")
+        elif feature.name == "geometry_parameters":
+            labels.extend(assembler.geometry_parameter_names)
+        else:
+            labels.extend(
+                f"{feature.name}[{index}]"
+                for index in range(feature.width)
+            )
+    return labels
 
 
 def visualize_network(config: dict[str, Any], filename: str) -> None:
@@ -27,26 +81,13 @@ def visualize_network(config: dict[str, Any], filename: str) -> None:
         config: полная конфигурация проекта.
         filename: имя файла внутри директории ``workspace/pictures``.
     """
-    input_params = config.get("input_params", {})
     arch = config.get("architecture", {})
     hidden_layers = arch.get("hidden_layers", [50, 50, 50, 50])
     activation = arch.get("activation", "tanh")
     output_dim = arch.get("output_dim", 3)
 
     # Подписи входов должны соответствовать флагам из input_params.
-    input_labels = []
-    if input_params.get("coordinates", True):
-        input_labels.extend(["x", "y"])
-    if input_params.get("sdf", True):
-        input_labels.append("sdf")
-    if input_params.get("boundary_types", True):
-        input_labels.append("boundary (one-hot)")
-    if input_params.get("inlet_velocity", False):
-        input_labels.extend(["u_in", "v_in"])
-    if input_params.get("viscosity", False):
-        input_labels.append("mu")
-    if input_params.get("density", False):
-        input_labels.append("rho")
+    input_labels = _input_labels(config)
 
     input_dim = len(input_labels)
 
@@ -131,7 +172,11 @@ def visualize_network(config: dict[str, Any], filename: str) -> None:
         facecolor=color_output,
     )
     ax.add_patch(rect_out)
-    outputs = ["u", "v", "p"] if output_dim == 3 else ["u", "v", "p", "rho"]
+    outputs = (
+        ["u/U_inf", "v/U_inf", "Cp"]
+        if output_dim == 3
+        else [f"output[{index}]" for index in range(output_dim)]
+    )
     ax.text(
         x_out,
         1 + height_out / 2,

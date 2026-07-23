@@ -22,6 +22,7 @@ from airfoil_pinn.data.handler import (
     _seed_dataloader_worker,
 )
 from airfoil_pinn.training.models import PINNIncompressible, Sine
+from airfoil_pinn.training.network_diagram import _input_labels
 from airfoil_pinn.training.numerics import (
     NumericalTrainingError,
     check_gradient_health,
@@ -187,6 +188,36 @@ class OperationalRobustnessTests(unittest.TestCase):
         self.assertIs(
             build_epoch_progress(epochs, enabled=False),
             epochs,
+        )
+
+    def test_network_diagram_uses_modern_manifest_labels(self) -> None:
+        config = copy.deepcopy(ConfigManager().config)
+        config["data"]["points_file"] = "missing-for-diagram-test.npy"
+        config["input_features"] = {
+            "coordinates": {"enabled": True},
+            "sdf": {"enabled": True},
+            "reynolds": {
+                "enabled": True,
+                "range": [1e4, 1e6],
+            },
+            "angle_of_attack": {"enabled": True},
+            "boundary_types": {"enabled": False},
+            "geometry_parameters": {
+                "enabled": True,
+                "names": ["thickness_over_chord"],
+            },
+        }
+        self.assertEqual(
+            _input_labels(config),
+            [
+                "x/c",
+                "y/c",
+                "SDF/c",
+                "scaled log10(Re_c)",
+                "cos(alpha)",
+                "sin(alpha)",
+                "thickness_over_chord",
+            ],
         )
 
     def test_worker_seeding_is_reproducible(self) -> None:

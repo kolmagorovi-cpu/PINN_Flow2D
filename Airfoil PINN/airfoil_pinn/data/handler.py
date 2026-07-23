@@ -1488,6 +1488,9 @@ class DataHandler:
             'mesh_data': mesh_state,
             'mesh_domain_coords': self.mesh_domain_coords,
             'mesh_airfoil_coords': self.mesh_airfoil_coords,
+            'loader_generator_state': (
+                self._loader_generator.get_state().cpu()
+            ),
         }
 
     def load_state(self, state: Optional[Dict[str, Any]]) -> None:
@@ -1523,6 +1526,11 @@ class DataHandler:
 
         self.mesh_domain_coords = state.get('mesh_domain_coords', self.mesh_domain_coords)
         self.mesh_airfoil_coords = state.get('mesh_airfoil_coords', self.mesh_airfoil_coords)
+        loader_generator_state = state.get('loader_generator_state')
+        if loader_generator_state is not None:
+            self._loader_generator.set_state(
+                loader_generator_state.cpu()
+            )
 
         mesh_state = state.get('mesh_data')
         if mesh_state is not None:
