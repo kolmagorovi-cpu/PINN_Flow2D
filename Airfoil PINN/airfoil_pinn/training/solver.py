@@ -31,10 +31,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from airfoil_pinn.app.paths import PATHS, project_relative, resolve_project_path
+from airfoil_pinn.config.validation import (
+    validate_runtime_contract,
+    validate_static_config,
+)
 from airfoil_pinn.utils import check_memory_usage, set_seed
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.training.models import PINNIncompressible, SelfAdaptiveWeights
 from airfoil_pinn.training.checkpoint import CheckpointManager
+from airfoil_pinn.training.contract import (
+    build_training_contract,
+    validate_checkpoint_contract,
+)
 from airfoil_pinn.training.key_listener import KeyListener
 from airfoil_pinn.training.visualizer import Visualizer
 from airfoil_pinn.training.boundary_layer_diagnostics import run_boundary_layer_diagnostics
@@ -69,6 +77,7 @@ class PINNSolver:
             experiment_dir: директория для сохранения результатов эксперимента
                            (если None, создаётся уникальная папка в workspace/experiments)
         """
+        validate_static_config(config)
         self.config = config
         self.config_name = config.get('project_name', 'unnamed')
         self.experiment_dir = str(resolve_project_path(experiment_dir)) if experiment_dir else None
@@ -139,6 +148,23 @@ class PINNSolver:
             y_max=self.y_max,
             device=self.device,
             dtype=self.dtype
+        )
+        validate_runtime_contract(
+            config,
+            self.data_handler,
+            self.loss_computer.feature_assembler,
+            sdf_geometry_fingerprint=(
+                self.loss_computer.sdf_geometry_fingerprint
+            ),
+        )
+        self.training_contract = build_training_contract(
+            config,
+            self.data_handler,
+            self.loss_computer,
+        )
+        logger.info(
+            "Training contract: %s",
+            self.training_contract.fingerprint()[:12],
         )
 
         # FVM-геометрия используется не только для FVM-loss, но и для
@@ -559,10 +585,46 @@ class PINNSolver:
 
     def _load_checkpoint_if_needed(self):
         load_path = self.config['process'].get('load_model_path')
-        if not load_path or not os.path.exists(load_path):
+        if not load_path:
             return
+        load_path = str(resolve_project_path(load_path))
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(
+                f"Requested checkpoint does not exist: {load_path}"
+            )
         try:
             checkpoint = torch.load(load_path, map_location=self.device, weights_only=False)
+            checkpoint_cfg = self.config.get("checkpoint", {})
+            contract_metadata = checkpoint.get("training_contract")
+            if contract_metadata is None:
+                if not bool(
+                    checkpoint_cfg.get(
+                        "allow_legacy_without_contract",
+                        True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Legacy checkpoint has no training contract and "
+                        "checkpoint.allow_legacy_without_contract=False"
+                    )
+                logger.warning(
+                    "Legacy checkpoint has no training contract; only tensor "
+                    "shape compatibility can be checked."
+                )
+            else:
+                try:
+                    validate_checkpoint_contract(
+                        contract_metadata,
+                        self.training_contract,
+                    )
+                except Exception:
+                    if bool(checkpoint_cfg.get("strict_contract", True)):
+                        raise
+                    logger.warning(
+                        "Checkpoint contract mismatch ignored because "
+                        "checkpoint.strict_contract=False.",
+                        exc_info=True,
+                    )
             # Сначала восстанавливаем данные/RAR-сетку, чтобы размеры SA-весов и
             # optimizer state соответствовали фактическому датасету.
             if 'data_handler_state' in checkpoint:
@@ -619,7 +681,10 @@ class PINNSolver:
                 self.start_epoch = checkpoint['epoch']
             logger.info(f"Чекпоинт загружен, продолжение с эпохи {self.start_epoch}")
         except Exception as e:
-            logger.error(f"Ошибка загрузки чекпоинта: {e}")
+            logger.error("Ошибка загрузки чекпоинта: %s", e, exc_info=True)
+            raise RuntimeError(
+                f"Checkpoint resume failed for {load_path}: {e}"
+            ) from e
 
     def _get_run_dir(self) -> str:
         """Возвращает корневую директорию текущего запуска (единый timestamp)."""
@@ -654,6 +719,7 @@ class PINNSolver:
             epoch=identifier if isinstance(identifier, int) else None,
             config=self.config,
             extra_state={
+                'training_contract': self.training_contract.to_metadata(),
                 'data_handler_state': self.data_handler.get_state(),
                 'trainer_state': self.trainer.get_state(),
                 'using_lbfgs': self.using_lbfgs,

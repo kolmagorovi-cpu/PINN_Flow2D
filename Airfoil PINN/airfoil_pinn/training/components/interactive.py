@@ -12,6 +12,8 @@ from typing import Optional, Dict, Any
 import torch
 import numpy as np
 
+from airfoil_pinn.training.contract import build_training_contract
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["InteractiveHandler"]
@@ -253,6 +255,11 @@ class InteractiveHandler:
         Сохраняет чекпоинт по запросу пользователя (Ctrl+S).
         """
         logger.info("💾 Сохранение чекпоинта по запросу...")
+        training_contract = build_training_contract(
+            self.config,
+            self.data_handler,
+            self.loss_computer,
+        )
         self.checkpoint_manager.save(
             filename=f"pinn_manual_epoch_{epoch}.pt",
             model=self.model,
@@ -262,7 +269,13 @@ class InteractiveHandler:
             history=self.metrics.history,
             sa_weights=self.sa_weights,
             epoch=epoch,
-            config=self.config
+            config=self.config,
+            extra_state={
+                "training_contract": training_contract.to_metadata(),
+                "data_handler_state": self.data_handler.get_state(),
+                "trainer_state": self.trainer.get_state(),
+                "using_lbfgs": self.trainer.using_lbfgs,
+            },
         )
 
     def _adjust_lr(self, factor: float) -> None:

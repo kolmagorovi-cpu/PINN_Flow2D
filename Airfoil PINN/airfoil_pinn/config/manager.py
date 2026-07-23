@@ -18,6 +18,7 @@ from typing import Dict, Any, Optional
 import yaml
 
 from airfoil_pinn.app.paths import PATHS, project_relative
+from airfoil_pinn.config.validation import validate_static_config
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,8 @@ class ConfigManager:
             },
             'checkpoint': {
                 'interval': 500,
+                'strict_contract': True,
+                'allow_legacy_without_contract': True,
                 'name_pattern': '{project_name}_{timestamp}',
                 'model_name_pattern': '{project_name}_{timestamp}',
                 'save_flow_images': True,
@@ -307,6 +310,11 @@ class ConfigManager:
         if 'architecture' in self.config and 'output_bias' in self.config['architecture']:
             if isinstance(self.config['architecture']['output_bias'], list):
                 self.config['architecture']['output_bias'] = tuple(self.config['architecture']['output_bias'])
+        self.validate()
+
+    def validate(self) -> None:
+        """Raise a consolidated error for incompatible configuration values."""
+        validate_static_config(self.config)
 
     def save(self, name: Optional[str] = None) -> None:
         """
@@ -317,6 +325,7 @@ class ConfigManager:
         """
         if name:
             self.name = name
+        self.validate()
         # Перед сохранением преобразуем кортежи в списки
         config_copy = self._prepare_for_save(self.config)
         path = os.path.join(self.CONFIG_DIR, self.name + '.yaml')
