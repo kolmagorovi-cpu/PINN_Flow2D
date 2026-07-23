@@ -73,8 +73,8 @@ from airfoil_pinn.data.sdf_diagnostics import (
     resolve_boundary_layer_model,
 )
 from airfoil_pinn.data.normalization import (
+    ReferenceScales,
     build_geometry_reference,
-    compute_reynolds_number,
     extract_geometry_reference,
     load_companion_metadata,
 )
@@ -555,27 +555,40 @@ class Initializer:
                 print("Введите число.")
 
     def _compute_normalization_params(self) -> None:
-        """Вычисляет параметры нормализации на основе выбранных жидкости и условий."""
+        """Build and validate the physical CFD reference-scale contract.
+
+        A zero freestream velocity is rejected because Reynolds number,
+        velocity normalization and pressure-coefficient normalization would
+        otherwise be undefined.  Previous versions silently substituted
+        ``U_inf = 1``; that produced dimensionally inconsistent artifacts.
+        """
         if self.fluid is None or self.conditions is None:
             raise RuntimeError("Сначала выберите жидкость и условия.")
 
-        self.chord = self._load_chord_from_metadata()
+        chord = self._load_chord_from_metadata()
         u_in = self.conditions.u
         v_in = self.conditions.v
-        self.U_inf = np.sqrt(u_in**2 + v_in**2)
-        if self.U_inf == 0:
-            self.U_inf = 1.0
-            logger.warning("⚠️ СКОРОСТЬ НА ВХОДЕ РАВНА 0! Использую U_inf = 1 для нормализации. "
-                          "Это может привести к нефизичным результатам. Рекомендуется изменить граничные условия.")
-        self.p_ref = self.conditions.outlet_pressure
-        self.rho = self.fluid.density
-        self.mu = self.fluid.dynamic_viscosity
-        self.Re = compute_reynolds_number(
-            self.U_inf,
-            self.chord,
-            self.rho,
-            self.mu,
+        velocity = float(np.hypot(u_in, v_in))
+        if not np.isfinite(velocity) or velocity <= 0.0:
+            raise ValueError(
+                "Модуль скорости набегающего потока должен быть конечным и "
+                "положительным. Невозможно определить Re, u*, v* и Cp при "
+                f"U_inf={velocity!r} м/с."
+            )
+
+        self.reference_scales = ReferenceScales(
+            chord=chord,
+            velocity=velocity,
+            density=self.fluid.density,
+            dynamic_viscosity=self.fluid.dynamic_viscosity,
+            static_pressure=self.conditions.outlet_pressure,
         )
+        self.chord = self.reference_scales.chord
+        self.U_inf = self.reference_scales.velocity
+        self.p_ref = self.reference_scales.static_pressure
+        self.rho = self.reference_scales.density
+        self.mu = self.reference_scales.dynamic_viscosity
+        self.Re = self.reference_scales.reynolds
 
         normal_layer = (
             self.sampler_metadata.get("normal_layer")
@@ -733,8 +746,12 @@ class Initializer:
         if 'id' not in self.points.dtype.names:
             arr_norm['id'] = np.arange(N)
 
-        arr_norm['x_norm'] = self.points['x'] / self.chord
-        arr_norm['y_norm'] = self.points['y'] / self.chord
+        arr_norm['x_norm'] = self.reference_scales.length_to_dimensionless(
+            self.points['x']
+        )
+        arr_norm['y_norm'] = self.reference_scales.length_to_dimensionless(
+            self.points['y']
+        )
 
         # --- Генерация начального поля скорости ---
         x = self.points['x']
@@ -776,8 +793,13 @@ class Initializer:
 
         # Добавление шума к давлению
         if self.pressure_perturbation_amplitude > 0:
-            q_ref = 0.5 * self.rho * self.U_inf**2
-            p_phys += self.pressure_perturbation_amplitude * q_ref * (2 * np.random.random(N) - 1)
+            q_ref = self.reference_scales.dynamic_pressure
+            pressure_noise = 2 * np.random.random(N) - 1
+            p_phys += (
+                self.pressure_perturbation_amplitude
+                * q_ref
+                * pressure_noise
+            )
 
         # Применяем граничные условия к начальному полю скорости
         if 'boundary_type' in self.points.dtype.names:
@@ -792,9 +814,15 @@ class Initializer:
             u_phys[axis_mask] = 0.0
 
         # Нормализация
-        arr_norm['u_norm'] = u_phys / self.U_inf
-        arr_norm['v_norm'] = v_phys / self.U_inf
-        arr_norm['p_norm'] = (p_phys - self.p_ref) / (0.5 * self.rho * self.U_inf**2)
+        arr_norm['u_norm'] = self.reference_scales.velocity_to_dimensionless(
+            u_phys
+        )
+        arr_norm['v_norm'] = self.reference_scales.velocity_to_dimensionless(
+            v_phys
+        )
+        arr_norm['p_norm'] = self.reference_scales.pressure_to_coefficient(
+            p_phys
+        )
 
         # --- Вычисление SDF (с поддержкой многопроцессорности) ---
         if len(self.wall_points) == 0:
@@ -838,7 +866,9 @@ class Initializer:
                         use_scipy=False,
                     )
 
-        arr_norm['sdf_norm'] = sdf_phys / self.chord
+        arr_norm['sdf_norm'] = self.reference_scales.length_to_dimensionless(
+            sdf_phys
+        )
 
         self.points_norm = arr_norm
         logger.info("Нормализованные поля инициализированы.")
@@ -861,8 +891,12 @@ class Initializer:
         logger.info(f"Сохранено: {base}")
 
         # Вычисляем нормализованные значения скорости на входе
-        inlet_u_norm = self.conditions.u / self.U_inf if self.U_inf > 0 else 1.0
-        inlet_v_norm = self.conditions.v / self.U_inf if self.U_inf > 0 else 0.0
+        inlet_u_norm = self.reference_scales.velocity_to_dimensionless(
+            self.conditions.u
+        )
+        inlet_v_norm = self.reference_scales.velocity_to_dimensionless(
+            self.conditions.v
+        )
 
         meta = {
             'description': description,
@@ -880,6 +914,7 @@ class Initializer:
             'rho': self.rho,
             'mu': self.mu,
             'Re': self.Re,
+            'reference_scales': self.reference_scales.to_metadata(),
             'delta_bl_99_est': self.delta_bl_est,
             'delta_bl_99_est_norm': self.delta_bl_est_norm,
             'delta_bl_model': self.boundary_layer_model,

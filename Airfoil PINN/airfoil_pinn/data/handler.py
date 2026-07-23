@@ -37,7 +37,7 @@ from airfoil_pinn.app.paths import (
 )
 from airfoil_pinn.core.type_hints import PointDtypeDict
 from airfoil_pinn.data.normalization import (
-    compute_reynolds_number,
+    ReferenceScales,
     extract_geometry_reference,
     load_companion_metadata,
 )
@@ -496,10 +496,11 @@ class DataHandler:
 
     def load_metadata(self) -> None:
         """
-        Загружает метаданные из файла _metadata.npy.
+        Load and validate the versioned CFD normalization contract.
 
         Raises:
             FileNotFoundError: Если файл метаданных не найден
+            ValueError: If physical reference scales are missing or invalid.
         """
         meta_path = self.points_file.replace('.npy', '_metadata.npy')
         if not os.path.exists(meta_path):
@@ -508,12 +509,31 @@ class DataHandler:
         self.initial_metadata = dict(meta)
         self.fluid_name = meta.get('fluid_name')
         self.conditions_name = meta.get('conditions_name')
-        self.chord = float(meta.get('chord', 1.0))
-        self.U_inf = float(meta.get('U_inf', 1.0))
-        self.p_ref = float(meta.get('p_ref', 0.0))
-        self.rho = float(meta.get('rho', 1.0))
-        self.mu = float(meta.get('mu', 1.0))
-        self.Re = float(meta.get('Re', 1.0))
+        self.reference_scales = ReferenceScales.from_metadata(meta)
+        self.chord = self.reference_scales.chord
+        self.U_inf = self.reference_scales.velocity
+        self.p_ref = self.reference_scales.static_pressure
+        self.rho = self.reference_scales.density
+        self.mu = self.reference_scales.dynamic_viscosity
+        self.Re = self.reference_scales.reynolds
+
+        stored_re = meta.get('Re')
+        if stored_re is not None:
+            try:
+                stored_re_value = float(stored_re)
+            except (TypeError, ValueError):
+                stored_re_value = float('nan')
+            if (
+                np.isfinite(stored_re_value)
+                and stored_re_value > 0.0
+                and not np.isclose(stored_re_value, self.Re, rtol=1e-8, atol=0.0)
+            ):
+                logger.warning(
+                    "Stored Re_c=%.9g disagrees with reference scales "
+                    "(Re_c=%.9g); using the value recomputed from rho*U*c/mu.",
+                    stored_re_value,
+                    self.Re,
+                )
         self.sdf_norm_factor = float(meta.get('sdf_norm_factor', self.chord))
         self.delta_bl_99_est = meta.get('delta_bl_99_est')
         self.delta_bl_99_est_norm = meta.get('delta_bl_99_est_norm')
@@ -526,7 +546,16 @@ class DataHandler:
         self.x_max = self.dataset.x.max().item()
         self.y_min = self.dataset.y.min().item()
         self.y_max = self.dataset.y.max().item()
-        logger.info(f"Метаданные: chord={self.chord:.4f} м, U_inf={self.U_inf:.4f} м/с, Re={self.Re:.2e}")
+        logger.info(
+            "Метаданные: chord=%.4f м, U_inf=%.4f м/с, Re=%.2e, "
+            "normalization=%s:%d, fingerprint=%s",
+            self.chord,
+            self.U_inf,
+            self.Re,
+            self.reference_scales.to_metadata()['schema'],
+            self.reference_scales.to_metadata()['version'],
+            self.reference_scales.fingerprint()[:12],
+        )
         logger.info(f"Вход: u_norm={self.inlet_u_norm:.3f}, v_norm={self.inlet_v_norm:.3f}")
         self.dataset.mesh_x_phys = (self.dataset.x.double().flatten() * float(self.chord)).clone()
         self.dataset.mesh_y_phys = (self.dataset.y.double().flatten() * float(self.chord)).clone()
@@ -659,12 +688,8 @@ class DataHandler:
 
         self.chord = new_chord
         self.sdf_norm_factor = new_chord
-        self.Re = compute_reynolds_number(
-            self.U_inf,
-            self.chord,
-            self.rho,
-            self.mu,
-        )
+        self.reference_scales = self.reference_scales.with_chord(new_chord)
+        self.Re = self.reference_scales.reynolds
         normal_layer = (
             self.sampler_metadata.get('normal_layer')
             if isinstance(self.sampler_metadata, dict)
