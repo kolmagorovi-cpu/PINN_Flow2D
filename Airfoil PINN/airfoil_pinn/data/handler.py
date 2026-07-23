@@ -19,6 +19,7 @@ Example:
 """
 
 import os
+import random
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -65,6 +66,18 @@ __all__ = [
     "MeshPointAdapter",
     "PINNDataset",
 ]
+
+
+def _seed_dataloader_worker(worker_id: int) -> None:
+    """Seed Python and NumPy from the worker seed assigned by PyTorch.
+
+    The function intentionally lives at module scope so it remains picklable
+    with the Windows ``spawn`` multiprocessing method.
+    """
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 @dataclass
@@ -481,6 +494,7 @@ class DataHandler:
         pin_memory: bool = False,
         persistent_workers: Optional[bool] = None,
         prefetch_factor: Optional[int] = None,
+        seed: int = 42,
     ) -> None:
         """
         Инициализирует обработчик данных.
@@ -495,6 +509,7 @@ class DataHandler:
             pin_memory: закреплять CPU-память для ускорения копирования на CUDA.
             persistent_workers: держать worker'ы между эпохами.
             prefetch_factor: число заранее подготовленных batch на worker.
+            seed: базовый seed перемешивания и worker-процессов.
         """
         self.points_file = str(resolve_project_path(points_file))
         self.batch_size = batch_size
@@ -511,6 +526,9 @@ class DataHandler:
             if prefetch_factor is not None
             else 2
         )
+        self.seed = int(seed)
+        self._loader_generator = torch.Generator()
+        self._loader_generator.manual_seed(self.seed)
         self.mesh_data: Optional[MeshData] = None
         self.mesh_file = str(resolve_project_path(mesh_file)) if mesh_file is not None else None
         self.mesh_domain_coords: Optional[np.ndarray] = None
@@ -528,6 +546,21 @@ class DataHandler:
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
         self.dataloader = self._make_dataloader(self.dataset, batch_size=batch_size, shuffle=shuffle)
+        logger.info(
+            "DataLoader: batch=%d, workers=%d, pin_memory=%s, "
+            "persistent=%s, prefetch=%s, seed=%d",
+            self.batch_size,
+            self.num_workers,
+            self.pin_memory,
+            self.persistent_workers if self.num_workers > 0 else False,
+            self.prefetch_factor if self.num_workers > 0 else None,
+            self.seed,
+        )
+        if os.name == "nt" and self.num_workers > 0:
+            logger.info(
+                "Windows multiprocessing uses spawn; launch training below "
+                "an `if __name__ == '__main__'` guard."
+            )
 
         if self.mesh_file is not None:
             self.load_mesh(self.mesh_file)
@@ -545,6 +578,8 @@ class DataHandler:
             'num_workers': self.num_workers,
             'pin_memory': self.pin_memory,
             'collate_fn': collate_pinn_batches,
+            'generator': self._loader_generator,
+            'worker_init_fn': _seed_dataloader_worker,
         }
         if self.num_workers > 0:
             kwargs['persistent_workers'] = self.persistent_workers

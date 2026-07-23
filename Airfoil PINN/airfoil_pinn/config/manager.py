@@ -55,6 +55,8 @@ class ConfigManager:
             'architecture': {
                 'hidden_layers': [50, 50, 50, 50],
                 'activation': 'tanh',
+                'siren_first_omega_0': 30.0,
+                'siren_hidden_omega_0': 30.0,
                 'output_dim': 3,
                 'output_bias': [0.1, 0.0, 0.0],
                 # Масштабирование координат для функции активации
@@ -174,6 +176,9 @@ class ConfigManager:
             },
             'output': {
                 'console_only': True,
+                'progress_bar': True,
+                'progress_bar_force': False,
+                'progress_mininterval': 0.5,
                 'graphical_window': {
                     'loss': True,
                     'pde': True,

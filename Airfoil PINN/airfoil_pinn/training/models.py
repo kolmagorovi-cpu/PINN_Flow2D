@@ -1,9 +1,11 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Модели нейронных сетей для проекта PINN Learning.
+"""Differentiable neural architectures used by the incompressible-flow PINN.
 
-Содержит классы PINNIncompressible и SelfAdaptiveWeights.
+The module contains a fully connected field model and pointwise SA-PINN
+weights.  The SIREN option follows the frequency scaling and layer-specific
+initialization proposed by Sitzmann et al.; this is important because the
+physics loss differentiates network outputs twice with respect to coordinates.
 
 Example:
     >>> model = PINNIncompressible(
@@ -17,12 +19,13 @@ Example:
 Версия: 3.260226 (с поддержкой выбора функции активации)
 """
 
+import math
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from typing import List, Tuple, Optional, Dict
-import numpy as np
-import math
 
 __all__ = [
     "PINNIncompressible",
@@ -32,25 +35,24 @@ __all__ = [
 
 
 class Sine(nn.Module):
-    """
-    Синусоидальная активация для SIREN.
+    """Frequency-scaled sinusoidal activation used by SIREN.
 
     Example:
-        >>> activation = Sine()
+        >>> activation = Sine(omega_0=30.0)
         >>> x = torch.randn(10, 5)
         >>> y = activation(x)
     """
+
+    def __init__(self, omega_0: float = 30.0) -> None:
+        """Store the positive angular-frequency multiplier."""
+        super().__init__()
+        if not math.isfinite(omega_0) or omega_0 <= 0.0:
+            raise ValueError("SIREN omega_0 must be finite and positive")
+        self.omega_0 = float(omega_0)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Применяет синусоидальную активацию.
-
-        Args:
-            x: Входной тензор
-
-        Returns:
-            Тензор с применённой активацией sin(x)
-        """
-        return torch.sin(x)
+        """Return ``sin(omega_0 * x)`` without detaching the graph."""
+        return torch.sin(self.omega_0 * x)
 
 
 class PINNIncompressible(nn.Module):
@@ -77,7 +79,9 @@ class PINNIncompressible(nn.Module):
         activation: str = 'tanh',
         output_dim: int = 3,
         output_bias: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-        coordinate_scaling: Optional[Dict] = None
+        coordinate_scaling: Optional[Dict] = None,
+        siren_first_omega_0: float = 30.0,
+        siren_hidden_omega_0: float = 30.0,
     ) -> None:
         """
         Инициализирует нейронную сеть.
@@ -89,33 +93,78 @@ class PINNIncompressible(nn.Module):
             output_dim: Размерность выхода (обычно 3: u, v, p)
             output_bias: Начальные значения смещения выходного слоя
             coordinate_scaling: Параметры масштабирования координат
+            siren_first_omega_0: SIREN frequency in the first hidden layer.
+            siren_hidden_omega_0: SIREN frequency in later hidden layers.
         """
         super().__init__()
+        if input_dim <= 0 or output_dim <= 0:
+            raise ValueError("Model input_dim and output_dim must be positive")
+        if not layers or any(width <= 0 for width in layers):
+            raise ValueError("Model must contain positive-width hidden layers")
+        for name, value in (
+            ("siren_first_omega_0", siren_first_omega_0),
+            ("siren_hidden_omega_0", siren_hidden_omega_0),
+        ):
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
         self.input_dim = input_dim
         self.hidden_layers = nn.ModuleList()
-        self.activation_name = activation
-        self.activation = self._get_activation(activation)
+        self.activation_name = str(activation).lower()
+        self.siren_first_omega_0 = float(siren_first_omega_0)
+        self.siren_hidden_omega_0 = float(siren_hidden_omega_0)
+        self.activations = nn.ModuleList()
 
         # Параметры масштабирования координат
-        self.coordinate_scaling = coordinate_scaling or {'enabled': False, 'scale_factor': 1.0}
-        self.scale_factor = self.coordinate_scaling.get('scale_factor', 1.0) if self.coordinate_scaling.get('enabled', False) else 1.0
+        self.coordinate_scaling = coordinate_scaling or {
+            'enabled': False,
+            'scale_factor': 1.0,
+        }
+        self.scale_factor = (
+            self.coordinate_scaling.get('scale_factor', 1.0)
+            if self.coordinate_scaling.get('enabled', False)
+            else 1.0
+        )
         self.coord_dim = int(self.coordinate_scaling.get('coord_dim', 2))
 
         prev = input_dim
-        for hidden in layers:
+        for index, hidden in enumerate(layers):
             self.hidden_layers.append(nn.Linear(prev, hidden))
+            omega_0 = (
+                self.siren_first_omega_0
+                if index == 0
+                else self.siren_hidden_omega_0
+            )
+            self.activations.append(
+                self._get_activation(self.activation_name, omega_0=omega_0)
+            )
             prev = hidden
         self.output_layer = nn.Linear(prev, output_dim)
+        # Backward-compatible inspection attribute. Forward uses the
+        # layer-specific modules above.
+        self.activation = self.activations[0]
 
         # Инициализация весов
         self._init_weights()
 
         # Установка bias выходного слоя
         with torch.no_grad():
-            bias = torch.tensor(output_bias[:output_dim], dtype=torch.float32)
-            self.output_layer.bias.data = bias
+            bias = torch.as_tensor(
+                output_bias,
+                dtype=self.output_layer.bias.dtype,
+                device=self.output_layer.bias.device,
+            )
+            if bias.numel() != output_dim:
+                raise ValueError(
+                    "output_bias length must equal model output_dim"
+                )
+            self.output_layer.bias.copy_(bias)
 
-    def _get_activation(self, name: str) -> nn.Module:
+    def _get_activation(
+        self,
+        name: str,
+        *,
+        omega_0: float = 30.0,
+    ) -> nn.Module:
         """
         Возвращает модуль активации по имени.
 
@@ -130,35 +179,48 @@ class PINNIncompressible(nn.Module):
         """
         if name == 'tanh':
             return nn.Tanh()
-        elif name == 'relu':
+        if name == 'relu':
             return nn.ReLU()
-        elif name == 'sigmoid':
+        if name == 'sigmoid':
             return nn.Sigmoid()
-        elif name == 'leaky_relu':
+        if name == 'leaky_relu':
             return nn.LeakyReLU(negative_slope=0.01)
-        elif name == 'elu':
+        if name == 'elu':
             return nn.ELU()
-        elif name == 'swish':
+        if name == 'swish':
             return nn.SiLU()  # SiLU = Swish
-        elif name == 'siren':
-            return Sine()
-        else:
-            raise ValueError(f"Неизвестная функция активации: {name}")
+        if name == 'siren':
+            return Sine(omega_0=omega_0)
+        raise ValueError(f"Неизвестная функция активации: {name}")
 
-    def _init_weights(self):
-        """Инициализация весов в зависимости от типа активации."""
-        for layer in self.hidden_layers:
+    def _init_weights(self) -> None:
+        """Initialize smooth MLP or frequency-scaled SIREN weights."""
+        for index, layer in enumerate(self.hidden_layers):
             if self.activation_name == 'siren':
-                # Инициализация для SIREN: равномерное распределение с масштабом sqrt(6 / fan_in)
                 fan_in = layer.weight.size(1)
-                bound = math.sqrt(6 / fan_in)
+                if index == 0:
+                    bound = 1.0 / fan_in
+                else:
+                    bound = (
+                        math.sqrt(6.0 / fan_in)
+                        / self.siren_hidden_omega_0
+                    )
                 init.uniform_(layer.weight, -bound, bound)
-                init.zeros_(layer.bias)
             else:
                 init.xavier_uniform_(layer.weight)
                 init.zeros_(layer.bias)
-        # Выходной слой всегда инициализируем Xavier (можно также использовать другую инициализацию)
-        init.xavier_uniform_(self.output_layer.weight)
+        if self.activation_name == 'siren':
+            output_bound = (
+                math.sqrt(6.0 / self.output_layer.weight.size(1))
+                / self.siren_hidden_omega_0
+            )
+            init.uniform_(
+                self.output_layer.weight,
+                -output_bound,
+                output_bound,
+            )
+        else:
+            init.xavier_uniform_(self.output_layer.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -177,11 +239,13 @@ class PINNIncompressible(nn.Module):
         else:
             h = x
 
-        for layer in self.hidden_layers:
+        for layer, activation in zip(
+            self.hidden_layers,
+            self.activations,
+        ):
             h = layer(h)
-            h = self.activation(h)
-        out = self.output_layer(h)
-        return out
+            h = activation(h)
+        return self.output_layer(h)
 
 
 class SelfAdaptiveWeights(nn.Module):

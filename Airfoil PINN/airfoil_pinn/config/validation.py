@@ -78,6 +78,8 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
     loss = _mapping(config, "loss_weights", errors)
     training = _mapping(config, "training", errors)
     process = _mapping(config, "process", errors)
+    data = _mapping(config, "data", errors)
+    output = _mapping(config, "output", errors)
 
     features = config.get("input_features", {})
     if features is not None and not isinstance(features, Mapping):
@@ -123,6 +125,43 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
         "siren",
     }:
         errors.append("architecture.activation is unsupported")
+    if (
+        pde.get("system") == "incompressible_navier_stokes"
+        and architecture.get("activation")
+        in {"relu", "leaky_relu", "elu"}
+    ):
+        errors.append(
+            "viscous Navier-Stokes requires a twice-differentiable "
+            "activation; use tanh, sigmoid, swish or siren"
+        )
+    for key in ("siren_first_omega_0", "siren_hidden_omega_0"):
+        try:
+            omega = float(architecture.get(key, 30.0))
+        except (TypeError, ValueError):
+            errors.append(f"architecture.{key} must be numeric")
+        else:
+            if not math.isfinite(omega) or omega <= 0.0:
+                errors.append(
+                    f"architecture.{key} must be finite and positive"
+                )
+    coordinate_scaling = architecture.get("coordinate_scaling", {})
+    if not isinstance(coordinate_scaling, Mapping):
+        errors.append("architecture.coordinate_scaling must be a mapping")
+    elif bool(coordinate_scaling.get("enabled", False)):
+        try:
+            scale_factor = float(
+                coordinate_scaling.get("scale_factor", 1.0)
+            )
+        except (TypeError, ValueError):
+            errors.append(
+                "architecture.coordinate_scaling.scale_factor must be numeric"
+            )
+        else:
+            if not math.isfinite(scale_factor) or scale_factor <= 0.0:
+                errors.append(
+                    "architecture.coordinate_scaling.scale_factor must be "
+                    "finite and positive"
+                )
     if architecture.get("output_dim") != 3:
         errors.append(
             "architecture.output_dim must be 3 for [u/Uinf, v/Uinf, Cp]"
@@ -222,13 +261,53 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
         )
     if training.get("switch_to_lbfgs_epoch", 0) < 0:
         errors.append("training.switch_to_lbfgs_epoch must be non-negative")
-    if process.get("dtype") not in {"float32", "float64", "float16"}:
-        errors.append("process.dtype must be float16, float32 or float64")
+    if process.get("dtype") not in {"float32", "float64"}:
+        errors.append(
+            "process.dtype must be float32 or float64; direct float16 is "
+            "unsafe for second-order PINN derivatives (use AMP instead)"
+        )
     _positive_integer(
         process.get("num_gpus", 1),
         "process.num_gpus",
         errors,
     )
+    grad_clip = training.get("grad_clip")
+    if grad_clip is not None:
+        try:
+            grad_clip_value = float(grad_clip)
+        except (TypeError, ValueError):
+            errors.append("training.grad_clip must be numeric or null")
+        else:
+            if not math.isfinite(grad_clip_value) or grad_clip_value <= 0.0:
+                errors.append(
+                    "training.grad_clip must be finite and positive"
+                )
+    num_workers = data.get("num_workers", 0)
+    if (
+        isinstance(num_workers, bool)
+        or not isinstance(num_workers, int)
+        or num_workers < 0
+    ):
+        errors.append("data.num_workers must be a non-negative integer")
+    _positive_integer(
+        data.get("prefetch_factor", 2),
+        "data.prefetch_factor",
+        errors,
+    )
+    try:
+        progress_mininterval = float(
+            output.get("progress_mininterval", 0.5)
+        )
+    except (TypeError, ValueError):
+        errors.append("output.progress_mininterval must be numeric")
+    else:
+        if (
+            not math.isfinite(progress_mininterval)
+            or progress_mininterval <= 0.0
+        ):
+            errors.append(
+                "output.progress_mininterval must be finite and positive"
+            )
 
     reynolds_cfg = (
         features.get("reynolds", {})

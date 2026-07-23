@@ -38,6 +38,10 @@ from airfoil_pinn.data.sdf_diagnostics import (
     format_sdf_summary,
 )
 from airfoil_pinn.training.components.rar import RARManager
+from airfoil_pinn.training.numerics import (
+    check_gradient_health,
+    ensure_finite_loss,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1751,7 +1755,15 @@ class Trainer:
             ]
         ).mean()
 
+        ensure_finite_loss(
+            fvm_loss,
+            stage="standalone FVM forward",
+        )
         fvm_loss.backward()
+        check_gradient_health(
+            self.model.named_parameters(),
+            stage="standalone FVM backward",
+        )
         if self.grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             if self.sa_weights is not None:
@@ -1820,6 +1832,16 @@ class Trainer:
                 integral_scale=integral_scale,
             )
             total_loss = fwd['total'] / self.accum_steps
+        ensure_finite_loss(
+            total_loss,
+            stage="Adam forward",
+            components={
+                "pde": sum(fwd["pde_raw"].values()),
+                "bc": sum(fwd["bc_comp"].values()),
+                "integral": fwd["integral_loss"],
+                "fvm": fwd.get("fvm_loss", 0.0),
+            },
+        )
 
         # Обратное распространение
         if self.use_amp and self.scaler is not None:
@@ -1827,38 +1849,44 @@ class Trainer:
         else:
             total_loss.backward()
 
-        # Вычисляем норму градиентов (до клиппинга и шага)
         grad_norm = 0.0
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        if self.sa_weights is not None:
-            for p in self.sa_weights.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-        grad_norm = total_norm ** 0.5
 
         # Если пора делать шаг оптимизации
         if accum_step:
             if self.use_amp and self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-                if self.grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    if self.sa_weights is not None:
-                        torch.nn.utils.clip_grad_norm_(self.sa_weights.parameters(), self.grad_clip)
+            named_parameters = list(self.model.named_parameters())
+            if self.sa_weights is not None:
+                named_parameters.extend(
+                    (
+                        f"sa_weights.{name}",
+                        parameter,
+                    )
+                    for name, parameter in self.sa_weights.named_parameters()
+                )
+            gradient_health = check_gradient_health(
+                named_parameters,
+                stage="Adam backward",
+            )
+            grad_norm = gradient_health.l2_norm
+            if self.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.grad_clip,
+                )
+                if self.sa_weights is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.sa_weights.parameters(),
+                        self.grad_clip,
+                    )
+
+            if self.use_amp and self.scaler is not None:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 if self.sa_weights is not None:
                     self.sa_weights.post_step_()
                 self.optimizer.zero_grad()
             else:
-                if self.grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    if self.sa_weights is not None:
-                        torch.nn.utils.clip_grad_norm_(self.sa_weights.parameters(), self.grad_clip)
                 self.optimizer.step()
                 if self.sa_weights is not None:
                     self.sa_weights.post_step_()
@@ -2105,7 +2133,21 @@ class Trainer:
                     fvm_loss_list.append(fwd.get('fvm_loss', 0.0))
                 n_batches += 1
 
+            ensure_finite_loss(
+                total_loss,
+                stage="L-BFGS forward",
+                components={
+                    "pde_batches": len(pde_raw_list),
+                    "bc_batches": len(bc_comp_list),
+                    "integral_batches": len(integral_loss_list),
+                    "fvm_batches": len(fvm_loss_list),
+                },
+            )
             total_loss.backward()
+            check_gradient_health(
+                self.model.named_parameters(),
+                stage="L-BFGS backward",
+            )
             return total_loss
 
         loss = self.optimizer.step(closure)

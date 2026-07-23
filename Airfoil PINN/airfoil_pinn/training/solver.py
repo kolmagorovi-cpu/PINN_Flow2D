@@ -17,6 +17,7 @@
 """
 
 import os
+import platform
 import sys
 import time
 import logging
@@ -51,6 +52,8 @@ from airfoil_pinn.training.reference import (
     interpolate_reference,
     load_reference,
 )
+from airfoil_pinn.training.progress import build_epoch_progress
+from airfoil_pinn.training.telemetry import RunTelemetry
 
 # Компоненты тренировочного процесса.
 from airfoil_pinn.training.components.optimizers import LocalMinimaDetector, CyclicLR
@@ -114,6 +117,7 @@ class PINNSolver:
             pin_memory=pin_memory,
             persistent_workers=data_cfg.get('persistent_workers'),
             prefetch_factor=data_cfg.get('prefetch_factor'),
+            seed=seed,
         )
 
         # Константы PDE (нормированные)
@@ -241,9 +245,11 @@ class PINNSolver:
             config_name=self.config_name,
             reference_data=self.reference_data
         )
+        self.telemetry = RunTelemetry(self._get_logs_dir())
 
         # Загрузка чекпоинта — после MetricsCollector, т.к. восстанавливает history
         self._load_checkpoint_if_needed()
+        self._write_run_manifest()
 
         # Визуализация
         out_cfg = config['output']
@@ -338,6 +344,61 @@ class PINNSolver:
     def _init_dtype(self, dtype_str: str) -> torch.dtype:
         return {'float32': torch.float32, 'float64': torch.float64, 'float16': torch.float16}[dtype_str]
 
+    def _write_run_manifest(self) -> None:
+        """Persist the effective graph, runtime and data-loader identity."""
+        base_model = self._unwrap_model_for_state(self.model)
+        parameter_count = sum(
+            parameter.numel()
+            for parameter in base_model.parameters()
+        )
+        trainable_count = sum(
+            parameter.numel()
+            for parameter in base_model.parameters()
+            if parameter.requires_grad
+        )
+        payload = {
+            "training_contract": self.training_contract.to_metadata(),
+            "runtime": {
+                "python": platform.python_version(),
+                "torch": torch.__version__,
+                "platform": platform.platform(),
+                "device": str(self.device),
+                "dtype": str(self.dtype),
+                "amp": self.use_amp,
+                "start_epoch": self.start_epoch,
+            },
+            "model": {
+                "class": base_model.__class__.__name__,
+                "parameters": parameter_count,
+                "trainable_parameters": trainable_count,
+            },
+            "data_loader": {
+                "points": self.data_handler.n_points,
+                "batch_size": self.data_handler.batch_size,
+                "batches": len(self.data_handler.get_dataloader()),
+                "num_workers": self.data_handler.num_workers,
+                "pin_memory": self.data_handler.pin_memory,
+                "persistent_workers": (
+                    self.data_handler.persistent_workers
+                    if self.data_handler.num_workers > 0
+                    else False
+                ),
+                "prefetch_factor": (
+                    self.data_handler.prefetch_factor
+                    if self.data_handler.num_workers > 0
+                    else None
+                ),
+                "seed": self.data_handler.seed,
+            },
+        }
+        self.telemetry.write_manifest(payload)
+        logger.info(
+            "Run manifest saved: %s; model parameters=%d, batches=%d",
+            self.telemetry.manifest_path,
+            parameter_count,
+            payload["data_loader"]["batches"],
+        )
+
     def _build_model(self) -> PINNIncompressible:
         arch = self.config['architecture']
         # Определяем фактическую размерность входа
@@ -376,7 +437,15 @@ class PINNSolver:
             activation=arch.get('activation', 'tanh'),
             output_dim=arch['output_dim'],
             output_bias=arch['output_bias'],
-            coordinate_scaling=coord_scaling
+            coordinate_scaling=coord_scaling,
+            siren_first_omega_0=arch.get(
+                'siren_first_omega_0',
+                30.0,
+            ),
+            siren_hidden_omega_0=arch.get(
+                'siren_hidden_omega_0',
+                30.0,
+            ),
         )
 
     def _maybe_compile_model(self, model: nn.Module) -> nn.Module:
@@ -993,9 +1062,18 @@ class PINNSolver:
 
         self.start_time = time.time()
         epoch = self.start_epoch  # на случай Ctrl+C до старта цикла
+        output_cfg = self.config.get("output", {})
+        epoch_progress = build_epoch_progress(
+            range(self.start_epoch + 1, epochs + 1),
+            enabled=bool(output_cfg.get("progress_bar", True)),
+            force=bool(output_cfg.get("progress_bar_force", False)),
+            mininterval=float(
+                output_cfg.get("progress_mininterval", 0.5)
+            ),
+        )
 
         try:
-            for epoch in range(self.start_epoch + 1, epochs + 1):
+            for epoch in epoch_progress:
                 start_time = time.time()
 
                 # Мониторинг памяти (каждые 10 эпох)
@@ -1115,6 +1193,38 @@ class PINNSolver:
                         self.scheduler.step()
                     # Другие типы планировщиков (например, StepLR) должны быть обработаны аналогично
 
+                learning_rate = float(
+                    self.optimizer.param_groups[0]["lr"]
+                )
+                self.telemetry.append_epoch(
+                    {
+                        "epoch": epoch,
+                        "optimizer": (
+                            "lbfgs" if self.using_lbfgs else "adam"
+                        ),
+                        "learning_rate": learning_rate,
+                        "pde_multiplier": pde_mult,
+                        "loss": loss,
+                        "pde": pde_raw,
+                        "pde_max": pde_max,
+                        "boundary": bc_comp,
+                        "integral_loss": integral_loss,
+                        "fvm_loss": self.trainer._last_fvm_loss,
+                        "wall_speed": wall_speed,
+                        "gradient_l2_norm": grad_norm,
+                        "diagnostics": extra_diag,
+                        "epoch_seconds": epoch_time,
+                        "elapsed_seconds": total_time,
+                    }
+                )
+                if hasattr(epoch_progress, "set_postfix"):
+                    epoch_progress.set_postfix(
+                        loss=f"{loss:.3e}",
+                        grad=f"{grad_norm:.3e}",
+                        lr=f"{learning_rate:.2e}",
+                        refresh=False,
+                    )
+
                 # Вывод в консоль (avg_u_in/out уже вычислены выше)
                 self.metrics.print_epoch_table(
                     epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time,
@@ -1161,6 +1271,8 @@ class PINNSolver:
             self._finalize()
             raise
         finally:
+            if hasattr(epoch_progress, "close"):
+                epoch_progress.close()
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 

@@ -105,6 +105,14 @@ def build_training_contract(
         "architecture": {
             "hidden_layers": list(architecture.get("hidden_layers", ())),
             "activation": architecture.get("activation"),
+            "siren_first_omega_0": architecture.get(
+                "siren_first_omega_0",
+                30.0,
+            ),
+            "siren_hidden_omega_0": architecture.get(
+                "siren_hidden_omega_0",
+                30.0,
+            ),
             "output_dim": architecture.get("output_dim"),
             "output_bias": list(architecture.get("output_bias", ())),
             "coordinate_scaling": architecture.get(

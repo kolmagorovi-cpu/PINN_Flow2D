@@ -392,6 +392,8 @@ class ArchitectureDict(TypedDict, total=False):
     """Архитектура нейронной сети."""
     hidden_layers: List[int]
     activation: str
+    siren_first_omega_0: float
+    siren_hidden_omega_0: float
     output_dim: int
     output_bias: Union[List[float], Tuple[float, ...]]
     coordinate_scaling: 'CoordinateScalingDict'
@@ -476,6 +478,9 @@ class EarlyStoppingDict(TypedDict, total=False):
 class OutputConfigDict(TypedDict, total=False):
     """Конфигурация вывода."""
     console_only: bool
+    progress_bar: bool
+    progress_bar_force: bool
+    progress_mininterval: float
     graphical_window: 'GraphicalWindowDict'
     plot_frequency: int
 
@@ -490,6 +495,8 @@ class GraphicalWindowDict(TypedDict, total=False):
 class CheckpointConfigDict(TypedDict, total=False):
     """Конфигурация контрольных точек."""
     interval: int
+    strict_contract: bool
+    allow_legacy_without_contract: bool
     name_pattern: str
     model_name_pattern: str
     save_flow_images: bool
