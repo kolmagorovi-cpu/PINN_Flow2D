@@ -219,6 +219,13 @@ class Trainer:
         else:
             bt = None
 
+        sdf, sdf_pde_mask = self.loss_computer.prepare_sdf_for_pde(
+            x,
+            y,
+            sdf,
+            bt,
+        )
+
         mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
         mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
         mask_p = mask_p.to(self.device, dtype=torch.bool).view(-1, 1)
@@ -247,7 +254,7 @@ class Trainer:
         cont = res['cont']
         mom1 = res[self.loss_computer.pde_components[1]]
         mom2 = res[self.loss_computer.pde_components[2]]
-        pde_mask = self._pde_loss_mask(bt, cont)
+        pde_mask = self._pde_loss_mask(bt, cont) & sdf_pde_mask
         pde_score = cont + mom1 + mom2
         self._update_pde_point_residual(
             idx,
@@ -441,8 +448,7 @@ class Trainer:
 
         mask = boundary_types[:, interior_idx].view(-1, 1) > 0.5
         if not bool(mask.any()):
-            logger.warning("PDE-loss mask пустая: fallback на весь batch.")
-            return torch.ones_like(reference, dtype=torch.bool)
+            logger.debug("PDE-loss mask is empty for this boundary-only batch.")
         return mask
 
     @staticmethod
@@ -451,7 +457,7 @@ class Trainer:
         if mask is None or mask.shape != values.shape:
             return values.mean()
         if not bool(mask.any()):
-            return values.mean()
+            return values.sum() * 0.0
         return values[mask].mean()
 
     @staticmethod
@@ -460,7 +466,7 @@ class Trainer:
         if mask is None or mask.shape != values.shape:
             return values.max()
         if not bool(mask.any()):
-            return values.max()
+            return values.sum() * 0.0
         return values[mask].max()
 
     def _compute_sa_bc_loss(

@@ -41,6 +41,7 @@ from airfoil_pinn.data.normalization import (
     extract_geometry_reference,
     load_companion_metadata,
 )
+from airfoil_pinn.geometry.sdf import PolylineDistanceField
 from airfoil_pinn.data.sdf_diagnostics import (
     estimate_boundary_layer_delta,
     resolve_boundary_layer_model,
@@ -463,6 +464,7 @@ class DataHandler:
         self.mesh_airfoil_coords: Optional[np.ndarray] = None
         self.sampler_metadata: Optional[Dict[str, Any]] = None
         self.geometry_reference: Optional[Dict[str, Any]] = None
+        self.fvm_sdf_geometry_fingerprint: Optional[str] = None
 
         self.dataset = PINNDataset(self.points_file)
         self.load_metadata()
@@ -964,14 +966,50 @@ class DataHandler:
         x_norm_np = (coords[:, 0] / self.chord).astype(np.float32)
         y_norm_np = (coords[:, 1] / self.chord).astype(np.float32)
 
-        # SDF по ближайшему соседу из обучающего датасета
-        x_data = self.dataset.x.numpy().flatten().astype(np.float32)
-        y_data = self.dataset.y.numpy().flatten().astype(np.float32)
-        sdf_data = self.dataset.sdf.numpy().flatten().astype(np.float32)
-
-        tree = cKDTree(np.column_stack([x_data, y_data]))
-        _, nn_idx = tree.query(np.column_stack([x_norm_np, y_norm_np]), workers=-1)
-        sdf_norm_np = sdf_data[nn_idx]
+        query_norm = np.column_stack([x_norm_np, y_norm_np])
+        if (
+            self.mesh_airfoil_coords is not None
+            and len(self.mesh_airfoil_coords) >= 2
+        ):
+            airfoil_norm = (
+                np.asarray(self.mesh_airfoil_coords, dtype=np.float64)
+                / self.chord
+            )
+            closed = (
+                bool(self.sampler_metadata.get('foil_closed', True))
+                if isinstance(self.sampler_metadata, dict)
+                else len(airfoil_norm) >= 3
+            )
+            distance_field = PolylineDistanceField(
+                airfoil_norm,
+                closed=closed,
+                segment_chunk_size=256,
+            )
+            sdf_norm_np = distance_field.evaluate_numpy(
+                query_norm,
+                point_chunk_size=2048,
+            ).astype(np.float32)
+            self.fvm_sdf_geometry_fingerprint = (
+                distance_field.geometry_fingerprint
+            )
+            logger.info(
+                "FVM SDF calculated from exact normalized segments: "
+                "segments=%d, geometry=%s",
+                distance_field.segment_count,
+                self.fvm_sdf_geometry_fingerprint[:12],
+            )
+        else:
+            logger.warning(
+                "Ordered airfoil polyline is unavailable; FVM SDF falls "
+                "back to nearest-neighbour values from the training dataset."
+            )
+            x_data = self.dataset.x.numpy().flatten().astype(np.float32)
+            y_data = self.dataset.y.numpy().flatten().astype(np.float32)
+            sdf_data = self.dataset.sdf.numpy().flatten().astype(np.float32)
+            tree = cKDTree(np.column_stack([x_data, y_data]))
+            _, nn_idx = tree.query(query_norm, workers=-1)
+            sdf_norm_np = sdf_data[nn_idx]
+            self.fvm_sdf_geometry_fingerprint = None
 
         # One-hot типов границ (по именам из датасета)
         bt_names = self.dataset.boundary_type_names

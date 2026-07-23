@@ -13,10 +13,13 @@
 учёта направления потока (нормали) и осесимметричной геометрии.
 """
 
-import torch
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
+import torch
+
+from airfoil_pinn.geometry.sdf import PolylineDistanceField
 from airfoil_pinn.utils import safe_grad
 from airfoil_pinn.physics.pde import PDEResiduals
 
@@ -128,10 +131,148 @@ class LossComputer:
 
         # Входные параметры (для построения тензора)
         self.input_params = config['input_params']
+        self.sdf_module: Optional[PolylineDistanceField] = None
+        self.sdf_geometry_fingerprint: Optional[str] = None
+        self.sdf_absolute_tie_tolerance = 1e-7
+        self.sdf_relative_tie_tolerance = 1e-5
+        self._initialize_differentiable_sdf()
 
         # Для axisymmetric требуется eps и множитель 2π
         self.eps_axi = 1e-12
         self.two_pi = 2.0 * torch.pi
+
+    def _initialize_differentiable_sdf(self) -> None:
+        """Build the normalized segment SDF used by PDE autograd.
+
+        Minimal unit-test handlers may not contain a geometry.  In that case
+        input assembly with an explicitly supplied cached SDF remains
+        available, but a training call requesting differentiable SDF fails
+        with a descriptive error in :meth:`prepare_sdf_for_pde`.
+        """
+        if not self.input_params.get('sdf', True):
+            return
+
+        polyline = getattr(self.data_handler, 'mesh_airfoil_coords', None)
+        chord = float(getattr(self.data_handler, 'chord', 0.0))
+        if polyline is None or len(polyline) < 2 or chord <= 0.0:
+            logger.debug(
+                "Differentiable SDF is not initialized: an ordered airfoil "
+                "polyline and a positive chord are required."
+            )
+            return
+
+        sdf_cfg = self.config.get('sdf', {}) or {}
+        chunk_size = int(sdf_cfg.get('segment_chunk_size', 256))
+        self.sdf_absolute_tie_tolerance = float(
+            sdf_cfg.get('absolute_tie_tolerance', 1e-7)
+        )
+        self.sdf_relative_tie_tolerance = float(
+            sdf_cfg.get('relative_tie_tolerance', 1e-5)
+        )
+        if (
+            self.sdf_absolute_tie_tolerance < 0.0
+            or self.sdf_relative_tie_tolerance < 0.0
+        ):
+            raise ValueError("SDF tie tolerances must be non-negative")
+
+        normalized = np.asarray(polyline, dtype=np.float64) / chord
+        sampler_metadata = getattr(self.data_handler, 'sampler_metadata', None)
+        closed = (
+            bool(sampler_metadata.get('foil_closed', True))
+            if isinstance(sampler_metadata, dict)
+            else len(normalized) >= 3
+        )
+        self.sdf_module = PolylineDistanceField(
+            normalized,
+            closed=closed,
+            segment_chunk_size=chunk_size,
+        ).to(device=self.device, dtype=self.dtype)
+        self.sdf_geometry_fingerprint = (
+            self.sdf_module.geometry_fingerprint
+        )
+        logger.info(
+            "Differentiable SDF initialized: segments=%d, closed=%s, "
+            "chunk=%d, geometry=%s",
+            self.sdf_module.segment_count,
+            closed,
+            chunk_size,
+            self.sdf_geometry_fingerprint[:12],
+        )
+
+    def prepare_sdf_for_pde(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        cached_sdf: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compose SDF with coordinates and return its valid PDE mask.
+
+        The exact minimum over segments is not differentiable where two
+        segments are equally close.  Such tie points and wall points keep their
+        cached value and are marked invalid for second-order PDE residuals.
+        Interior points receive the online distance, preserving all chain-rule
+        terms from the network's SDF input to ``x`` and ``y``.
+        """
+        if not self.input_params.get('sdf', True):
+            return cached_sdf, torch.ones_like(x, dtype=torch.bool)
+        if self.sdf_module is None:
+            raise RuntimeError(
+                "SDF is enabled but no ordered airfoil polyline is available. "
+                "Regenerate geometry/sampling artifacts before training."
+            )
+        if x.shape != y.shape or x.shape != cached_sdf.shape:
+            raise ValueError("x, y and cached_sdf must have identical shapes")
+
+        candidate_mask = torch.ones_like(x, dtype=torch.bool)
+        if boundary_types is not None and boundary_types.shape[1] > 0:
+            type_to_idx = getattr(
+                self.data_handler.dataset,
+                'type_to_idx',
+                {},
+            )
+            if not self.pde_on_boundary and 'interior' in type_to_idx:
+                interior_idx = type_to_idx['interior']
+                candidate_mask = (
+                    boundary_types[:, interior_idx].view(-1, 1) > 0.5
+                )
+            wall_idx = type_to_idx.get('wall')
+            if wall_idx is not None and wall_idx < boundary_types.shape[1]:
+                wall_mask = boundary_types[:, wall_idx].view(-1, 1) > 0.5
+                candidate_mask = candidate_mask & ~wall_mask
+
+        candidate_indices = torch.nonzero(
+            candidate_mask.reshape(-1),
+            as_tuple=False,
+        ).reshape(-1)
+        result = cached_sdf.clone()
+        valid_mask = torch.zeros_like(x, dtype=torch.bool)
+        if candidate_indices.numel() == 0:
+            return result, valid_mask
+
+        points = torch.cat((x, y), dim=1)
+        nearest, second = self.sdf_module.nearest_two(
+            points[candidate_indices]
+        )
+        ties = self.sdf_module.tie_mask(
+            nearest,
+            second,
+            absolute_tolerance=self.sdf_absolute_tie_tolerance,
+            relative_tolerance=self.sdf_relative_tie_tolerance,
+        ).detach().reshape(-1)
+        finite = torch.isfinite(nearest.detach()).reshape(-1)
+        safe_local = ~ties & finite
+        safe_indices = candidate_indices[safe_local]
+
+        if safe_indices.numel() > 0:
+            flat_result = result.reshape(-1)
+            flat_result[safe_indices] = nearest.reshape(-1)[safe_local]
+            result = flat_result.reshape_as(cached_sdf)
+            flat_valid = valid_mask.reshape(-1)
+            flat_valid[safe_indices] = True
+            valid_mask = flat_valid.reshape_as(x)
+
+        return result, valid_mask
 
     def _grad(
         self,

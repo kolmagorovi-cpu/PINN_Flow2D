@@ -587,6 +587,14 @@ class BoundaryLayerRAR:
                         dtype=tr.dtype,
                     ).view(-1, 1)
                     bt = _interior_boundary_types(tr, len(x))
+                    sdf_t, sdf_pde_mask = (
+                        loss_computer.prepare_sdf_for_pde(
+                            x,
+                            y,
+                            sdf_t,
+                            bt,
+                        )
+                    )
                     inp = loss_computer.build_input_tensor(x, y, sdf_t, bt)
                     out = model(inp)
                     u, v, p = out[:, 0:1], out[:, 1:2], out[:, 2:3]
@@ -595,6 +603,11 @@ class BoundaryLayerRAR:
                         w_cont * res["cont"]
                         + w_1 * res[pde_components[1]]
                         + w_2 * res[pde_components[2]]
+                    )
+                    score = torch.where(
+                        sdf_pde_mask,
+                        score,
+                        torch.zeros_like(score),
                     )
                     scores.append(
                         torch.nan_to_num(

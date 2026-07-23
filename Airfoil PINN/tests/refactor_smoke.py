@@ -286,6 +286,11 @@ def test_one_train_batch(cfg: dict, handler: DataHandler) -> None:
         device=device,
         dtype=dtype,
     )
+    assert loss_computer.sdf_module is not None
+    assert (
+        loss_computer.sdf_geometry_fingerprint
+        == handler.fvm_sdf_geometry_fingerprint
+    )
     model = PINNIncompressible(
         input_dim=_input_dim(cfg, handler),
         layers=[16, 16],

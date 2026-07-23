@@ -35,8 +35,6 @@ import matplotlib.pyplot as plt
 import logging
 from typing import Optional, List, Tuple, Dict, Any
 import glob
-import multiprocessing as mp
-from functools import partial
 
 try:
     from scipy.spatial import cKDTree
@@ -57,6 +55,7 @@ from airfoil_pinn.app.paths import (
     resolve_project_path,
 )
 from airfoil_pinn.core.type_hints import InitializerMetadataDict
+from airfoil_pinn.geometry.sdf import PolylineDistanceField
 
 # Импортируем наши модули и классы
 from airfoil_pinn.physics.fluids import FluidLibrary, Fluid
@@ -240,6 +239,7 @@ class Initializer:
         self.sampler_metadata: Optional[Dict[str, Any]] = None
         self.geometry_reference: Optional[Dict[str, Any]] = None
         self.chord_source: Optional[str] = None
+        self.sdf_geometry_fingerprint: Optional[str] = None
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
         """
@@ -704,7 +704,9 @@ class Initializer:
             velocity_perturbation_amplitude: если None, используется perturbation_amplitude
             pressure_perturbation_amplitude: относительная амплитуда шума для давления
                                              (доля от динамического напора 0.5*rho*U_inf^2)
-            num_processes: количество процессов для параллельного вычисления SDF
+            num_processes: Deprecated compatibility argument.  The exact
+                segment SDF uses vectorized PyTorch chunks instead of process
+                workers.
 
         Returns:
             Нормализованный массив точек.
@@ -717,6 +719,12 @@ class Initializer:
             raise RuntimeError("Сначала выберите граничные условия.")
         if self.wall_points is None:
             self.extract_wall_points()
+        if num_processes not in (None, 1):
+            logger.info(
+                "num_processes=%s ignored for exact segment SDF; "
+                "vectorized chunking is used.",
+                num_processes,
+            )
 
         self.pressure_mode = pressure_mode
         self.velocity_initial_mode = velocity_initial_mode
@@ -824,51 +832,51 @@ class Initializer:
             p_phys
         )
 
-        # --- Вычисление SDF (с поддержкой многопроцессорности) ---
+        # --- Exact segment-based SDF cache ---
         if len(self.wall_points) == 0:
             logger.warning("Нет точек WALL, SDF будет нулевым.")
             sdf_phys = np.zeros(N)
         else:
-            logger.info("Вычисление SDF...")
-            xs = self.points['x'].copy()
-            ys = self.points['y'].copy()
+            logger.info(
+                "Вычисление точного SDF до сегментов профиля "
+                "(vectorized PyTorch CPU)."
+            )
+            wall_norm = np.asarray(
+                self.reference_scales.length_to_dimensionless(
+                    self.wall_points
+                ),
+                dtype=np.float64,
+            )
+            query_norm = np.column_stack(
+                (arr_norm['x_norm'], arr_norm['y_norm'])
+            )
+            closed = (
+                bool(self.sampler_metadata.get('foil_closed', True))
+                if isinstance(self.sampler_metadata, dict)
+                else len(wall_norm) >= 3
+            )
+            distance_field = PolylineDistanceField(
+                wall_norm,
+                closed=closed,
+                segment_chunk_size=256,
+            )
+            arr_norm['sdf_norm'] = distance_field.evaluate_numpy(
+                query_norm,
+                point_chunk_size=8192,
+            )
+            self.sdf_geometry_fingerprint = (
+                distance_field.geometry_fingerprint
+            )
+            logger.info(
+                "SDF-кэш рассчитан: segments=%d, geometry=%s",
+                distance_field.segment_count,
+                self.sdf_geometry_fingerprint[:12],
+            )
 
-            if num_processes is None:
-                num_processes = mp.cpu_count()
-            num_processes = max(1, min(int(num_processes), N, 16))
-
-            if num_processes > 1 and mp.cpu_count() > 1:
-                logger.info(f"Используется процессов: {num_processes}")
-                indices = np.arange(N)
-                chunks = [chunk for chunk in np.array_split(indices, num_processes) if len(chunk) > 0]
-                with mp.Pool(processes=num_processes) as pool:
-                    func = partial(_compute_sdf_chunk,
-                                   xs=xs, ys=ys,
-                                   wall_points=self.wall_points,
-                                   use_scipy=SCIPY_AVAILABLE)
-                    results = pool.map(func, chunks)
-
-                sdf_phys = np.zeros(N)
-                for chunk_idx, sdf_vals in zip(chunks, results):
-                    sdf_phys[chunk_idx] = sdf_vals
-            else:
-                # Однопоточный режим с использованием заранее построенного дерева
-                logger.info("Однопоточный режим.")
-                if SCIPY_AVAILABLE and self.wall_tree is not None:
-                    sdf_phys, _ = self.wall_tree.query(np.column_stack((xs, ys)), k=1)
-                    sdf_phys = np.asarray(sdf_phys, dtype=np.float64)
-                else:
-                    sdf_phys = _compute_sdf_chunk(
-                        np.arange(N),
-                        xs=xs,
-                        ys=ys,
-                        wall_points=self.wall_points,
-                        use_scipy=False,
-                    )
-
-        arr_norm['sdf_norm'] = self.reference_scales.length_to_dimensionless(
-            sdf_phys
-        )
+        if len(self.wall_points) == 0:
+            arr_norm['sdf_norm'] = (
+                self.reference_scales.length_to_dimensionless(sdf_phys)
+            )
 
         self.points_norm = arr_norm
         logger.info("Нормализованные поля инициализированы.")
@@ -915,6 +923,8 @@ class Initializer:
             'mu': self.mu,
             'Re': self.Re,
             'reference_scales': self.reference_scales.to_metadata(),
+            'sdf_geometry_fingerprint': self.sdf_geometry_fingerprint,
+            'sdf_method': 'exact_polyline_segments',
             'delta_bl_99_est': self.delta_bl_est,
             'delta_bl_99_est_norm': self.delta_bl_est_norm,
             'delta_bl_model': self.boundary_layer_model,
