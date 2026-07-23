@@ -302,9 +302,14 @@ class MetricsCollector:
         u_raw: torch.Tensor,
         v_raw: torch.Tensor,
         bt: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         u = u_raw
         v = v_raw
+        target_u, target_v = self.loss_computer.get_freestream_targets(
+            u_raw,
+            case_ids,
+        )
         names = self.data_handler.boundary_type_names
         for idx, name in enumerate(names):
             if idx >= bt.shape[1]:
@@ -313,8 +318,8 @@ class MetricsCollector:
             if not bool(mask.any()):
                 continue
             if name in ('inlet', 'velocity_dirichlet'):
-                u = torch.where(mask, torch.ones_like(u) * self.data_handler.inlet_u_norm, u)
-                v = torch.where(mask, torch.ones_like(v) * self.data_handler.inlet_v_norm, v)
+                u = torch.where(mask, target_u, u)
+                v = torch.where(mask, target_v, v)
             elif name == 'wall':
                 u = torch.where(mask, torch.zeros_like(u), u)
                 v = torch.where(mask, torch.zeros_like(v), v)
@@ -407,8 +412,18 @@ class MetricsCollector:
                 u = out[:, 0:1]
                 v = out[:, 1:2]
                 if self.loss_computer.bc_type == 'hard':
-                    u, v = self._apply_hard_velocity_constraints(u, v, bt)
-                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
+                    u, v = self._apply_hard_velocity_constraints(
+                        u,
+                        v,
+                        bt,
+                        case_ids=case_ids,
+                    )
+                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                    u,
+                    v,
+                    bt,
+                    case_ids=case_ids,
+                )
 
                 if 'inlet' in self.data_handler.boundary_type_names:
                     inlet_idx = self.data_handler.boundary_type_names.index('inlet')
@@ -779,7 +794,13 @@ class MetricsCollector:
 
                 self.model.eval()
                 with torch.no_grad():
-                    input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
+                    input_tensor = self.loss_computer.build_input_tensor(
+                        x_norm,
+                        y_norm,
+                        sdf_norm,
+                        bt,
+                        case_ids=dataset.case_id,
+                    )
                     out = self.model(input_tensor)
                     u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
                     if self.loss_computer.bc_type == 'hard':
@@ -795,7 +816,10 @@ class MetricsCollector:
                     else:
                         u_pred_t, v_pred_t, p_pred_t = u_raw, v_raw, p_raw
                     u_pred_t, v_pred_t = self.loss_computer.apply_velocity_dirichlet_constraint(
-                        u_pred_t, v_pred_t, bt
+                        u_pred_t,
+                        v_pred_t,
+                        bt,
+                        case_ids=dataset.case_id,
                     )
 
                     p_dyn = 0.5 * self.data_handler.rho * self.data_handler.U_inf ** 2

@@ -481,11 +481,25 @@ class PINNSolver:
     def _init_optimizer(self, optim_type='adam') -> optim.Optimizer:
         opt_params = self.config.get('optimizer_params', {'lr': 1e-3})
         lr = opt_params.get('lr', 1e-3)
-        params = [{'params': self.model.parameters()}]
-        if self.sa_weights is not None:
-            params.append({'params': self.sa_weights.parameters(), 'lr': self.config.get('sa_lr', 0.001)})
+        weight_decay = float(opt_params.get('weight_decay', 0.0))
+        params = [
+            {
+                'params': self.model.parameters(),
+                'weight_decay': weight_decay,
+            }
+        ]
+        if self.sa_weights is not None and optim_type == 'adam':
+            for parameter in self.sa_weights.parameters():
+                parameter.requires_grad_(True)
+            params.append(
+                {
+                    'params': self.sa_weights.parameters(),
+                    'lr': self.config.get('sa_lr', 0.001),
+                    'weight_decay': 0.0,
+                }
+            )
         if optim_type == 'adam':
-            return optim.Adam(params, lr=lr, weight_decay=opt_params.get('weight_decay', 0))
+            return optim.Adam(params, lr=lr)
         else:  # LBFGS
             all_params = []
             for group in params:
@@ -866,7 +880,12 @@ class PINNSolver:
                     )
                 else:
                     u, v, p = u_raw, v_raw, p_raw
-                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
+                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                    u,
+                    v,
+                    bt,
+                    case_ids=case_ids,
+                )
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -1131,6 +1150,13 @@ class PINNSolver:
 
     def _switch_to_lbfgs(self):
         logger.info(f"Переключение на L-BFGS после эпохи {self.adam_epochs}")
+        if self.sa_weights is not None:
+            for parameter in self.sa_weights.parameters():
+                parameter.requires_grad_(False)
+            logger.info(
+                "SA-PINN attention weights are frozen for L-BFGS; their "
+                "min-max ascent is performed only during the Adam stage."
+            )
         self.optimizer = self._init_optimizer(optim_type='lbfgs')
         self.scheduler = None
         self.using_lbfgs = True

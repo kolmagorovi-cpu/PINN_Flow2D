@@ -924,6 +924,8 @@ class Initializer:
             'temperature': self.temperature,
             'pressure_mode': self.pressure_mode,
             'velocity_initial_mode': self.velocity_initial_mode,
+            'field_role': 'initial_guess_only',
+            'supervised_reference': False,
             'velocity_perturbation_amplitude': self.velocity_perturbation_amplitude,
             'pressure_perturbation_amplitude': self.pressure_perturbation_amplitude,
             'num_points': len(self.points_norm),

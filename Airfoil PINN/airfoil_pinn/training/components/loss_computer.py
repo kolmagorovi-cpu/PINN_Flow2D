@@ -55,8 +55,10 @@ class LossComputer:
         Args:
             config: полная конфигурация (словарь)
             data_handler: объект DataHandler с метаданными и информацией о границах
-            rho_norm: нормализованная плотность (тензор-скаляр)
-            mu_norm: нормализованная вязкость (тензор-скаляр)
+            rho_norm: устаревший аргумент совместимости; в безразмерной PDE
+                плотность не является независимым коэффициентом
+            mu_norm: устаревший аргумент совместимости; вязкий коэффициент
+                вычисляется как ``1 / Re`` для каждой точки
             x_min, x_max, y_min, y_max: границы области (нормированные)
             device: устройство для вычислений
             dtype: тип данных
@@ -154,6 +156,47 @@ class LossComputer:
         # Для axisymmetric требуется eps и множитель 2π
         self.eps_axi = 1e-12
         self.two_pi = 2.0 * torch.pi
+
+    def get_flow_case_batch(
+        self,
+        reference: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+    ):
+        """Return the flow parameters associated with every point.
+
+        The same helper is used by network input assembly, PDE coefficients
+        and boundary targets.  This prevents a case identifier from selecting
+        one operating point at the input while the loss silently uses another.
+        """
+        if case_ids is None:
+            case_ids = torch.zeros(
+                reference.shape[0],
+                device=reference.device,
+                dtype=torch.long,
+            )
+        if case_ids.numel() != reference.shape[0]:
+            raise ValueError(
+                "case_ids must contain exactly one identifier per point"
+            )
+        if not hasattr(self.data_handler, "get_flow_case_batch"):
+            raise RuntimeError(
+                "Parameterized physics requires "
+                "DataHandler.get_flow_case_batch"
+            )
+        return self.data_handler.get_flow_case_batch(
+            case_ids,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    def get_freestream_targets(
+        self,
+        reference: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return dimensionless ``(u_inf, v_inf)`` for every point."""
+        flow = self.get_flow_case_batch(reference, case_ids)
+        return flow.cos_alpha, flow.sin_alpha
 
     def _initialize_differentiable_sdf(self) -> None:
         """Build the normalized segment SDF used by PDE autograd.
@@ -342,7 +385,8 @@ class LossComputer:
         v: torch.Tensor,
         p: torch.Tensor,
         x: torch.Tensor,
-        y: torch.Tensor
+        y: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Вычисляет невязки PDE (квадраты) для заданных полей.
@@ -350,6 +394,7 @@ class LossComputer:
         Args:
             u, v, p: поля скорости и давления (тензоры с requires_grad)
             x, y: координаты (тензоры с requires_grad)
+            case_ids: идентификатор режима для каждой точки
 
         Returns:
             словарь с ключами, соответствующими self.pde_components,
@@ -358,20 +403,34 @@ class LossComputer:
         if self.pde_system == 'euler':
             if self.flow_type == 'axisymmetric':
                 return PDEResiduals.compute_residuals_euler_axisymmetric(
-                    u, v, p, x, y, self.rho_norm, self._grad, self.eps_axi
+                    u, v, p, x, y, self._grad, self.eps_axi
                 )
             return PDEResiduals.compute_residuals_euler_2d(
-                u, v, p, x, y, self.rho_norm, self._grad
+                u, v, p, x, y, self._grad
             )
 
+        flow = self.get_flow_case_batch(x, case_ids)
+        inverse_reynolds = flow.reynolds.reciprocal()
         if self.flow_type == 'axisymmetric':
             return PDEResiduals.compute_residuals_axisymmetric(
-                u, v, p, x, y, self.rho_norm, self.mu_norm, self._grad, self.eps_axi
+                u,
+                v,
+                p,
+                x,
+                y,
+                inverse_reynolds,
+                self._grad,
+                self.eps_axi,
             )
-        else:
-            return PDEResiduals.compute_residuals_2d(
-                u, v, p, x, y, self.rho_norm, self.mu_norm, self._grad
-            )
+        return PDEResiduals.compute_residuals_2d(
+            u,
+            v,
+            p,
+            x,
+            y,
+            inverse_reynolds,
+            self._grad,
+        )
 
     # ------------------------------------------------------------------
     # Граничные условия (только для soft)
@@ -381,10 +440,12 @@ class LossComputer:
         u: torch.Tensor,
         v: torch.Tensor,
         mask: torch.Tensor,
+        target_u: torch.Tensor,
+        target_v: torch.Tensor,
     ) -> torch.Tensor:
         return (
-            torch.mean((u[mask] - self.data_handler.inlet_u_norm) ** 2)
-            + torch.mean((v[mask] - self.data_handler.inlet_v_norm) ** 2)
+            torch.mean((u[mask] - target_u[mask]) ** 2)
+            + torch.mean((v[mask] - target_v[mask]) ** 2)
         )
 
     def _boundary_side_masks(
@@ -433,6 +494,8 @@ class LossComputer:
         x: torch.Tensor,
         y: torch.Tensor,
         mask: torch.Tensor,
+        target_u: torch.Tensor,
+        target_v: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         left, right, bottom, top = self._boundary_side_masks(mask, x, y)
         vertical = left | right
@@ -443,22 +506,28 @@ class LossComputer:
         velocity_anchor_terms = []
 
         if bool(horizontal.any()):
-            normal_terms.append((v[horizontal] - self.data_handler.inlet_v_norm) ** 2)
+            normal_terms.append((v[horizontal] - target_v[horizontal]) ** 2)
             du_dy = self._grad(u, y, silent=False)
             tangent_grad_terms.append(du_dy[horizontal] ** 2)
-            velocity_anchor_terms.append((u[horizontal] - self.data_handler.inlet_u_norm) ** 2)
+            velocity_anchor_terms.append(
+                (u[horizontal] - target_u[horizontal]) ** 2
+            )
 
         if bool(vertical.any()):
-            normal_terms.append((u[vertical] - self.data_handler.inlet_u_norm) ** 2)
+            normal_terms.append((u[vertical] - target_u[vertical]) ** 2)
             dv_dx = self._grad(v, x, silent=False)
             tangent_grad_terms.append(dv_dx[vertical] ** 2)
-            velocity_anchor_terms.append((v[vertical] - self.data_handler.inlet_v_norm) ** 2)
+            velocity_anchor_terms.append(
+                (v[vertical] - target_v[vertical]) ** 2
+            )
 
         if not normal_terms:
-            normal_terms.append((v[mask] - self.data_handler.inlet_v_norm) ** 2)
+            normal_terms.append((v[mask] - target_v[mask]) ** 2)
             du_dy = self._grad(u, y, silent=False)
             tangent_grad_terms.append(du_dy[mask] ** 2)
-            velocity_anchor_terms.append((u[mask] - self.data_handler.inlet_u_norm) ** 2)
+            velocity_anchor_terms.append(
+                (u[mask] - target_u[mask]) ** 2
+            )
 
         normal_loss = torch.mean(torch.cat([term.flatten() for term in normal_terms]))
         tangent_grad_loss = torch.mean(torch.cat([term.flatten() for term in tangent_grad_terms]))
@@ -472,7 +541,8 @@ class LossComputer:
         p: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
         x: torch.Tensor,
-        y: torch.Tensor
+        y: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Вычисляет потери на границах для soft boundary conditions.
@@ -483,6 +553,7 @@ class LossComputer:
             u, v, p: поля скорости и давления
             boundary_types: one-hot тензор типов границ (или None)
             x, y: координаты
+            case_ids: идентификатор режима для каждой точки
 
         Returns:
             bc_comp: словарь {имя_границы: тензор потерь (скаляр)}
@@ -495,6 +566,7 @@ class LossComputer:
         bc_comp = {name: torch.tensor(0.0, device=self.device, dtype=self.dtype)
                    for name in self.data_handler.boundary_type_names}
         extra_grad = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        target_u, target_v = self.get_freestream_targets(x, case_ids)
 
         for idx, name in enumerate(self.data_handler.boundary_type_names):
             mask = boundary_types[:, idx].view(-1, 1) > 0.5
@@ -502,10 +574,22 @@ class LossComputer:
                 continue
 
             if name == 'inlet':
-                bc_comp[name] += self._freestream_velocity_loss(u, v, mask)
+                bc_comp[name] += self._freestream_velocity_loss(
+                    u,
+                    v,
+                    mask,
+                    target_u,
+                    target_v,
+                )
 
             elif name in ('farfield', 'velocity_dirichlet'):
-                bc_comp[name] += self._freestream_velocity_loss(u, v, mask)
+                bc_comp[name] += self._freestream_velocity_loss(
+                    u,
+                    v,
+                    mask,
+                    target_u,
+                    target_v,
+                )
 
             elif name == 'outlet':
                 p_out = p[mask]
@@ -524,7 +608,13 @@ class LossComputer:
 
             elif name == 'slip':
                 normal_loss, tangent_grad_loss, velocity_anchor_loss = self._slip_bc_losses(
-                    u, v, x, y, mask
+                    u,
+                    v,
+                    x,
+                    y,
+                    mask,
+                    target_u,
+                    target_v,
                 )
                 bc_comp[name] += normal_loss
                 extra_grad += (
@@ -724,21 +814,7 @@ class LossComputer:
         """
         flow = None
         if self.feature_assembler.requires_flow:
-            if case_ids is None:
-                case_ids = torch.zeros(
-                    x.shape[0],
-                    device=x.device,
-                    dtype=torch.long,
-                )
-            if not hasattr(self.data_handler, 'get_flow_case_batch'):
-                raise RuntimeError(
-                    "Parametric inputs require DataHandler.get_flow_case_batch"
-                )
-            flow = self.data_handler.get_flow_case_batch(
-                case_ids,
-                device=x.device,
-                dtype=x.dtype,
-            )
+            flow = self.get_flow_case_batch(x, case_ids)
         return self.feature_assembler.build(
             x,
             y,
@@ -783,6 +859,7 @@ class LossComputer:
         u_raw: torch.Tensor,
         v_raw: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
+        case_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Hard speed Dirichlet for boundary_type='velocity_dirichlet' in any BC mode."""
         names = getattr(self.data_handler, 'boundary_type_names', [])
@@ -797,8 +874,9 @@ class LossComputer:
         if not bool(mask.any()):
             return u_raw, v_raw
 
-        u_final = torch.where(mask, torch.ones_like(u_raw) * self.data_handler.inlet_u_norm, u_raw)
-        v_final = torch.where(mask, torch.ones_like(v_raw) * self.data_handler.inlet_v_norm, v_raw)
+        target_u, target_v = self.get_freestream_targets(u_raw, case_ids)
+        u_final = torch.where(mask, target_u, u_raw)
+        v_final = torch.where(mask, target_v, v_raw)
         return u_final, v_final
 
     # ------------------------------------------------------------------

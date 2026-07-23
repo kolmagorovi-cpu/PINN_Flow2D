@@ -168,9 +168,9 @@ class PINNDataset(Dataset):
         x: X-координаты (нормированные)
         y: Y-координаты (нормированные)
         sdf: Расстояние до стенки (нормированное)
-        p_target: Целевое давление
-        u_target: Целевая скорость U
-        v_target: Целевая скорость V
+        p_initial_guess: Начальное поле давления, не supervised target
+        u_initial_guess: Начальное поле скорости U, не supervised target
+        v_initial_guess: Начальное поле скорости V, не supervised target
         boundary_types: One-hot кодирование типов границ
         mask_u_fixed: Маска фиксированных компонент U
         mask_v_fixed: Маска фиксированных компонент V
@@ -203,10 +203,20 @@ class PINNDataset(Dataset):
         self.y = torch.tensor(np.ascontiguousarray(data['y_norm']), dtype=torch.float32).view(-1, 1)
         self.sdf = torch.tensor(np.ascontiguousarray(data['sdf_norm']), dtype=torch.float32).view(-1, 1)
 
-        # Целевые значения (для справки, не используются при hard)
-        self.p_target = torch.tensor(np.ascontiguousarray(data['p_norm']), dtype=torch.float32).view(-1, 1)
-        self.u_target = torch.tensor(np.ascontiguousarray(data['u_norm']), dtype=torch.float32).view(-1, 1)
-        self.v_target = torch.tensor(np.ascontiguousarray(data['v_norm']), dtype=torch.float32).view(-1, 1)
+        # These are initializer fields, not ground-truth solution labels.
+        # Explicit names prevent accidental inclusion in a supervised loss.
+        self.p_initial_guess = torch.tensor(
+            np.ascontiguousarray(data['p_norm']),
+            dtype=torch.float32,
+        ).view(-1, 1)
+        self.u_initial_guess = torch.tensor(
+            np.ascontiguousarray(data['u_norm']),
+            dtype=torch.float32,
+        ).view(-1, 1)
+        self.v_initial_guess = torch.tensor(
+            np.ascontiguousarray(data['v_norm']),
+            dtype=torch.float32,
+        ).view(-1, 1)
 
         # Обработка типов границ (one-hot) – все имена в нижнем регистре
         self.boundary_types = None
@@ -308,6 +318,33 @@ class PINNDataset(Dataset):
                 "но u_bc/v_bc = 0 до вызова DataHandler.set_inlet_values(). "
                 "Убедитесь, что DataHandler вызывает set_inlet_values() после загрузки метаданных."
             )
+
+    @property
+    def p_target(self) -> torch.Tensor:
+        """Deprecated alias for the non-supervised pressure initial guess."""
+        return self.p_initial_guess
+
+    @p_target.setter
+    def p_target(self, value: torch.Tensor) -> None:
+        self.p_initial_guess = value
+
+    @property
+    def u_target(self) -> torch.Tensor:
+        """Deprecated alias for the non-supervised x-velocity initial guess."""
+        return self.u_initial_guess
+
+    @u_target.setter
+    def u_target(self, value: torch.Tensor) -> None:
+        self.u_initial_guess = value
+
+    @property
+    def v_target(self) -> torch.Tensor:
+        """Deprecated alias for the non-supervised y-velocity initial guess."""
+        return self.v_initial_guess
+
+    @v_target.setter
+    def v_target(self, value: torch.Tensor) -> None:
+        self.v_initial_guess = value
 
     def set_inlet_values(self, u_norm: float, v_norm: float) -> None:
         """
@@ -527,6 +564,18 @@ class DataHandler:
             raise FileNotFoundError(f"Файл метаданных {meta_path} не найден")
         meta = np.load(meta_path, allow_pickle=True).item()
         self.initial_metadata = dict(meta)
+        self.field_role = str(
+            meta.get("field_role", "legacy_initial_guess")
+        ).lower()
+        if self.field_role not in {
+            "initial_guess_only",
+            "legacy_initial_guess",
+        }:
+            raise ValueError(
+                "Collocation artifact field_role must identify initializer "
+                f"fields, received {self.field_role!r}. Supervised reference "
+                "solutions require a separate validated data contract."
+            )
         self.fluid_name = meta.get('fluid_name')
         self.conditions_name = meta.get('conditions_name')
         self.reference_scales = ReferenceScales.from_metadata(meta)
@@ -1253,7 +1302,7 @@ class DataHandler:
         x_norm: np.ndarray,
         y_norm: np.ndarray,
         sdf_norm: np.ndarray,
-        case_id: int = 0,
+        case_id: Any = 0,
     ) -> int:
         """
         Добавляет новые interior-точки с уникальными координатами.
@@ -1269,8 +1318,20 @@ class DataHandler:
             return 0
         if not (len(y_norm) == n_new and len(sdf_norm) == n_new):
             raise ValueError("x_norm, y_norm и sdf_norm должны иметь одинаковую длину")
-        if int(case_id) not in self.flow_cases:
-            raise ValueError(f"Undefined flow case ID for RAR: {case_id}")
+        case_ids = np.asarray(case_id, dtype=np.int64)
+        if case_ids.ndim == 0:
+            case_ids = np.full(n_new, int(case_ids), dtype=np.int64)
+        else:
+            case_ids = case_ids.reshape(-1)
+        if len(case_ids) != n_new:
+            raise ValueError(
+                "case_id must be scalar or contain one value per RAR point"
+            )
+        undefined = sorted(set(case_ids.tolist()) - set(self.flow_cases))
+        if undefined:
+            raise ValueError(
+                f"Undefined flow case IDs for RAR: {undefined}"
+            )
 
         ds = self.dataset
         if ds.boundary_types is None or 'interior' not in ds.type_to_idx:
@@ -1284,7 +1345,22 @@ class DataHandler:
             ds.x.cpu().numpy().reshape(-1),
             ds.y.cpu().numpy().reshape(-1),
         ])
-        _, nn_idx = cKDTree(old_xy).query(np.column_stack([x_norm, y_norm]), workers=-1)
+        new_xy = np.column_stack([x_norm, y_norm])
+        nn_idx = np.empty(n_new, dtype=np.int64)
+        old_case_ids = ds.case_id.cpu().numpy().reshape(-1)
+        for current_case in np.unique(case_ids):
+            new_mask = case_ids == current_case
+            old_indices = np.flatnonzero(old_case_ids == current_case)
+            if len(old_indices) == 0:
+                raise RuntimeError(
+                    "RAR cannot initialize reference fields because flow case "
+                    f"{int(current_case)} has no existing dataset points"
+                )
+            _, local_idx = cKDTree(old_xy[old_indices]).query(
+                new_xy[new_mask],
+                workers=-1,
+            )
+            nn_idx[new_mask] = old_indices[np.asarray(local_idx).reshape(-1)]
         nn_idx_t = torch.tensor(nn_idx, dtype=torch.long)
 
         ds.x = torch.cat([ds.x, torch.tensor(x_norm, dtype=torch.float32).view(-1, 1)], dim=0)
@@ -1320,7 +1396,7 @@ class DataHandler:
         ds.case_id = torch.cat(
             [
                 ds.case_id,
-                torch.full((n_new,), int(case_id), dtype=torch.long),
+                torch.as_tensor(case_ids, dtype=torch.long),
             ],
             dim=0,
         )

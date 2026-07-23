@@ -185,27 +185,69 @@ class PINNIncompressible(nn.Module):
 
 
 class SelfAdaptiveWeights(nn.Module):
+    """Positive pointwise SA-PINN weights trained by gradient ascent.
+
+    The network parameters minimize the weighted loss, whereas the attention
+    parameters maximize it, as required by the SA-PINN min--max objective.
+    Gradient reversal lets both parameter groups use one Adam optimizer without
+    accidentally driving all attention weights toward zero.
     """
-    Обучаемые веса для каждой точки и каждого уравнения.
-    Используются в SA-PINN для автоматической балансировки вклада точек.
-    Веса всегда положительны благодаря Softplus.
-    """
-    def __init__(self, n_points: int, n_eqns: int, init_val: float = 1.0):
-        """
+
+    def __init__(
+        self,
+        n_points: int,
+        n_eqns: int,
+        init_val: float = 1.0,
+        max_value: float = 100.0,
+    ):
+        """Initialize bounded softplus attention masks.
+
         Args:
-            n_points: общее количество точек коллокации
-            n_eqns: количество уравнений (например, 3 для PDE)
-            init_val: начальное значение весов
+            n_points: Number of collocation-point associations.
+            n_eqns: Number of independently weighted residual components.
+            init_val: Positive initial attention value.
+            max_value: Positive safety ceiling applied after optimizer steps.
         """
         super().__init__()
+        if n_points <= 0 or n_eqns <= 0:
+            raise ValueError("SelfAdaptiveWeights dimensions must be positive")
         if init_val <= 0:
             raise ValueError("init_val для SelfAdaptiveWeights должен быть положительным")
+        if max_value <= init_val:
+            raise ValueError("max_value must be greater than init_val")
+        self.max_value = float(max_value)
         self.initial_raw_value = float(np.log(np.expm1(init_val)))
-        self.log_weights = nn.Parameter(torch.full((n_points, n_eqns), self.initial_raw_value))
+        self.maximum_raw_value = float(np.log(np.expm1(max_value)))
+        self.log_weights = nn.Parameter(
+            torch.full((n_points, n_eqns), self.initial_raw_value)
+        )
+        self.log_weights.register_hook(self._reverse_gradient)
         self.softplus = nn.Softplus()
 
+    @staticmethod
+    def _reverse_gradient(gradient: torch.Tensor) -> torch.Tensor:
+        """Convert optimizer descent into ascent for attention parameters."""
+        return -gradient
+
     def forward(self) -> torch.Tensor:
-        """
-        Возвращает тензор весов формы (n_points, n_eqns).
-        """
+        """Return positive weights with shape ``(n_points, n_eqns)``."""
         return self.softplus(self.log_weights)
+
+    @torch.no_grad()
+    def post_step_(self) -> None:
+        """Clamp raw weights after an optimizer step for numerical robustness."""
+        self.log_weights.clamp_(max=self.maximum_raw_value)
+
+    def extend(self, n_new: int) -> None:
+        """Append freshly initialized point weights while preserving ascent."""
+        if n_new <= 0:
+            return
+        current = self.log_weights.detach()
+        appended = torch.full(
+            (int(n_new), current.shape[1]),
+            self.initial_raw_value,
+            device=current.device,
+            dtype=current.dtype,
+        )
+        self.log_weights = nn.Parameter(torch.cat([current, appended], dim=0))
+        self.log_weights.register_hook(self._reverse_gradient)
