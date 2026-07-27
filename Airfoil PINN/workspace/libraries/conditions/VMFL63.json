@@ -1,0 +1,12 @@
+{
+    "fluid_name": "VMFL63",
+    "inlet_pressure": 101325.0,
+    "outlet_pressure": 101325.0,
+    "inlet_velocity_mode": "magnitude_angle",
+    "inlet_u": 0.0,
+    "inlet_v": 0.0,
+    "inlet_speed": 0.0517,
+    "inlet_angle": 0.0,
+    "symmetry_type": "symmetry",
+    "description": ""
+}

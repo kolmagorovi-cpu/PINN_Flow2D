@@ -1,0 +1,58 @@
+# FVM continuity objective
+
+The canonical FVM loss measures the spatial, volume-weighted L2 norm of the
+discrete divergence. For control volume `i`,
+
+\[
+R_i = \frac{\Phi_i}{V_i}
+    = \frac{1}{V_i}\sum_{f\in\partial V_i}\mathbf u_f\cdot\mathbf S_{if},
+\qquad
+L_{\mathrm{FVM}} =
+\frac{\sum_i V_i R_i^2}{\sum_i V_i}.
+\]
+
+The production reduction is named `divergence_l2_volume`. Its square root is
+reported as `fvm_rms`. It has a non-zero, grid-independent limit for a fixed
+non-solenoidal velocity field.
+
+`flux_balance_l2` measures the absolute face-flux imbalance instead:
+
+\[
+\frac{\sum_i \Phi_i^2}{\sum_i V_i}.
+\]
+
+The historical name `volume_weighted` retains this second formula for
+reproducibility. It is a legacy/diagnostic reduction and must not be interpreted
+as a divergence norm.
+
+The reference configuration is:
+
+```yaml
+loss_weights:
+  fvm:
+    enabled: true
+    weight: 25.0
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+    batch_interval: 1
+```
+
+`every_optimizer_step` performs one full-mesh FVM forward per optimizer update,
+including when several mini-batches form one update through gradient
+accumulation. `every_k_optimizer_steps` and `stochastic_optimizer_step` use the
+explicit interval `K` and multiply an included FVM term by `K`; the stochastic
+mode therefore preserves the full-schedule gradient in expectation.
+
+An enabled FVM loss is fail-fast. Construction and every RAR rebuild reject
+non-finite or non-positive volumes, invalid face indices, non-finite or zero
+area vectors, unknown boundary types, orphan control volumes, and
+control-volume area vectors that do not geometrically close. Missing mesh data
+or a mismatch between operator nodes and FVM input tensors also aborts the run.
+
+Checkpoint training contracts include the reduction, configured weight,
+schedule, interval/probability, mesh identifier and SHA-256 fingerprint,
+normalization rule, and dimensional state. A mismatch rejects exact `resume`;
+an explicitly selected `finetune` still loads model weights only.
+
+Per-epoch telemetry records `fvm_raw_loss`, `fvm_weighted_loss`, `fvm_rms`, and
+`fvm_evaluations` separately.

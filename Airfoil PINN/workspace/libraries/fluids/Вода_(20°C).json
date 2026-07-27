@@ -1,0 +1,7 @@
+{
+    "name": "Вода (20°C)",
+    "density": 998.0,
+    "kinematic_viscosity": 1.004e-06,
+    "dynamic_viscosity": 0.001001992,
+    "description": "Пресная вода при 20°C"
+}
