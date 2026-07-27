@@ -80,10 +80,18 @@ def loss_function_menu(cfg: ConfigManager) -> None:
             if isinstance(fvm_cfg, dict):
                 fvm_w = fvm_cfg.get('weight', 1.0)
                 fvm_bi = fvm_cfg.get('batch_interval', 1)
+                fvm_schedule = fvm_cfg.get(
+                    'schedule',
+                    'every_optimizer_step',
+                )
             else:
                 fvm_w = float(fvm_cfg)
                 fvm_bi = 1
-            print(f"FVM Mass flow: {fvm_on}, вес: {fvm_w}, batch_interval: {fvm_bi}")
+                fvm_schedule = 'every_optimizer_step'
+            print(
+                f"FVM Mass flow: {fvm_on}, вес: {fvm_w}, "
+                f"schedule: {fvm_schedule}, interval: {fvm_bi}"
+            )
             input("Нажмите Enter...")
         elif sub == '0':
             print_submenu_footer()
@@ -106,7 +114,8 @@ def weights_menu(cfg: ConfigManager) -> None:
                 'enabled': False,
                 'weight': 1.0,
                 'batch_interval': 1,
-                'reduction': 'volume_weighted',
+                'reduction': 'divergence_l2_volume',
+                'schedule': 'every_optimizer_step',
             },
         )
         if not isinstance(fvm_cfg, dict):
@@ -115,13 +124,16 @@ def weights_menu(cfg: ConfigManager) -> None:
                 'weight': float(fvm_cfg) if float(fvm_cfg) > 0 else 1.0,
                 'batch_interval': 1,
                 'reduction': 'legacy',
+                'schedule': 'every_optimizer_step',
             }
             lw['fvm'] = fvm_cfg
         fvm_cfg.setdefault('batch_interval', 1)
-        fvm_cfg.setdefault('reduction', 'volume_weighted')
+        fvm_cfg.setdefault('reduction', 'divergence_l2_volume')
+        fvm_cfg.setdefault('schedule', 'every_optimizer_step')
         fvm_enabled = bool(fvm_cfg.get('enabled', False))
         fvm_weight = fvm_cfg.get('weight', 1.0)
         fvm_bi = fvm_cfg.get('batch_interval', 1)
+        fvm_schedule = fvm_cfg.get('schedule', 'every_optimizer_step')
         print(
             "5. Интегральная потеря "
             f"(текущ: {lw['integral_condition']}, вес: {lw['integral_weight']})"
@@ -129,7 +141,7 @@ def weights_menu(cfg: ConfigManager) -> None:
         print(
             "6. FVM Mass flow "
             f"(включено: {fvm_enabled}, вес: {fvm_weight}, "
-            f"каждые {fvm_bi} батч.)"
+            f"schedule: {fvm_schedule}, interval: {fvm_bi})"
         )
         print("7. Вывод текущих настроек")
         print("0. Назад")
@@ -168,20 +180,27 @@ def weights_menu(cfg: ConfigManager) -> None:
                     except ValueError:
                         print("Неверное значение, оставлено текущее.")
                 bi = input(
-                    "FVM раз в K батчей (1=каждый батч) "
+                    "FVM interval K по optimizer steps "
+                    "(1=каждый optimizer step; K>1=stochastic) "
                     f"[{fvm_cfg.get('batch_interval', 1)}]: "
                 ).strip()
                 if bi:
                     try:
                         val = int(bi)
                         fvm_cfg['batch_interval'] = max(1, val)
+                        fvm_cfg['schedule'] = (
+                            'every_optimizer_step'
+                            if val <= 1
+                            else 'stochastic_optimizer_step'
+                        )
                     except ValueError:
                         print("Неверное значение, оставлено текущее.")
             fvm_status = 'включено' if fvm_cfg['enabled'] else 'выключено'
             print(
                 f"FVM Mass flow: {fvm_status}, "
                 f"вес: {fvm_cfg.get('weight', 1.0)}, "
-                f"каждые {fvm_cfg.get('batch_interval', 1)} батч."
+                f"schedule: {fvm_cfg.get('schedule')}, "
+                f"interval: {fvm_cfg.get('batch_interval', 1)}."
             )
         elif ch == '7':
             fvm_cfg = lw.get('fvm', {})
@@ -189,9 +208,14 @@ def weights_menu(cfg: ConfigManager) -> None:
             if isinstance(fvm_cfg, dict):
                 fvm_w = fvm_cfg.get('weight', 1.0)
                 fvm_bi = fvm_cfg.get('batch_interval', 1)
+                fvm_schedule = fvm_cfg.get(
+                    'schedule',
+                    'every_optimizer_step',
+                )
             else:
                 fvm_w = float(fvm_cfg)
                 fvm_bi = 1
+                fvm_schedule = 'every_optimizer_step'
             print("\n--- ТЕКУЩИЕ ВЕСА ---")
             print("PDE weights:", lw['pde_weights'])
             print("BC weights:", lw['bc_weights'])
@@ -202,7 +226,10 @@ def weights_menu(cfg: ConfigManager) -> None:
                 f"integral_condition: {lw['integral_condition']}, "
                 f"weight: {lw['integral_weight']}"
             )
-            print(f"fvm_mass_flow: {fvm_on}, weight: {fvm_w}, batch_interval: {fvm_bi}")
+            print(
+                f"fvm_mass_flow: {fvm_on}, weight: {fvm_w}, "
+                f"schedule: {fvm_schedule}, interval: {fvm_bi}"
+            )
             input("Нажмите Enter...")
         elif ch == '0':
             print_submenu_footer()

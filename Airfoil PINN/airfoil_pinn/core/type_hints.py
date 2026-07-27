@@ -481,6 +481,7 @@ class FVMLossConfigDict(TypedDict, total=False):
     weight: float
     batch_interval: int
     reduction: str
+    schedule: str
 
 
 class TrainingConfigDict(TypedDict, total=False):

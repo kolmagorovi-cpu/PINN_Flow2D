@@ -19,6 +19,7 @@
 
 import logging
 import os
+import random
 from collections import deque
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -154,11 +155,18 @@ class Trainer:
         # Флаг изменения SA-весов (для сигнала solver'у о необходимости пересоздания оптимизатора)
         self.sa_weights_changed = False
 
-        # FVM-потеря: раз в fvm_interval эпох; внутри эпохи — раз в fvm_batch_interval батчей
-        self.fvm_interval = config.get('fvm_interval', 1)
         self.fvm_batch_interval: int = getattr(loss_computer, 'fvm_batch_interval', 1)
+        self.fvm_schedule: str = getattr(
+            loss_computer,
+            'fvm_schedule',
+            'every_optimizer_step',
+        )
         self._fvm_epoch_counter = 0
+        self._fvm_optimizer_step_counter = 0
         self._last_fvm_loss = 0.0
+        self._last_fvm_raw_loss = 0.0
+        self._last_fvm_rms = 0.0
+        self._last_fvm_evaluations = 0
         self._last_integral_loss = 0.0
         self._rar_fvm_rebuild_counter = 0
         self._rar_new_points_since_fvm = 0
@@ -434,6 +442,8 @@ class Trainer:
         integral_raw_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
         integral_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
         fvm_loss_val = 0.0
+        fvm_raw_val = 0.0
+        fvm_rms_val = 0.0
         fvm_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
 
         needs_fvm_forward = (
@@ -455,7 +465,14 @@ class Trainer:
                     bt_fvm,
                 )
             else:
-                logger.warning("FVM/integral: fvm-тензоры не подготовлены, глобальный сеточный проход пропущен.")
+                if add_fvm and self.loss_computer.fvm_weight > 0.0:
+                    raise RuntimeError(
+                        "FVM is enabled, but its node tensors are unavailable"
+                    )
+                logger.warning(
+                    "Integral condition: FVM tensors are unavailable; "
+                    "using the boundary-point fallback."
+                )
 
         if add_integral and self.loss_computer.integral_condition:
             if fvm_case_outputs and self.loss_computer.fvm is not None:
@@ -479,15 +496,27 @@ class Trainer:
             and fvm_case_outputs
             and self.loss_computer.fvm_weight > 0.0
         ):
-            case_fvm_losses = [
-                self.loss_computer.compute_fvm_loss(
+            case_fvm_metrics = [
+                self.loss_computer.compute_fvm_metrics(
                     output[:, :2],
                     freestream_velocity=freestream_velocity,
                 )
                 for _, output, freestream_velocity in fvm_case_outputs
             ]
-            fvm_weighted_t = torch.stack(case_fvm_losses).mean()
+            fvm_raw_t = torch.stack(
+                [metrics["raw"] for metrics in case_fvm_metrics]
+            ).mean()
+            fvm_weighted_t = torch.stack(
+                [metrics["weighted"] for metrics in case_fvm_metrics]
+            ).mean()
+            fvm_rms_t = torch.sqrt(
+                torch.stack(
+                    [metrics["rms"].square() for metrics in case_fvm_metrics]
+                ).mean().clamp_min(0.0)
+            )
+            fvm_raw_val = fvm_raw_t.item()
             fvm_loss_val = fvm_weighted_t.item()
+            fvm_rms_val = fvm_rms_t.item()
             fvm_t = fvm_weighted_t * float(fvm_scale)
 
         # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют.
@@ -518,6 +547,9 @@ class Trainer:
             'extra_grad': extra_grad.item() if self.loss_computer.bc_type != 'hard' else 0.0,
             'integral_loss': integral_raw_t.item() if torch.is_tensor(integral_raw_t) else integral_raw_t,
             'fvm_loss': fvm_loss_val,
+            'fvm_raw_loss': fvm_raw_val,
+            'fvm_weighted_loss': fvm_loss_val,
+            'fvm_rms': fvm_rms_val,
             'pressure_gauge_raw': pressure_gauge_raw.item(),
             'pressure_gauge_loss': pressure_gauge_loss.item(),
             'pde_coverage': {
@@ -1192,7 +1224,11 @@ class Trainer:
             'rar_history': self.rar_history,
             'rar_used_sources': sorted(getattr(self, '_rar_used_sources', set())),
             'fvm_epoch_counter': self._fvm_epoch_counter,
+            'fvm_optimizer_step_counter': self._fvm_optimizer_step_counter,
             'last_fvm_loss': self._last_fvm_loss,
+            'last_fvm_raw_loss': self._last_fvm_raw_loss,
+            'last_fvm_rms': self._last_fvm_rms,
+            'last_fvm_evaluations': self._last_fvm_evaluations,
             'last_integral_loss': self._last_integral_loss,
             'rar_fvm_rebuild_counter': self._rar_fvm_rebuild_counter,
             'rar_new_points_since_fvm': self._rar_new_points_since_fvm,
@@ -1231,7 +1267,22 @@ class Trainer:
         self.rar_history = list(state.get('rar_history', self.rar_history) or [])
         self._rar_used_sources = set(int(v) for v in state.get('rar_used_sources', []))
         self._fvm_epoch_counter = int(state.get('fvm_epoch_counter', self._fvm_epoch_counter))
+        self._fvm_optimizer_step_counter = int(
+            state.get(
+                'fvm_optimizer_step_counter',
+                self._fvm_optimizer_step_counter,
+            )
+        )
         self._last_fvm_loss = float(state.get('last_fvm_loss', self._last_fvm_loss))
+        self._last_fvm_raw_loss = float(
+            state.get('last_fvm_raw_loss', self._last_fvm_raw_loss)
+        )
+        self._last_fvm_rms = float(
+            state.get('last_fvm_rms', self._last_fvm_rms)
+        )
+        self._last_fvm_evaluations = int(
+            state.get('last_fvm_evaluations', self._last_fvm_evaluations)
+        )
         self._last_integral_loss = float(state.get('last_integral_loss', self._last_integral_loss))
         self._rar_fvm_rebuild_counter = int(state.get('rar_fvm_rebuild_counter', self._rar_fvm_rebuild_counter))
         self._rar_new_points_since_fvm = int(state.get('rar_new_points_since_fvm', self._rar_new_points_since_fvm))
@@ -1618,7 +1669,15 @@ class Trainer:
             self._save_rar_mesh_volume_plot(mesh)
             logger.info("Adaptive RAR: FVM-сетка перестроена.")
         except Exception as exc:
-            logger.warning("Adaptive RAR: не удалось перестроить FVM-сетку: %s", exc, exc_info=True)
+            if self.loss_computer.fvm_weight > 0.0:
+                raise RuntimeError(
+                    "Adaptive RAR produced an invalid FVM mesh"
+                ) from exc
+            logger.warning(
+                "Adaptive RAR: не удалось перестроить FVM-сетку: %s",
+                exc,
+                exc_info=True,
+            )
 
     def _save_rar_mesh_volume_plot(self, mesh) -> None:
         """Сохраняет карту объёмов контрольных объёмов после RAR rebuild."""
@@ -1884,24 +1943,42 @@ class Trainer:
         logger.debug("FVM step: loss=%.4e", val)
         return val
 
-    def _scheduled_fvm_batches(self, n_batches: int, enabled: bool) -> set:
-        """
-        Возвращает индексы batch-ей, где запускается полный FVM-проход.
-
-        batch_interval задаётся пользователем в one-based терминах:
-        1 — каждый batch, 5 — batch 5, 10, 15, ...
-        Если interval больше числа batch-ей, FVM запускается один раз на
-        последнем batch-е эпохи.
-        Каждый запуск потом масштабируется так, чтобы суммарный FVM-вклад за
-        эпоху не становился больше заданного веса только из-за частоты запусков.
-        """
+    def _scheduled_fvm_batches(
+        self,
+        n_batches: int,
+        enabled: bool,
+    ) -> Dict[int, float]:
+        """Map optimizer-step batch indices to FVM frequency corrections."""
         if not enabled or n_batches <= 0:
-            return set()
+            return {}
+
+        accumulation_steps = max(1, int(getattr(self, "accum_steps", 1)))
+        optimizer_batches = [
+            index
+            for index in range(n_batches)
+            if (index + 1) % accumulation_steps == 0
+            or index == n_batches - 1
+        ]
         interval = max(1, int(self.fvm_batch_interval))
-        batches = set(range(interval - 1, n_batches, interval))
-        if not batches:
-            batches.add(n_batches - 1)
-        return batches
+        schedule = str(
+            getattr(self, "fvm_schedule", "every_optimizer_step")
+        ).lower().replace("-", "_")
+        selected: Dict[int, float] = {}
+        for batch_index in optimizer_batches:
+            if not hasattr(self, "_fvm_optimizer_step_counter"):
+                self._fvm_optimizer_step_counter = 0
+            self._fvm_optimizer_step_counter += 1
+            if schedule == "every_optimizer_step":
+                selected[batch_index] = 1.0
+            elif schedule == "every_k_optimizer_steps":
+                if self._fvm_optimizer_step_counter % interval == 0:
+                    selected[batch_index] = float(interval)
+            elif schedule == "stochastic_optimizer_step":
+                if random.random() < 1.0 / interval:
+                    selected[batch_index] = float(interval)
+            else:
+                raise ValueError(f"Unsupported FVM schedule: {self.fvm_schedule!r}")
+        return selected
 
     # ------------------------------------------------------------------
     # Шаг обучения (Adam)
@@ -2008,6 +2085,9 @@ class Trainer:
             'extra_grad': fwd['extra_grad'],
             'integral_loss': fwd['integral_loss'],
             'fvm_loss': fwd.get('fvm_loss', 0.0),
+            'fvm_raw_loss': fwd.get('fvm_raw_loss', 0.0),
+            'fvm_weighted_loss': fwd.get('fvm_weighted_loss', 0.0),
+            'fvm_rms': fwd.get('fvm_rms', 0.0),
             'pressure_gauge_loss': fwd['pressure_gauge_loss'],
             'pde_coverage': fwd['pde_coverage'],
             'wall_speed': fwd['wall_speed'],
@@ -2059,21 +2139,20 @@ class Trainer:
             'grad_norm_sum': 0.0,
             'grad_norm_count': 0,
             'fvm_loss_sum': 0.0,
+            'fvm_raw_loss_sum': 0.0,
+            'fvm_rms_sum': 0.0,
             'fvm_loss_count': 0,
         }
         n_batches = 0
         n_total_batches = len(dataloader)
 
-        # FVM добавляется по пользовательскому batch_interval, но нормируется
-        # по числу запусков, чтобы эффективный вес за эпоху оставался тем же.
         self._fvm_epoch_counter += 1
         fvm_this_epoch = (
             self.loss_computer.fvm is not None
             and self.loss_computer.fvm_weight > 0.0
-            and self._fvm_epoch_counter % self.fvm_interval == 0
         )
         fvm_batches = self._scheduled_fvm_batches(n_total_batches, fvm_this_epoch)
-        fvm_scale = (float(self.accum_steps) / len(fvm_batches)) if fvm_batches else 1.0
+        self._last_fvm_evaluations = 0
 
         integral_this_epoch = (
             self.loss_computer.integral_condition
@@ -2087,6 +2166,11 @@ class Trainer:
             is_last_batch = (i == n_total_batches - 1)
             accum_step = ((i + 1) % self.accum_steps == 0) or is_last_batch
             add_fvm = i in fvm_batches
+            fvm_scale = (
+                float(self.accum_steps) * fvm_batches[i]
+                if add_fvm
+                else 1.0
+            )
             add_integral = i in integral_batches
             batch_losses = self.train_batch_adam(
                 batch,
@@ -2116,7 +2200,13 @@ class Trainer:
                 epoch_losses['grad_norm_count'] += 1
             if add_fvm:
                 epoch_losses['fvm_loss_sum'] += batch_losses.get('fvm_loss', 0.0)
+                epoch_losses['fvm_raw_loss_sum'] += batch_losses.get(
+                    'fvm_raw_loss',
+                    0.0,
+                )
+                epoch_losses['fvm_rms_sum'] += batch_losses.get('fvm_rms', 0.0)
                 epoch_losses['fvm_loss_count'] += 1
+                self._last_fvm_evaluations += 1
             if add_integral:
                 self._last_integral_loss = batch_losses.get('integral_loss', 0.0)
             n_batches += 1
@@ -2150,9 +2240,16 @@ class Trainer:
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
 
         if epoch_losses['fvm_loss_count'] > 0:
-            self._last_fvm_loss = epoch_losses['fvm_loss_sum'] / epoch_losses['fvm_loss_count']
+            count = epoch_losses['fvm_loss_count']
+            self._last_fvm_loss = epoch_losses['fvm_loss_sum'] / count
+            self._last_fvm_raw_loss = (
+                epoch_losses['fvm_raw_loss_sum'] / count
+            )
+            self._last_fvm_rms = epoch_losses['fvm_rms_sum'] / count
         else:
             self._last_fvm_loss = 0.0
+            self._last_fvm_raw_loss = 0.0
+            self._last_fvm_rms = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, avg_grad_norm
 
@@ -2184,31 +2281,35 @@ class Trainer:
         bc_comp_list = []
         integral_loss_list = []
         fvm_loss_list = []
+        fvm_raw_loss_list = []
+        fvm_rms_list = []
         wall_speed_list = []
         n_batches = 0
+        fvm_evaluations = 0
 
         # FVM добавляется прямо в closure — единый backward с PDE/BC
         self._fvm_epoch_counter += 1
         fvm_this_epoch = (
             self.loss_computer.fvm is not None
             and self.loss_computer.fvm_weight > 0.0
-            and self._fvm_epoch_counter % self.fvm_interval == 0
         )
+        fvm_decision = self._scheduled_fvm_batches(1, fvm_this_epoch)
+        fvm_correction = fvm_decision.get(0)
 
         def closure():
             self.optimizer.zero_grad()
             total_loss = 0.0
-            nonlocal n_batches
+            nonlocal n_batches, fvm_evaluations
             pde_raw_list.clear()
             pde_max_list.clear()
             bc_comp_list.clear()
             integral_loss_list.clear()
             fvm_loss_list.clear()
+            fvm_raw_loss_list.clear()
+            fvm_rms_list.clear()
             wall_speed_list.clear()
             n_batches = 0
             batches_list = list(dataloader)
-            fvm_batches = self._scheduled_fvm_batches(len(batches_list), fvm_this_epoch)
-            fvm_scale = (1.0 / len(fvm_batches)) if fvm_batches else 1.0
             integral_batches = (
                 {len(batches_list) - 1}
                 if self.loss_computer.integral_condition
@@ -2218,13 +2319,20 @@ class Trainer:
             )
             self._last_integral_loss = 0.0
             for k, batch in enumerate(batches_list):
-                add_fvm_b = k in fvm_batches
+                add_fvm_b = (
+                    fvm_correction is not None
+                    and k == len(batches_list) - 1
+                )
                 add_integral_b = k in integral_batches
                 fwd = self.forward_pass(
                     batch,
                     pde_mult=1.0,
                     add_fvm=add_fvm_b,
-                    fvm_scale=fvm_scale,
+                    fvm_scale=(
+                        float(fvm_correction)
+                        if fvm_correction is not None
+                        else 1.0
+                    ),
                     add_integral=add_integral_b,
                     integral_scale=1.0,
                 )
@@ -2239,8 +2347,13 @@ class Trainer:
                     self._last_integral_loss = fwd['integral_loss']
                 if fwd['wall_speed'] is not None:
                     wall_speed_list.append(fwd['wall_speed'])
-                if add_fvm_b and fwd.get('fvm_loss', 0.0) > 0:
+                if add_fvm_b:
                     fvm_loss_list.append(fwd.get('fvm_loss', 0.0))
+                    fvm_raw_loss_list.append(
+                        fwd.get('fvm_raw_loss', 0.0)
+                    )
+                    fvm_rms_list.append(fwd.get('fvm_rms', 0.0))
+                    fvm_evaluations += 1
                 n_batches += 1
 
             ensure_finite_loss(
@@ -2287,8 +2400,13 @@ class Trainer:
 
         if fvm_loss_list:
             self._last_fvm_loss = float(np.mean(fvm_loss_list))
+            self._last_fvm_raw_loss = float(np.mean(fvm_raw_loss_list))
+            self._last_fvm_rms = float(np.mean(fvm_rms_list))
         else:
             self._last_fvm_loss = 0.0
+            self._last_fvm_raw_loss = 0.0
+            self._last_fvm_rms = 0.0
+        self._last_fvm_evaluations = fvm_evaluations
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, 0.0
 

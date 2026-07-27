@@ -1664,9 +1664,18 @@ class MainWindow(QMainWindow):
         fvm_cfg = loss_cfg.setdefault("fvm", {})
         if isinstance(fvm_cfg, dict):
             fvm_cfg["enabled"] = ui_config["loss_weights"]["use_fvm"]
-            fvm_cfg["weight"] = 1.0 if ui_config["loss_weights"]["use_fvm"] else 0.0
+            fvm_cfg.setdefault("weight", 25.0)
+            fvm_cfg.setdefault("batch_interval", 1)
+            fvm_cfg.setdefault("reduction", "divergence_l2_volume")
+            fvm_cfg.setdefault("schedule", "every_optimizer_step")
         else:
-            loss_cfg["fvm"] = 1.0 if ui_config["loss_weights"]["use_fvm"] else 0.0
+            loss_cfg["fvm"] = {
+                "enabled": ui_config["loss_weights"]["use_fvm"],
+                "weight": 25.0,
+                "batch_interval": 1,
+                "reduction": "divergence_l2_volume",
+                "schedule": "every_optimizer_step",
+            }
 
         process = config.setdefault("process", {})
         if ui_config["training"]["device"] != "auto":

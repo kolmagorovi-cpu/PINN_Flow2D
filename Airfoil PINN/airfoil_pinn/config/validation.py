@@ -324,9 +324,13 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
             errors,
         )
         reduction = str(
-            fvm.get("reduction", fvm.get("loss_reduction", "volume_weighted"))
+            fvm.get(
+                "reduction",
+                fvm.get("loss_reduction", "divergence_l2_volume"),
+            )
         ).lower().replace("-", "_")
         if reduction not in {
+            "divergence_l2_volume",
             "legacy",
             "mean",
             "node_mean",
@@ -338,6 +342,7 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
             "flux_volume",
             "flux_weighted",
             "balance",
+            "flux_balance_l2",
             "flux_mean",
             "mean_flux",
             "divergence_volume",
@@ -345,6 +350,23 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
             "old_volume_weighted",
         }:
             errors.append("loss_weights.fvm.reduction is unsupported")
+        schedule = str(
+            fvm.get("schedule", "every_optimizer_step")
+        ).lower().replace("-", "_")
+        if schedule not in {
+            "every_optimizer_step",
+            "every_k_optimizer_steps",
+            "stochastic_optimizer_step",
+        }:
+            errors.append("loss_weights.fvm.schedule is unsupported")
+        if (
+            schedule == "every_optimizer_step"
+            and fvm.get("batch_interval", 1) != 1
+        ):
+            errors.append(
+                "loss_weights.fvm.batch_interval must be 1 when schedule is "
+                "every_optimizer_step"
+            )
         if (
             bool(fvm.get("enabled", False))
             and pde.get("flow_type") == "axisymmetric"

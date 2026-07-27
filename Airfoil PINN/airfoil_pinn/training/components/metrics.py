@@ -80,6 +80,10 @@ class MetricsCollector:
             'total_bc': [] if loss_computer.bc_type == 'soft' else None,
             'total_pde': [],
             'fvm_loss': [],
+            'fvm_raw_loss': [],
+            'fvm_weighted_loss': [],
+            'fvm_rms': [],
+            'fvm_evaluations': [],
             # Новые поля для диагностики
             'grad_norm_pde': [],
             'grad_norm_bc': [],
@@ -168,6 +172,20 @@ class MetricsCollector:
         if extra_diag:
             if 'fvm_loss' in extra_diag:
                 self.history['fvm_loss'].append(extra_diag['fvm_loss'])
+            if 'fvm_raw_loss' in extra_diag:
+                self.history['fvm_raw_loss'].append(
+                    extra_diag['fvm_raw_loss']
+                )
+            if 'fvm_weighted_loss' in extra_diag:
+                self.history['fvm_weighted_loss'].append(
+                    extra_diag['fvm_weighted_loss']
+                )
+            if 'fvm_rms' in extra_diag:
+                self.history['fvm_rms'].append(extra_diag['fvm_rms'])
+            if 'fvm_evaluations' in extra_diag:
+                self.history['fvm_evaluations'].append(
+                    extra_diag['fvm_evaluations']
+                )
             if 'grad_norm_pde' in extra_diag:
                 self.history['grad_norm_pde'].append(extra_diag['grad_norm_pde'])
             if 'grad_norm_bc' in extra_diag:
@@ -195,6 +213,10 @@ class MetricsCollector:
         """Добавляет новые ключи при resume из старых чекпоинтов."""
         defaults = {
             'fvm_loss': [],
+            'fvm_raw_loss': [],
+            'fvm_weighted_loss': [],
+            'fvm_rms': [],
+            'fvm_evaluations': [],
             'grad_norm_pde': [],
             'grad_norm_bc': [],
             'grad_cosine': [],
@@ -703,7 +725,9 @@ class MetricsCollector:
         pde_max: Dict[str, float],
         epoch_time: float,
         total_time: float,
-        fvm_loss: float = 0.0
+        fvm_loss: float = 0.0,
+        fvm_raw_loss: Optional[float] = None,
+        fvm_rms: Optional[float] = None,
     ) -> None:
         """
         Выводит подробную таблицу с компонентами потерь за эпоху.
@@ -786,8 +810,27 @@ class MetricsCollector:
         fvm_w = getattr(self.loss_computer, 'fvm_weight', 0.0)
         if fvm_w > 0.0:
             rate_fvm = self._compute_rate('fvm', None, fvm_loss)
-            fvm_raw = fvm_loss / fvm_w if fvm_w else fvm_loss
-            print(fmt_line('FVM Loss', rate_fvm, fvm_raw, fvm_raw, fvm_w, fvm_loss, fvm_loss))
+            fvm_raw = (
+                fvm_loss / fvm_w
+                if fvm_raw_loss is None and fvm_w
+                else float(fvm_raw_loss or 0.0)
+            )
+            rms = (
+                float(fvm_rms)
+                if fvm_rms is not None
+                else float(np.sqrt(max(fvm_raw, 0.0)))
+            )
+            print(
+                fmt_line(
+                    'FVM Divergence',
+                    rate_fvm,
+                    rms,
+                    fvm_raw,
+                    fvm_w,
+                    fvm_loss,
+                    fvm_loss,
+                )
+            )
 
         # Totals
         total_bc = sum(bc_comp.values()) if self.loss_computer.bc_type == 'soft' else 0.0
@@ -928,6 +971,10 @@ class MetricsCollector:
 
         fvm_hist = self.history.get('fvm_loss', [])
         final_fvm_loss = fvm_hist[-1] if fvm_hist else 0.0
+        fvm_raw_hist = self.history.get('fvm_raw_loss', [])
+        final_fvm_raw_loss = fvm_raw_hist[-1] if fvm_raw_hist else 0.0
+        fvm_rms_hist = self.history.get('fvm_rms', [])
+        final_fvm_rms = fvm_rms_hist[-1] if fvm_rms_hist else 0.0
 
         metrics = {
             'experiment': self.config_name,
@@ -942,6 +989,9 @@ class MetricsCollector:
             'final_bc_loss': final_bc_loss,
             'final_integral_loss': final_integral_loss,
             'final_fvm_loss': final_fvm_loss,
+            'final_fvm_raw_loss': final_fvm_raw_loss,
+            'final_fvm_weighted_loss': final_fvm_loss,
+            'final_fvm_rms': final_fvm_rms,
             'best_epoch': best_epoch,
             'best_loss': best_loss,
             'final_gradient_norm': final_grad_norm,

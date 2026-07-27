@@ -128,7 +128,8 @@ class ConfigManager:
                     'enabled': False,
                     'weight': 1.0,
                     'batch_interval': 1,
-                    'reduction': 'volume_weighted',
+                    'reduction': 'divergence_l2_volume',
+                    'schedule': 'every_optimizer_step',
                 },
             },
             'training': {
@@ -452,10 +453,20 @@ class ConfigManager:
         fvm_enabled = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
         fvm_weight = fvm_cfg.get('weight', 1.0) if isinstance(fvm_cfg, dict) else float(fvm_cfg)
         fvm_bi = fvm_cfg.get('batch_interval', 1) if isinstance(fvm_cfg, dict) else 1
-        fvm_red = fvm_cfg.get('reduction', 'legacy') if isinstance(fvm_cfg, dict) else 'legacy'
+        fvm_red = (
+            fvm_cfg.get('reduction', 'divergence_l2_volume')
+            if isinstance(fvm_cfg, dict)
+            else 'legacy'
+        )
+        fvm_schedule = (
+            fvm_cfg.get('schedule', 'every_optimizer_step')
+            if isinstance(fvm_cfg, dict)
+            else 'every_optimizer_step'
+        )
         print(
             f"  fvm_mass_flow   : {fvm_enabled} "
-            f"(weight={fvm_weight}, batch_interval={fvm_bi}, reduction={fvm_red})"
+            f"(weight={fvm_weight}, schedule={fvm_schedule}, "
+            f"interval={fvm_bi}, reduction={fvm_red})"
         )
         print()
 

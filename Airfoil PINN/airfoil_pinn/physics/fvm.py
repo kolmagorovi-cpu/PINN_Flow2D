@@ -25,7 +25,9 @@ fvm_residuals.py — FVM-вычислитель невязки уравнени�
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import warnings
 from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -60,7 +62,8 @@ __all__ = [
     "FVMResiduals",
 ]
 
-_V_MIN: float = 1e-30
+_GEOMETRY_CLOSURE_RTOL: float = 1e-8
+_GEOMETRY_CLOSURE_ATOL: float = 1e-12
 
 
 class FVMResiduals:
@@ -91,6 +94,7 @@ class FVMResiduals:
         self._dtype = torch.float64
         self._geometry_is_dimensionless = False
         self._geometry_length_scale = 1.0
+        self._legacy_volume_reduction_warned = False
         self._build_from_mesh(mesh)
 
     # ── Инициализация ─────────────────────────────────────────────────────────
@@ -102,29 +106,44 @@ class FVMResiduals:
             else self._extract_mesh_data(mesh)
         )
 
-        self.N = len(cv)
-        self.M = len(ei)
-        self.B = len(bn)
+        cv_array = np.asarray(cv, dtype=np.float64)
+        edge_i_array = np.asarray(ei, dtype=np.int64)
+        edge_j_array = np.asarray(ej, dtype=np.int64)
+        edge_s_array = np.asarray(eS, dtype=np.float64)
+        bnd_node_array = np.asarray(bn, dtype=np.int64)
+        bnd_s_array = np.asarray(bS, dtype=np.float64)
+        boundary_types = [str(value).strip().lower() for value in bt_strs]
+        self._validate_geometry_arrays(
+            cv_array,
+            edge_i_array,
+            edge_j_array,
+            edge_s_array,
+            bnd_node_array,
+            bnd_s_array,
+            boundary_types,
+        )
 
-        self.V = torch.tensor(np.asarray(cv, dtype=np.float64), dtype=self._dtype)
-        n_bad = int((self.V <= 0).sum())
-        if n_bad:
-            logger.warning(
-                "FVMResiduals: %d/%d CV-объёмов ≤ 0 (min=%.3e) — "
-                "вырожденная сетка. Объёмы зажаты снизу до %.3e.",
-                n_bad, self.N, float(self.V.min()), _V_MIN,
-            )
-            self.V = self.V.clamp(min=_V_MIN)
+        self.N = len(cv_array)
+        self.M = len(edge_i_array)
+        self.B = len(bnd_node_array)
+        self._mesh_fingerprint = self._fingerprint_geometry(
+            cv_array,
+            edge_i_array,
+            edge_j_array,
+            edge_s_array,
+            bnd_node_array,
+            bnd_s_array,
+            boundary_types,
+        )
 
-        self.edge_i = torch.tensor(np.asarray(ei, dtype=np.int64),    dtype=torch.long)
-        self.edge_j = torch.tensor(np.asarray(ej, dtype=np.int64),    dtype=torch.long)
-        self.edge_S = torch.tensor(np.asarray(eS, dtype=np.float64).reshape(-1, 2),
-                                   dtype=self._dtype)
-        self.bnd_node = torch.tensor(np.asarray(bn, dtype=np.int64),  dtype=torch.long)
-        self.bnd_S    = torch.tensor(np.asarray(bS, dtype=np.float64).reshape(-1, 2),
-                                     dtype=self._dtype)
+        self.V = torch.tensor(cv_array, dtype=self._dtype)
+        self.edge_i = torch.tensor(edge_i_array, dtype=torch.long)
+        self.edge_j = torch.tensor(edge_j_array, dtype=torch.long)
+        self.edge_S = torch.tensor(edge_s_array, dtype=self._dtype)
+        self.bnd_node = torch.tensor(bnd_node_array, dtype=torch.long)
+        self.bnd_S = torch.tensor(bnd_s_array, dtype=self._dtype)
         bnd_codes = np.fromiter(
-            (BC_CODES.get(str(t).lower(), BC_CODES['interior']) for t in bt_strs),
+            (BC_CODES[t] for t in boundary_types),
             dtype=np.int64, count=self.B,
         )
         self.bnd_type = torch.tensor(bnd_codes, dtype=torch.long)
@@ -150,6 +169,130 @@ class FVMResiduals:
 
         logger.info("FVMResiduals: N=%d, M=%d, B=%d", self.N, self.M, self.B)
 
+    @staticmethod
+    def _validate_geometry_arrays(
+        volumes: np.ndarray,
+        edge_i: np.ndarray,
+        edge_j: np.ndarray,
+        edge_s: np.ndarray,
+        bnd_node: np.ndarray,
+        bnd_s: np.ndarray,
+        boundary_types: list[str],
+    ) -> None:
+        """Fail fast when a mesh cannot define a conservative FVM operator."""
+        if volumes.ndim != 1 or volumes.size == 0:
+            raise ValueError("FVM control volumes must be a non-empty 1-D array")
+        if not np.isfinite(volumes).all():
+            raise ValueError("FVM volumes contain NaN or Inf")
+        if np.any(volumes <= 0.0):
+            raise ValueError("FVM control volumes must be strictly positive")
+
+        n_nodes = int(volumes.size)
+        if edge_i.ndim != 1 or edge_j.ndim != 1:
+            raise ValueError("FVM internal face indices must be 1-D arrays")
+        if edge_i.shape != edge_j.shape:
+            raise ValueError("FVM internal face index arrays have different lengths")
+        if edge_s.shape != (edge_i.size, 2):
+            raise ValueError(
+                "FVM internal area vectors must have shape "
+                f"({edge_i.size}, 2), received {edge_s.shape}"
+            )
+        if bnd_node.ndim != 1:
+            raise ValueError("FVM boundary face indices must be a 1-D array")
+        if bnd_s.shape != (bnd_node.size, 2):
+            raise ValueError(
+                "FVM boundary area vectors must have shape "
+                f"({bnd_node.size}, 2), received {bnd_s.shape}"
+            )
+        if len(boundary_types) != bnd_node.size:
+            raise ValueError(
+                "FVM boundary type count does not match boundary face count"
+            )
+        if bnd_node.size == 0:
+            raise ValueError("FVM mesh must contain boundary faces")
+
+        for name, indices in (
+            ("internal face i", edge_i),
+            ("internal face j", edge_j),
+            ("boundary face", bnd_node),
+        ):
+            if np.any(indices < 0) or np.any(indices >= n_nodes):
+                raise ValueError(
+                    f"FVM {name} indices must be in [0, {n_nodes})"
+                )
+        if np.any(edge_i == edge_j):
+            raise ValueError("FVM internal faces cannot connect a node to itself")
+
+        all_area_vectors = (
+            np.vstack((edge_s, bnd_s))
+            if edge_s.size
+            else bnd_s
+        )
+        if not np.isfinite(all_area_vectors).all():
+            raise ValueError("FVM area vectors contain NaN or Inf")
+        if np.any(np.linalg.norm(all_area_vectors, axis=1) <= 0.0):
+            raise ValueError("FVM area vectors must be non-zero")
+
+        unknown_types = sorted(set(boundary_types) - set(BC_CODES))
+        if unknown_types:
+            raise ValueError(
+                "FVM boundary faces contain unsupported types: "
+                + ", ".join(unknown_types)
+            )
+
+        incident_faces = np.zeros(n_nodes, dtype=np.int64)
+        np.add.at(incident_faces, edge_i, 1)
+        np.add.at(incident_faces, edge_j, 1)
+        np.add.at(incident_faces, bnd_node, 1)
+        if np.any(incident_faces == 0):
+            orphan_count = int(np.count_nonzero(incident_faces == 0))
+            raise ValueError(
+                f"FVM mesh contains {orphan_count} control volumes without faces"
+            )
+
+        closure = np.zeros((n_nodes, 2), dtype=np.float64)
+        np.add.at(closure, edge_i, edge_s)
+        np.add.at(closure, edge_j, -edge_s)
+        np.add.at(closure, bnd_node, bnd_s)
+        max_error = float(np.linalg.norm(closure, axis=1).max())
+        area_scale = float(np.linalg.norm(all_area_vectors, axis=1).max())
+        tolerance = max(
+            _GEOMETRY_CLOSURE_ATOL,
+            _GEOMETRY_CLOSURE_RTOL * area_scale,
+        )
+        if max_error > tolerance:
+            raise ValueError(
+                "FVM control-volume area vectors do not close: "
+                f"max norm {max_error:.6e} exceeds {tolerance:.6e}"
+            )
+
+    @staticmethod
+    def _fingerprint_geometry(
+        volumes: np.ndarray,
+        edge_i: np.ndarray,
+        edge_j: np.ndarray,
+        edge_s: np.ndarray,
+        bnd_node: np.ndarray,
+        bnd_s: np.ndarray,
+        boundary_types: list[str],
+    ) -> str:
+        """Return a stable identity of the canonical dimensional mesh arrays."""
+        digest = hashlib.sha256()
+        for name, values, dtype in (
+            ("volumes", volumes, "<f8"),
+            ("edge_i", edge_i, "<i8"),
+            ("edge_j", edge_j, "<i8"),
+            ("edge_s", edge_s, "<f8"),
+            ("bnd_node", bnd_node, "<i8"),
+            ("bnd_s", bnd_s, "<f8"),
+        ):
+            array = np.ascontiguousarray(values, dtype=np.dtype(dtype))
+            digest.update(name.encode("ascii"))
+            digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+            digest.update(array.tobytes())
+        digest.update("\0".join(boundary_types).encode("utf-8"))
+        return digest.hexdigest()
+
     def _validate_velocity(self, u: torch.Tensor) -> None:
         """Проверяет скорость перед FVM-операциями, чтобы ошибки были явными."""
         if not torch.is_tensor(u):
@@ -170,6 +313,23 @@ class FVMResiduals:
                 "FVMResiduals.compute_residual: dtype u не совпадает с геометрией "
                 f"({u.dtype} != {self._dtype}). Вызовите fvm.to(u.device, u.dtype)."
             )
+
+    def _validate_tensor_geometry(self) -> None:
+        """Reject invalid values introduced by dtype conversion or scaling."""
+        if not torch.isfinite(self.V).all():
+            raise ValueError("FVM volumes contain NaN or Inf")
+        if torch.any(self.V <= 0):
+            raise ValueError("FVM control volumes must be strictly positive")
+        if (
+            not torch.isfinite(self.edge_S).all()
+            or not torch.isfinite(self.bnd_S).all()
+        ):
+            raise ValueError("FVM area vectors contain NaN or Inf")
+        if (
+            (self.M > 0 and torch.any(self.edge_S.norm(dim=1) <= 0))
+            or (self.B > 0 and torch.any(self.bnd_S.norm(dim=1) <= 0))
+        ):
+            raise ValueError("FVM area vectors must be non-zero")
 
     def _compute_residual(
         self,
@@ -308,52 +468,109 @@ class FVMResiduals:
     def mass_loss(
         self,
         u: torch.Tensor,
-        reduction: str = "legacy",
+        reduction: str = "divergence_l2_volume",
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Среднеквадратичная невязка (скаляр), готовая для сложения с total_loss.
+        """Reduce the discrete mass residual to a scalar objective.
 
-        L_mass = (1/N) Σ R_i²
-
-        Аргументы:
-            u: скорость (N, 2)
-
-        Возвращает:
-            Скалярный тензор потерь
+        ``divergence_l2_volume`` evaluates
+        ``sum(V_i * R_i**2) / sum(V_i)``. ``flux_balance_l2`` evaluates
+        ``sum(Phi_i**2) / sum(V_i)``. The deprecated ``volume_weighted``
+        name retains the latter formula for old experiment reproducibility.
         """
         residual = self.compute_residual(
             u,
             freestream_velocity=freestream_velocity,
         )
+        return self._reduce_residual(residual, reduction)
+
+    def _reduce_residual(
+        self,
+        residual: torch.Tensor,
+        reduction: str,
+    ) -> torch.Tensor:
+        """Reduce one already-computed discrete divergence field."""
         mode = str(reduction or "legacy").strip().lower().replace("-", "_")
 
         volumes = self.V.to(device=residual.device, dtype=residual.dtype)
-        denom = torch.clamp(volumes.sum(), min=torch.finfo(residual.dtype).tiny)
-        # residual is Phi_i / V_i. For finite-volume mass balance we penalize
-        # the face-flux imbalance Phi_i, not the divergence-like residual itself.
+        denom = volumes.sum()
         flux_balance = residual * volumes
 
         if mode in {"legacy", "mean", "node_mean", "unweighted"}:
-            return torch.mean(residual ** 2)
+            return torch.mean(residual.square())
 
-        if mode in {"volume", "volume_weighted", "cell_volume"}:
-            return torch.sum(flux_balance ** 2) / denom
+        if mode in {
+            "divergence_l2_volume",
+            "divergence_volume",
+            "divergence_volume_weighted",
+            "old_volume_weighted",
+        }:
+            return torch.sum(volumes * residual.square()) / denom
 
-        if mode in {"flux", "flux_volume", "flux_weighted", "balance"}:
-            return torch.sum(flux_balance ** 2) / denom
+        if mode in {
+            "volume",
+            "volume_weighted",
+            "cell_volume",
+            "flux_balance_l2",
+            "flux",
+            "flux_volume",
+            "flux_weighted",
+            "balance",
+        }:
+            if (
+                mode in {"volume", "volume_weighted", "cell_volume"}
+                and not self._legacy_volume_reduction_warned
+            ):
+                warnings.warn(
+                    "FVM reduction 'volume_weighted' is a deprecated legacy "
+                    "flux-balance objective; use 'divergence_l2_volume' for "
+                    "the physical divergence norm or 'flux_balance_l2' for "
+                    "explicit diagnostics.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                self._legacy_volume_reduction_warned = True
+            return torch.sum(flux_balance.square()) / denom
 
         if mode in {"flux_mean", "mean_flux"}:
-            return torch.mean(flux_balance ** 2)
-
-        if mode in {"divergence_volume", "divergence_volume_weighted", "old_volume_weighted"}:
-            return torch.sum(volumes * residual ** 2) / denom
+            return torch.mean(flux_balance.square())
 
         raise ValueError(
             "FVMResiduals.mass_loss: unknown reduction "
-            f"{reduction!r}. Use 'legacy', 'volume_weighted', 'flux', "
-            "'flux_mean', or 'divergence_volume_weighted'."
+            f"{reduction!r}. Use 'divergence_l2_volume', "
+            "'flux_balance_l2', 'volume_weighted' (legacy), or 'legacy'."
         )
+
+    def loss_and_divergence_rms(
+        self,
+        u: torch.Tensor,
+        reduction: str = "divergence_l2_volume",
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the selected loss and physical RMS from one face pass."""
+        residual = self.compute_residual(
+            u,
+            freestream_velocity=freestream_velocity,
+        )
+        raw = self._reduce_residual(residual, reduction)
+        divergence_l2 = self._reduce_residual(
+            residual,
+            "divergence_l2_volume",
+        )
+        return raw, torch.sqrt(divergence_l2.clamp_min(0.0))
+
+    def divergence_rms(
+        self,
+        u: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return the volume-weighted RMS discrete divergence."""
+        _, rms = self.loss_and_divergence_rms(
+            u,
+            reduction="divergence_l2_volume",
+            freestream_velocity=freestream_velocity,
+        )
+        return rms
 
     # ── Вспомогательные методы ────────────────────────────────────────────────
 
@@ -428,6 +645,7 @@ class FVMResiduals:
             'N': self.N,
             'M': self.M,
             'B': self.B,
+            'mesh_fingerprint': self._mesh_fingerprint,
             'device': str(self._device),
             'geometry_is_dimensionless': self._geometry_is_dimensionless,
             'geometry_length_scale': self._geometry_length_scale,
@@ -445,6 +663,11 @@ class FVMResiduals:
             },
             'prescribed_bc_types': prescribed_types,
         }
+
+    @property
+    def mesh_fingerprint(self) -> str:
+        """Stable SHA-256 identity of the dimensional mesh arrays."""
+        return self._mesh_fingerprint
 
     # ── Предписанные граничные условия ────────────────────────────────────────
 
@@ -571,6 +794,7 @@ class FVMResiduals:
         # such as cuda:0. Store the concrete value to keep validation reliable.
         self._device = self.V.device
         self._dtype = self.V.dtype
+        self._validate_tensor_geometry()
         return self
 
     def nondimensionalize_geometry(
@@ -605,6 +829,7 @@ class FVMResiduals:
         self.edge_S.div_(scale)
         self.bnd_S.div_(scale)
         self.V.div_(scale ** 2)
+        self._validate_tensor_geometry()
         self._geometry_is_dimensionless = True
         self._geometry_length_scale = scale
         logger.info(

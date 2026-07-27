@@ -166,6 +166,9 @@ class PINNSolver:
                 self.loss_computer.sdf_geometry_fingerprint
             ),
         )
+        # FVM-геометрия используется не только для FVM-loss, но и для
+        # корректного интегрального баланса массы по граничным граням.
+        self._setup_fvm_residuals()
         self.training_contract = build_training_contract(
             config,
             self.data_handler,
@@ -175,10 +178,6 @@ class PINNSolver:
             "Training contract: %s",
             self.training_contract.fingerprint()[:12],
         )
-
-        # FVM-геометрия используется не только для FVM-loss, но и для
-        # корректного интегрального баланса массы по граничным граням.
-        self._setup_fvm_residuals()
 
         # SA-веса (если используются)
         self.sa_weights = None
@@ -559,9 +558,10 @@ class PINNSolver:
 
         if self.data_handler.mesh_data is None:
             if fvm_enabled:
-                logger.warning(
-                    "FVM Mass flow включён (fvm.enabled=True), но mesh_file не задан — "
-                    "FVM-потеря не будет вычисляться"
+                raise RuntimeError(
+                    "FVM is enabled, but no valid mesh is loaded. Set "
+                    "data.mesh_file to a valid FVM mesh or disable "
+                    "loss_weights.fvm."
                 )
             if integral_enabled:
                 logger.warning(
@@ -576,6 +576,23 @@ class PINNSolver:
             fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
             fvm.to(self.device, dtype=self.dtype)
             fvm.nondimensionalize_geometry(self.data_handler.chord)
+            tensor_lengths = {
+                "fvm_x": len(self.data_handler.fvm_x),
+                "fvm_y": len(self.data_handler.fvm_y),
+                "fvm_sdf": len(self.data_handler.fvm_sdf),
+            }
+            if self.data_handler.fvm_bt is not None:
+                tensor_lengths["fvm_bt"] = len(self.data_handler.fvm_bt)
+            mismatched = {
+                name: length
+                for name, length in tensor_lengths.items()
+                if length != fvm.N
+            }
+            if mismatched:
+                raise ValueError(
+                    "FVM node tensor count does not match the operator: "
+                    f"operator={fvm.N}, tensors={mismatched}"
+                )
             inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
             inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
             velocity_bc = torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
@@ -587,6 +604,10 @@ class PINNSolver:
             logger.info("FVMResiduals подключён: %d узлов", fvm.N)
         except Exception as e:
             self.loss_computer.fvm = None
+            if fvm_enabled:
+                raise RuntimeError(
+                    "FVM is enabled, but its geometry is invalid"
+                ) from e
             logger.warning("Не удалось инициализировать FVMResiduals: %s", e)
 
     def _init_optimizer(self, optim_type='adam') -> optim.Optimizer:
@@ -656,6 +677,26 @@ class PINNSolver:
             return optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min',
                                                          factor=0.5, patience=50)
 
+    def _restore_checkpoint_data_state(self, state: Dict) -> None:
+        """Restore dataset/RAR/FVM state before validating its contract."""
+        self.data_handler.load_state(state)
+        self.loss_computer.synchronize_cached_training_sdf()
+        self.x_min = self.data_handler.dataset.x.min().item()
+        self.x_max = self.data_handler.dataset.x.max().item()
+        self.y_min = self.data_handler.dataset.y.min().item()
+        self.y_max = self.data_handler.dataset.y.max().item()
+        self.loss_computer.x_min = self.x_min
+        self.loss_computer.x_max = self.x_max
+        self.loss_computer.y_min = self.y_min
+        self.loss_computer.y_max = self.y_max
+        self._setup_fvm_residuals()
+        self.trainer._fvm_tensor_cache = None
+        self.training_contract = build_training_contract(
+            self.config,
+            self.data_handler,
+            self.loss_computer,
+        )
+
     def _load_checkpoint_if_needed(self):
         load_path = self.config['process'].get('load_model_path')
         if not load_path:
@@ -672,6 +713,12 @@ class PINNSolver:
                 checkpoint_cfg.get("load_mode", "resume")
             ).lower()
             finetune = load_mode == "finetune"
+            data_state_restored = False
+            if not finetune and "data_handler_state" in checkpoint:
+                self._restore_checkpoint_data_state(
+                    checkpoint["data_handler_state"]
+                )
+                data_state_restored = True
             contract_metadata = checkpoint.get("training_contract")
             if contract_metadata is None:
                 current_boundary = self.training_contract.payload.get(
@@ -757,23 +804,8 @@ class PINNSolver:
                 return
             # Сначала восстанавливаем данные/RAR-сетку, чтобы размеры SA-весов и
             # optimizer state соответствовали фактическому датасету.
-            if 'data_handler_state' in checkpoint:
-                self.data_handler.load_state(checkpoint['data_handler_state'])
-                # A checkpoint may contain RAR points and an SDF column
-                # produced by older geometry logic.  Coordinates are state;
-                # SDF values are a geometry-derived cache and must therefore
-                # be rebuilt by the active canonical segment engine.
-                self.loss_computer.synchronize_cached_training_sdf()
-                self.x_min = self.data_handler.dataset.x.min().item()
-                self.x_max = self.data_handler.dataset.x.max().item()
-                self.y_min = self.data_handler.dataset.y.min().item()
-                self.y_max = self.data_handler.dataset.y.max().item()
-                self.loss_computer.x_min = self.x_min
-                self.loss_computer.x_max = self.x_max
-                self.loss_computer.y_min = self.y_min
-                self.loss_computer.y_max = self.y_max
-                self._setup_fvm_residuals()
-                self.trainer._fvm_tensor_cache = None
+            if data_state_restored:
+                pass
             elif self.trainer.rar_enable:
                 logger.warning(
                     "Чекпоинт не содержит data_handler_state. Если он был сохранён после RAR, "
@@ -849,6 +881,11 @@ class PINNSolver:
 
     def _save_checkpoint(self, identifier: Union[int, str]) -> None:
         filename = f"pinn_{identifier}.pt"
+        self.training_contract = build_training_contract(
+            self.config,
+            self.data_handler,
+            self.loss_computer,
+        )
         self.checkpoint_manager.save(
             filename=filename,
             model=self.model,
@@ -1179,7 +1216,13 @@ class PINNSolver:
                         self.trainer.train_epoch_adam(pde_mult)
 
                 # Сбор дополнительных метрик для диагностики (если нужно)
-                extra_diag = {'fvm_loss': self.trainer._last_fvm_loss}
+                extra_diag = {
+                    'fvm_loss': self.trainer._last_fvm_loss,
+                    'fvm_raw_loss': self.trainer._last_fvm_raw_loss,
+                    'fvm_weighted_loss': self.trainer._last_fvm_loss,
+                    'fvm_rms': self.trainer._last_fvm_rms,
+                    'fvm_evaluations': self.trainer._last_fvm_evaluations,
+                }
                 sample_batch = None
                 if self.sa_weights is not None:
                     with torch.no_grad():
@@ -1289,6 +1332,12 @@ class PINNSolver:
                         "boundary": bc_comp,
                         "integral_loss": integral_loss,
                         "fvm_loss": self.trainer._last_fvm_loss,
+                        "fvm_raw_loss": self.trainer._last_fvm_raw_loss,
+                        "fvm_weighted_loss": self.trainer._last_fvm_loss,
+                        "fvm_rms": self.trainer._last_fvm_rms,
+                        "fvm_evaluations": (
+                            self.trainer._last_fvm_evaluations
+                        ),
                         "wall_speed": wall_speed,
                         "gradient_l2_norm": grad_norm,
                         "diagnostics": extra_diag,
@@ -1307,7 +1356,9 @@ class PINNSolver:
                 # Вывод в консоль (avg_u_in/out уже вычислены выше)
                 self.metrics.print_epoch_table(
                     epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time,
-                    fvm_loss=self.trainer._last_fvm_loss
+                    fvm_loss=self.trainer._last_fvm_loss,
+                    fvm_raw_loss=self.trainer._last_fvm_raw_loss,
+                    fvm_rms=self.trainer._last_fvm_rms,
                 )
                 line2 = (
                     f"   avg u_inlet = {avg_u_in:.4f} (норм.), "

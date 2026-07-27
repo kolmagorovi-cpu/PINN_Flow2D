@@ -140,15 +140,19 @@ class LossComputer:
             else:
                 self.fvm_weight: float = float(fvm_cfg.get('weight', 0.0))
             self.fvm_batch_interval: int = max(1, int(fvm_cfg.get('batch_interval', 1)))
+            self.fvm_schedule: str = str(
+                fvm_cfg.get('schedule', 'every_optimizer_step')
+            ).strip().lower().replace('-', '_')
             self.fvm_loss_reduction: str = str(
                 fvm_cfg.get(
                     'reduction',
-                    fvm_cfg.get('loss_reduction', 'volume_weighted'),
+                    fvm_cfg.get('loss_reduction', 'divergence_l2_volume'),
                 )
             )
         else:
             self.fvm_weight: float = float(fvm_cfg)
             self.fvm_batch_interval: int = 1
+            self.fvm_schedule: str = 'every_optimizer_step'
             self.fvm_loss_reduction: str = 'legacy'
         # Заполняется из PINNSolver при наличии mesh_file в конфиге
         self.fvm: Optional["FVMResiduals"] = None
@@ -606,16 +610,32 @@ class LossComputer:
             freestream_velocity: case-local ``(cos(alpha), sin(alpha))``
 
         Returns:
-            Скалярный тензор fvm_weight * mean(R_i²),
-            или ноль если fvm не подключён / вес равен нулю.
+            Configured FVM contribution ``fvm_weight * raw_fvm_loss``.
         """
-        if self.fvm is None or self.fvm_weight == 0.0:
-            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        return self.fvm_weight * self.fvm.mass_loss(
+        return self.compute_fvm_metrics(
+            u_fvm,
+            freestream_velocity=freestream_velocity,
+        )["weighted"]
+
+    def compute_fvm_metrics(
+        self,
+        u_fvm: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return selected raw loss, configured contribution and divergence RMS."""
+        if self.fvm is None:
+            zero = torch.zeros((), device=self.device, dtype=self.dtype)
+            return {"raw": zero, "weighted": zero, "rms": zero}
+        raw, rms = self.fvm.loss_and_divergence_rms(
             u_fvm,
             reduction=self.fvm_loss_reduction,
             freestream_velocity=freestream_velocity,
         )
+        return {
+            "raw": raw,
+            "weighted": raw * self.fvm_weight,
+            "rms": rms,
+        }
 
     def _setup_pde_components(self) -> List[str]:
         """Возвращает список названий компонент PDE в зависимости от типа течения."""

@@ -122,6 +122,13 @@ def test_fvm_checks(handler: DataHandler) -> None:
         volumes.sum(),
         min=torch.finfo(residual.dtype).tiny,
     )
+    divergence_volume_loss = torch.sum(
+        volumes * residual ** 2
+    ) / volumes.sum()
+    assert torch.allclose(
+        fvm.mass_loss(zeros, reduction="divergence_l2_volume"),
+        divergence_volume_loss,
+    )
     assert torch.allclose(
         fvm.mass_loss(zeros, reduction="volume_weighted"),
         flux_volume_loss,
@@ -152,13 +159,23 @@ def test_fvm_checks(handler: DataHandler) -> None:
 
 def test_fvm_schedule() -> None:
     trainer = Trainer.__new__(Trainer)
+    trainer.accum_steps = 1
+    trainer.fvm_schedule = "every_optimizer_step"
+    trainer._fvm_optimizer_step_counter = 0
     trainer.fvm_batch_interval = 1
-    assert trainer._scheduled_fvm_batches(4, True) == {0, 1, 2, 3}
-    trainer.fvm_batch_interval = 2
-    assert trainer._scheduled_fvm_batches(5, True) == {1, 3}
-    trainer.fvm_batch_interval = 10
-    assert trainer._scheduled_fvm_batches(5, True) == {4}
-    assert trainer._scheduled_fvm_batches(5, False) == set()
+    assert trainer._scheduled_fvm_batches(4, True) == {
+        0: 1.0,
+        1: 1.0,
+        2: 1.0,
+        3: 1.0,
+    }
+    trainer.accum_steps = 2
+    assert trainer._scheduled_fvm_batches(5, True) == {
+        1: 1.0,
+        3: 1.0,
+        4: 1.0,
+    }
+    assert trainer._scheduled_fvm_batches(5, False) == {}
 
 
 def test_sdf_chunk() -> None:

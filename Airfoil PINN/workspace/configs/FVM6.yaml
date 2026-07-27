@@ -70,7 +70,9 @@ loss_weights:
   fvm:
     batch_interval: 1
     enabled: true
-    weight: 100.0
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+    weight: 25.0
   integral_condition: false
   integral_weight: 0.0
   pde_weights:

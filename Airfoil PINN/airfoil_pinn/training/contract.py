@@ -85,6 +85,31 @@ def build_training_contract(
         case.to_metadata()
         for _, case in sorted(data_handler.flow_cases.items())
     ]
+    fvm_config = config.get("loss_weights", {}).get("fvm", {})
+    if isinstance(fvm_config, Mapping):
+        fvm_weight = float(fvm_config.get("weight", 1.0))
+        fvm_enabled = (
+            bool(fvm_config["enabled"])
+            if "enabled" in fvm_config
+            else fvm_weight != 0.0
+        )
+        fvm_reduction = str(
+            fvm_config.get(
+                "reduction",
+                fvm_config.get("loss_reduction", "divergence_l2_volume"),
+            )
+        ).lower().replace("-", "_")
+        fvm_schedule = str(
+            fvm_config.get("schedule", "every_optimizer_step")
+        ).lower().replace("-", "_")
+        fvm_interval = int(fvm_config.get("batch_interval", 1))
+    else:
+        fvm_enabled = bool(float(fvm_config))
+        fvm_weight = float(fvm_config)
+        fvm_reduction = "legacy"
+        fvm_schedule = "every_optimizer_step"
+        fvm_interval = 1
+    fvm_operator = getattr(loss_computer, "fvm", None)
     payload = {
         "feature_manifest": loss_computer.feature_manifest.to_dict(),
         "reference_scales": reference_scales.to_metadata(),
@@ -116,6 +141,43 @@ def build_training_contract(
             "fvm_sdf_geometry_fingerprint",
             None,
         ),
+        "fvm": {
+            "enabled": fvm_enabled,
+            "reduction": fvm_reduction,
+            "weight": fvm_weight,
+            "schedule": fvm_schedule,
+            "interval": fvm_interval,
+            "inclusion_probability": (
+                1.0 / fvm_interval
+                if fvm_schedule == "stochastic_optimizer_step"
+                else 1.0
+            ),
+            "mesh_identifier": config.get("data", {}).get("mesh_file"),
+            "mesh_fingerprint": getattr(
+                fvm_operator,
+                "mesh_fingerprint",
+                None,
+            ),
+            "normalization": "face_vectors/c;control_volumes/c^2",
+            "geometry_is_dimensionless": bool(
+                getattr(
+                    fvm_operator,
+                    "_geometry_is_dimensionless",
+                    False,
+                )
+            ),
+            "geometry_length_scale": (
+                float(
+                    getattr(
+                        fvm_operator,
+                        "_geometry_length_scale",
+                        1.0,
+                    )
+                )
+                if fvm_operator is not None
+                else None
+            ),
+        },
         "flow_cases": flow_cases,
         "boundary_type_names": list(data_handler.boundary_type_names),
         "boundary_enforcement": (
