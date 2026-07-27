@@ -90,6 +90,27 @@ def build_training_contract(
         "reference_scales": reference_scales.to_metadata(),
         "reference_scales_fingerprint": reference_scales.fingerprint(),
         "sdf_geometry_fingerprint": loss_computer.sdf_geometry_fingerprint,
+        "sdf_value_contract": {
+            "method": "exact_polyline_segments",
+            "evaluation_dtype": "float64",
+            "consistency_tolerance": float(
+                getattr(
+                    loss_computer,
+                    "sdf_float64_consistency_tolerance",
+                    1e-12,
+                )
+            ),
+            "cached_geometry_fingerprint": getattr(
+                data_handler,
+                "cached_sdf_geometry_fingerprint",
+                None,
+            ),
+            "cached_method": getattr(
+                data_handler,
+                "cached_sdf_method",
+                None,
+            ),
+        },
         "fvm_sdf_geometry_fingerprint": getattr(
             data_handler,
             "fvm_sdf_geometry_fingerprint",
@@ -97,6 +118,34 @@ def build_training_contract(
         ),
         "flow_cases": flow_cases,
         "boundary_type_names": list(data_handler.boundary_type_names),
+        "boundary_enforcement": (
+            loss_computer.boundary_enforcement_contract
+            if hasattr(loss_computer, "boundary_enforcement_contract")
+            else {
+                name: {
+                    "kind": values.get("kind", name),
+                    "mode": values.get("enforcement", "soft"),
+                    **(
+                        {
+                            "transform": "normalized_distance",
+                            "distance_scale": float(
+                                values.get("distance_scale", 0.02)
+                            ),
+                        }
+                        if (
+                            name == "wall"
+                            and values.get("enforcement", "soft") == "hard"
+                        )
+                        else {}
+                    ),
+                }
+                for name, values in config.get(
+                    "boundary_conditions",
+                    {},
+                ).items()
+                if isinstance(values, Mapping)
+            }
+        ),
         "pde": {
             "system": pde.get("system"),
             "flow_type": pde.get("flow_type"),

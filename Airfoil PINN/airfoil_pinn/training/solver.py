@@ -122,6 +122,7 @@ class PINNSolver:
             persistent_workers=data_cfg.get('persistent_workers'),
             prefetch_factor=data_cfg.get('prefetch_factor'),
             seed=seed,
+            pde_system=config['pde']['system'],
         )
 
         # Константы PDE (нормированные)
@@ -407,20 +408,15 @@ class PINNSolver:
         arch = self.config['architecture']
         # Определяем фактическую размерность входа
         sample_batch = next(iter(self.data_handler.get_dataloader()))
-        idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = sample_batch
+        _, x, y, sdf, *_ = sample_batch
         case_ids = getattr(sample_batch, 'case_id', None)
-        x = x.to(self.device)
-        y = y.to(self.device)
-        sdf = sdf.to(self.device)
-        if bt.shape[1] > 0:
-            bt = bt.to(self.device)
-        else:
-            bt = None
+        x = x.to(self.device, dtype=self.dtype)
+        y = y.to(self.device, dtype=self.dtype)
+        sdf = sdf.to(self.device, dtype=self.dtype)
         input_tensor = self.loss_computer.build_input_tensor(
             x,
             y,
             sdf,
-            bt,
             case_ids=case_ids,
         )
         actual_input_dim = input_tensor.shape[1]
@@ -672,8 +668,25 @@ class PINNSolver:
         try:
             checkpoint = torch.load(load_path, map_location=self.device, weights_only=False)
             checkpoint_cfg = self.config.get("checkpoint", {})
+            load_mode = str(
+                checkpoint_cfg.get("load_mode", "resume")
+            ).lower()
+            finetune = load_mode == "finetune"
             contract_metadata = checkpoint.get("training_contract")
             if contract_metadata is None:
+                current_boundary = self.training_contract.payload.get(
+                    "boundary_enforcement"
+                )
+                hard_wall = (
+                    isinstance(current_boundary, dict)
+                    and current_boundary.get("wall", {}).get("mode") == "hard"
+                )
+                if hard_wall and not finetune:
+                    raise RuntimeError(
+                        "A legacy checkpoint cannot be resumed with the new "
+                        "hard wall transform. Set checkpoint.load_mode=finetune "
+                        "to load model weights only."
+                    )
                 if not bool(
                     checkpoint_cfg.get(
                         "allow_legacy_without_contract",
@@ -689,23 +702,68 @@ class PINNSolver:
                     "shape compatibility can be checked."
                 )
             else:
+                checkpoint_boundary = contract_metadata.get(
+                    "payload",
+                    {},
+                ).get("boundary_enforcement")
+                current_boundary = self.training_contract.payload.get(
+                    "boundary_enforcement"
+                )
+                if (
+                    checkpoint_boundary != current_boundary
+                    and not finetune
+                ):
+                    raise RuntimeError(
+                        "Boundary enforcement/transform differs from the "
+                        "checkpoint, so exact resume is invalid. Set "
+                        "checkpoint.load_mode=finetune to load model weights "
+                        "without optimizer, data, history, epoch or RNG state."
+                    )
                 try:
                     validate_checkpoint_contract(
                         contract_metadata,
                         self.training_contract,
                     )
                 except Exception:
-                    if bool(checkpoint_cfg.get("strict_contract", True)):
+                    if (
+                        not finetune
+                        and bool(checkpoint_cfg.get("strict_contract", True))
+                    ):
                         raise
                     logger.warning(
-                        "Checkpoint contract mismatch ignored because "
-                        "checkpoint.strict_contract=False.",
-                        exc_info=True,
+                        "Checkpoint contract mismatch accepted for %s mode.",
+                        load_mode,
                     )
+            if finetune:
+                if 'model_state_dict' not in checkpoint:
+                    raise RuntimeError(
+                        "Finetune checkpoint contains no model_state_dict"
+                    )
+                state_dict = checkpoint['model_state_dict']
+                state_dict = self._strip_state_prefix(state_dict, 'module.')
+                state_dict = self._strip_state_prefix(
+                    state_dict,
+                    '_orig_mod.',
+                )
+                self._unwrap_model_for_state(self.model).load_state_dict(
+                    state_dict
+                )
+                self.start_epoch = 0
+                logger.warning(
+                    "Checkpoint loaded in finetune mode: only model weights "
+                    "were restored; optimizer, scheduler, data/RAR state, "
+                    "history, epoch and RNG state were intentionally ignored."
+                )
+                return
             # Сначала восстанавливаем данные/RAR-сетку, чтобы размеры SA-весов и
             # optimizer state соответствовали фактическому датасету.
             if 'data_handler_state' in checkpoint:
                 self.data_handler.load_state(checkpoint['data_handler_state'])
+                # A checkpoint may contain RAR points and an SDF column
+                # produced by older geometry logic.  Coordinates are state;
+                # SDF values are a geometry-derived cache and must therefore
+                # be rebuilt by the active canonical segment engine.
+                self.loss_computer.synchronize_cached_training_sdf()
                 self.x_min = self.data_handler.dataset.x.min().item()
                 self.x_max = self.data_handler.dataset.x.max().item()
                 self.y_min = self.data_handler.dataset.y.min().item()
@@ -1013,7 +1071,7 @@ class PINNSolver:
                 case_ids = getattr(batch, 'case_id', None)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
-                sdf = sdf.to(self.device, dtype=self.dtype)
+                sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
                 if bt.shape[1] > 0:
                     bt = bt.to(self.device, dtype=self.dtype)
                 else:
@@ -1023,13 +1081,21 @@ class PINNSolver:
                     x,
                     y,
                     sdf,
-                    bt,
                     case_ids=case_ids,
                 )
                 out = self.model(input_tensor)
                 u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+                u, v, p = self.loss_computer.transform_outputs(
+                    u_raw,
+                    v_raw,
+                    p_raw,
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
 
-                # Применяем hard constraints, если нужно
+                # Legacy pointwise override.
                 if self.loss_computer.bc_type == 'hard':
                     mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
                     mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
@@ -1038,16 +1104,14 @@ class PINNSolver:
                     v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     u, v, p = self.loss_computer.apply_hard_constraints(
-                        u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                        u, v, p, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
                     )
-                else:
-                    u, v, p = u_raw, v_raw, p_raw
-                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
-                    u,
-                    v,
-                    bt,
-                    case_ids=case_ids,
-                )
+                    u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                        u,
+                        v,
+                        bt,
+                        case_ids=case_ids,
+                    )
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())

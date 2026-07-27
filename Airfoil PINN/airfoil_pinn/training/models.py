@@ -157,6 +157,10 @@ class PINNIncompressible(nn.Module):
                 raise ValueError(
                     "output_bias length must equal model output_dim"
                 )
+            if output_dim == 3 and float(bias[2]) != 0.0:
+                raise ValueError(
+                    "Raw pressure output bias must be initialized to zero"
+                )
             self.output_layer.bias.copy_(bias)
 
     def _get_activation(

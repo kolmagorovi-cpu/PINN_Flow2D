@@ -154,10 +154,10 @@ class ParametricFVMTests(unittest.TestCase):
                 x: torch.Tensor,
                 y: torch.Tensor,
                 sdf: torch.Tensor,
-                boundary_types: torch.Tensor,
+                *,
                 case_ids: torch.Tensor,
             ) -> torch.Tensor:
-                del y, sdf, boundary_types
+                del y, sdf
                 return case_ids.to(dtype=x.dtype).view(-1, 1)
 
             @staticmethod

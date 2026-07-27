@@ -80,6 +80,11 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
     process = _mapping(config, "process", errors)
     data = _mapping(config, "data", errors)
     output = _mapping(config, "output", errors)
+    checkpoint = _mapping(config, "checkpoint", errors)
+    sdf_config = config.get("sdf", {})
+    if not isinstance(sdf_config, Mapping):
+        errors.append("sdf must be a mapping")
+        sdf_config = {}
 
     features = config.get("input_features", {})
     if features is not None and not isinstance(features, Mapping):
@@ -166,6 +171,11 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
         errors.append(
             "architecture.output_dim must be 3 for [u/Uinf, v/Uinf, Cp]"
         )
+    _finite_nonnegative(
+        sdf_config.get("float64_consistency_tolerance", 1e-12),
+        "sdf.float64_consistency_tolerance",
+        errors,
+    )
     output_bias = architecture.get("output_bias")
     if (
         not isinstance(output_bias, Sequence)
@@ -176,6 +186,11 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
         errors.append(
             "architecture.output_bias must contain three finite values"
         )
+    elif float(output_bias[2]) != 0.0:
+        errors.append(
+            "architecture.output_bias[2] must be zero for the raw pressure "
+            "output"
+        )
 
     if pde.get("system") not in {
         "incompressible_navier_stokes",
@@ -184,8 +199,80 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
         errors.append("pde.system must be incompressible_navier_stokes or euler")
     if pde.get("flow_type") not in {"2d", "axisymmetric"}:
         errors.append("pde.flow_type must be 2d or axisymmetric")
-    if boundary.get("type") not in {"soft", "hard"}:
-        errors.append("boundary_conditions.type must be soft or hard")
+    legacy_boundary_type = boundary.get("type")
+    if legacy_boundary_type == "hard":
+        errors.append(
+            "Global boundary_conditions.type=hard is deprecated. Configure "
+            "enforcement separately for each boundary."
+        )
+    elif legacy_boundary_type not in {None, "soft"}:
+        errors.append(
+            "boundary_conditions.type is deprecated and, when present for "
+            "legacy files, must be soft"
+        )
+
+    for boundary_name, boundary_value in boundary.items():
+        if boundary_name == "type":
+            continue
+        if not isinstance(boundary_value, Mapping):
+            errors.append(
+                f"boundary_conditions.{boundary_name} must be a mapping"
+            )
+            continue
+        enforcement = boundary_value.get("enforcement", "soft")
+        if enforcement not in {"soft", "hard"}:
+            errors.append(
+                f"boundary_conditions.{boundary_name}.enforcement must be "
+                "soft or hard"
+            )
+        elif enforcement == "hard" and boundary_name != "wall":
+            errors.append(
+                f"Hard enforcement is not yet supported for boundary "
+                f"{boundary_name!r}; use soft enforcement."
+            )
+
+    wall = boundary.get("wall", {})
+    if not isinstance(wall, Mapping):
+        wall = {}
+    wall_enforcement = wall.get("enforcement", "soft")
+    wall_kind = wall.get("kind", "no_slip")
+    if wall_enforcement == "hard":
+        if pde.get("system") != "incompressible_navier_stokes":
+            errors.append(
+                "Hard wall is currently supported only for incompressible "
+                "Navier-Stokes."
+            )
+        if wall_kind != "no_slip":
+            errors.append(
+                "Hard wall currently supports only the no-slip condition."
+            )
+        if not bool(sdf):
+            errors.append("Hard wall requires differentiable SDF.")
+        try:
+            distance_scale = float(wall.get("distance_scale", 0.02))
+        except (TypeError, ValueError):
+            errors.append(
+                "boundary_conditions.wall.distance_scale must be numeric"
+            )
+        else:
+            if not math.isfinite(distance_scale) or distance_scale <= 0.0:
+                errors.append(
+                    "boundary_conditions.wall.distance_scale must be finite "
+                    "and positive"
+                )
+    if (
+        pde.get("system") == "euler"
+        and legacy_boundary_type == "hard"
+    ):
+        errors.append(
+            "Euler wall impermeability couples u and v through the surface "
+            "normal and currently requires boundary_conditions.type=soft"
+        )
+    if checkpoint.get("load_mode", "resume") not in {
+        "resume",
+        "finetune",
+    }:
+        errors.append("checkpoint.load_mode must be resume or finetune")
 
     pde_weights = loss.get("pde_weights")
     if not isinstance(pde_weights, Mapping):
@@ -207,6 +294,22 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
                     f"loss_weights.pde_weights.{component}",
                     errors,
                 )
+
+    try:
+        pressure_gauge_weight = float(
+            loss.get("pressure_gauge_weight", 1.0)
+        )
+    except (TypeError, ValueError):
+        errors.append("loss_weights.pressure_gauge_weight must be numeric")
+    else:
+        if (
+            not math.isfinite(pressure_gauge_weight)
+            or pressure_gauge_weight <= 0.0
+        ):
+            errors.append(
+                "loss_weights.pressure_gauge_weight must be finite and "
+                "strictly positive"
+            )
 
     fvm = loss.get("fvm", {})
     if isinstance(fvm, Mapping):
@@ -480,6 +583,23 @@ def validate_runtime_contract(
         errors.append(
             "mandatory differentiable SDF geometry is unavailable"
         )
+    if hasattr(data_handler, "cached_sdf_geometry_fingerprint"):
+        cached_fingerprint = getattr(
+            data_handler,
+            "cached_sdf_geometry_fingerprint",
+            None,
+        )
+        cached_method = getattr(data_handler, "cached_sdf_method", None)
+        if cached_fingerprint != sdf_geometry_fingerprint:
+            errors.append(
+                "cached training SDF geometry fingerprint does not match "
+                "the active canonical geometry"
+            )
+        if cached_method != "exact_polyline_segments":
+            errors.append(
+                "cached training SDF method must be "
+                "exact_polyline_segments"
+            )
     fvm_fingerprint = getattr(
         data_handler,
         "fvm_sdf_geometry_fingerprint",

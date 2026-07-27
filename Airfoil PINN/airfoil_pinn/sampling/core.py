@@ -105,6 +105,8 @@ class BoundaryType(Enum):
     INLET = "inlet"
     OUTLET = "outlet"
     FARFIELD = "farfield"
+    SLIP_WALL = "slip_wall"
+    # Legacy spelling accepted when loading old sampler configurations.
     SLIP = "slip"
     VELOCITY_DIRICHLET = "velocity_dirichlet"
     WALL = "wall"
@@ -134,6 +136,8 @@ class CollocationPoint:
     on_airfoil: bool = False
     on_boundary: bool = False
     segment_id: int = -1
+    normal_x: float = float("nan")
+    normal_y: float = float("nan")
 
     def to_dict(self) -> CollocationPointDict:
         """
@@ -149,7 +153,9 @@ class CollocationPoint:
             boundary_type=self.boundary_type.value,
             on_airfoil=self.on_airfoil,
             on_boundary=self.on_boundary,
-            segment_id=self.segment_id
+            segment_id=self.segment_id,
+            normal_x=self.normal_x,
+            normal_y=self.normal_y,
         )
 
     def to_tuple(self) -> Tuple[float, float]:
@@ -166,6 +172,7 @@ _VALID_BOUNDARY_TYPES = (
     'inlet',
     'outlet',
     'farfield',
+    'slip_wall',
     'slip',
     'velocity_dirichlet',
     'symmetry',
@@ -192,7 +199,9 @@ class SamplerConfig:
         output_dir: Директория для выходных файлов
         boundary_point_density: Плотность точек на границах
         interior_point_density: Плотность внутренних точек
-        left_boundary_type: Тип левой границы (x=x_min); одно из: inlet, outlet, farfield, slip, velocity_dirichlet, symmetry, axis_symmetry, wall
+        left_boundary_type: Тип левой границы (x=x_min); одно из: inlet,
+            outlet, farfield, slip_wall, velocity_dirichlet, symmetry,
+            axis_symmetry, wall
         right_boundary_type: Тип правой границы (x=x_max)
         top_boundary_type: Тип верхней границы (y=y_max)
         bottom_boundary_type: Тип нижней границы (y=y_min)
@@ -750,6 +759,53 @@ class CollocationPoints:
             reference = surface.copy()
         return surface, reference
 
+    @staticmethod
+    def _polyline_normals(
+        points: np.ndarray,
+        reference: np.ndarray,
+        *,
+        closed: bool,
+    ) -> np.ndarray:
+        """Return nearest-segment unit normals for sampled boundary points."""
+        points = np.asarray(points, dtype=np.float64)
+        reference = np.asarray(reference, dtype=np.float64)
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=np.float64)
+        if len(reference) < 2:
+            return np.full((len(points), 2), np.nan, dtype=np.float64)
+
+        starts = reference[:-1]
+        ends = reference[1:]
+        if closed and not np.allclose(reference[0], reference[-1]):
+            starts = np.vstack((starts, reference[-1]))
+            ends = np.vstack((ends, reference[0]))
+
+        segments = ends - starts
+        lengths_sq = np.einsum("ij,ij->i", segments, segments)
+        valid = lengths_sq > 1.0e-28
+        starts = starts[valid]
+        segments = segments[valid]
+        lengths_sq = lengths_sq[valid]
+        if len(segments) == 0:
+            return np.full((len(points), 2), np.nan, dtype=np.float64)
+
+        offset = points[:, None, :] - starts[None, :, :]
+        projection = np.einsum("nsi,si->ns", offset, segments)
+        projection = np.clip(
+            projection / lengths_sq[None, :],
+            0.0,
+            1.0,
+        )
+        nearest = starts[None, :, :] + projection[:, :, None] * segments[None, :, :]
+        distances_sq = np.sum(
+            (points[:, None, :] - nearest) ** 2,
+            axis=2,
+        )
+        nearest_segment = np.argmin(distances_sq, axis=1)
+        tangents = segments[nearest_segment]
+        lengths = np.linalg.norm(tangents, axis=1, keepdims=True)
+        return np.column_stack((-tangents[:, 1], tangents[:, 0])) / lengths
+
     # ------------------------------------------------------------------
     # Генерация точек на внешнем контуре (прямоугольник)
     # ------------------------------------------------------------------
@@ -806,7 +862,12 @@ class CollocationPoints:
         def _coord_key(x: float, y: float) -> Tuple[int, int]:
             return (int(round(x / tol)), int(round(y / tol)))
 
-        def _append_point(x: float, y: float) -> None:
+        def _append_point(
+            x: float,
+            y: float,
+            segment_id: int,
+            normal: np.ndarray,
+        ) -> None:
             key = _coord_key(x, y)
             if key in seen:
                 return
@@ -823,14 +884,18 @@ class CollocationPoints:
                 x=x, y=y,
                 boundary_type=btype,
                 on_airfoil=on_foil,
-                on_boundary=True
+                on_boundary=True,
+                segment_id=segment_id,
+                normal_x=float(normal[0]),
+                normal_y=float(normal[1]),
             ))
 
-        for a, b in segments:
+        for segment_id, (a, b) in enumerate(segments):
             seg = b - a
             seg_len = float(np.linalg.norm(seg))
             if seg_len <= 1e-14:
                 continue
+            normal = np.array([-seg[1], seg[0]], dtype=np.float64) / seg_len
 
             n_full = int(np.floor(seg_len / step))
             distances = [i * step for i in range(n_full + 1)]
@@ -840,7 +905,12 @@ class CollocationPoints:
             for distance in distances:
                 t = min(1.0, max(0.0, distance / seg_len))
                 xy = a + t * seg
-                _append_point(float(xy[0]), float(xy[1]))
+                _append_point(
+                    float(xy[0]),
+                    float(xy[1]),
+                    segment_id,
+                    normal,
+                )
 
         type_counts = {}
         for p in points:
@@ -911,6 +981,11 @@ class CollocationPoints:
         """
         if normal_layer_config is not None:
             surface, reference = self._normal_layer_surface_reference(foil, normal_layer_config)
+            surface_normals = self._polyline_normals(
+                surface,
+                reference,
+                closed=self.foil_is_closed,
+            )
             points = [
                 CollocationPoint(
                     id=self._get_next_id(),
@@ -919,8 +994,10 @@ class CollocationPoints:
                     boundary_type=BoundaryType.WALL,
                     on_airfoil=True,
                     on_boundary=True,
+                    normal_x=float(surface_normals[i, 0]),
+                    normal_y=float(surface_normals[i, 1]),
                 )
-                for x, y in surface
+                for i, (x, y) in enumerate(surface)
             ]
             self.mesh_foil_coords = reference
             logger.info(
@@ -943,12 +1020,29 @@ class CollocationPoints:
         points = []
         for distance in distances:
             pt = line.interpolate(distance)
+            tangent_step = max(min(step * 0.25, length * 1.0e-4), 1.0e-12)
+            before = line.interpolate(max(0.0, distance - tangent_step))
+            after = line.interpolate(min(length, distance + tangent_step))
+            tangent = np.array(
+                [after.x - before.x, after.y - before.y],
+                dtype=np.float64,
+            )
+            tangent_norm = float(np.linalg.norm(tangent))
+            if tangent_norm <= 1.0e-14:
+                normal = np.array([np.nan, np.nan], dtype=np.float64)
+            else:
+                normal = np.array(
+                    [-tangent[1], tangent[0]],
+                    dtype=np.float64,
+                ) / tangent_norm
             points.append(CollocationPoint(
                 id=self._get_next_id(),
                 x=pt.x, y=pt.y,
                 boundary_type=BoundaryType.WALL,
                 on_airfoil=True,
                 on_boundary=True,
+                normal_x=float(normal[0]),
+                normal_y=float(normal[1]),
             ))
         logger.info(f"✅ Профиль (WALL): {len(points)} точек")
         return points
@@ -993,7 +1087,9 @@ class CollocationPoints:
                 x=x, y=y_min_dom,
                 boundary_type=btype,
                 on_airfoil=False,
-                on_boundary=True
+                on_boundary=True,
+                normal_x=0.0,
+                normal_y=1.0,
             ))
         logger.info(f"✅ Нижняя граница ({btype.value}): {len(points)} точек")
         return points
@@ -2002,9 +2098,11 @@ class CollocationPoints:
         if self.config.save_format == 'npy':
             dtype = [('id', 'i4'), ('x', 'f8'), ('y', 'f8'),
                      ('boundary_type', 'U20'), ('on_airfoil', 'bool'),
-                     ('on_boundary', 'bool'), ('segment_id', 'i4')]
+                     ('on_boundary', 'bool'), ('segment_id', 'i4'),
+                     ('normal_x', 'f8'), ('normal_y', 'f8')]
             arr = np.array([(p.id, p.x, p.y, p.boundary_type.value,
-                             p.on_airfoil, p.on_boundary, p.segment_id)
+                             p.on_airfoil, p.on_boundary, p.segment_id,
+                             p.normal_x, p.normal_y)
                             for p in self.points], dtype=dtype)
             np.save(f"{base}.npy", arr)
             interior_coords = [(p.x, p.y) for p in self.points_interior]
@@ -2016,10 +2114,14 @@ class CollocationPoints:
             logger.info(f"✅ Сохранено: {base}.npy")
         elif self.config.save_format == 'csv':
             with open(f"{base}.csv", 'w') as f:
-                f.write("id,x,y,boundary_type,on_airfoil,on_boundary,segment_id\n")
+                f.write(
+                    "id,x,y,boundary_type,on_airfoil,on_boundary,"
+                    "segment_id,normal_x,normal_y\n"
+                )
                 for p in self.points:
                     f.write(f"{p.id},{p.x},{p.y},{p.boundary_type.value},"
-                            f"{p.on_airfoil},{p.on_boundary},{p.segment_id}\n")
+                            f"{p.on_airfoil},{p.on_boundary},{p.segment_id},"
+                            f"{p.normal_x},{p.normal_y}\n")
             logger.info(f"✅ Сохранено: {base}.csv")
         np.save(f"{base}_metadata.npy", self.metadata)
         logger.info(f"✅ Метаданные сохранены")
@@ -2173,12 +2275,12 @@ def S2DR() -> None:
             "   4 - axis_symmetry (осевая симметрия)\n"
             "   5 - wall          (твёрдая стенка)\n"
             "   6 - farfield      (мягкая скорость U_inf)\n"
-            "   7 - slip          (непроникание + слабая скорость)\n"
+            "   7 - slip_wall     (непротекание u·n = 0)\n"
             "   8 - velocity_dirichlet (жёсткая скорость U_inf)"
         )
         _BOUNDARY_MAP = {'1': 'inlet', '2': 'outlet', '3': 'symmetry',
                          '4': 'axis_symmetry', '5': 'wall',
-                         '6': 'farfield', '7': 'slip',
+                         '6': 'farfield', '7': 'slip_wall',
                          '8': 'velocity_dirichlet'}
 
         print("\nТип ЛЕВОЙ границы (x = x_min):")

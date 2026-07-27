@@ -650,16 +650,31 @@ def _predict_model_on_points(
                 stop = min(start + batch_size, len(x_norm_np))
                 x = torch.as_tensor(x_norm_np[start:stop], device=device, dtype=dtype).view(-1, 1)
                 y = torch.as_tensor(y_norm_np[start:stop], device=device, dtype=dtype).view(-1, 1)
-                sdf = torch.as_tensor(sdf_norm_np[start:stop], device=device, dtype=dtype).view(-1, 1)
+                sdf = loss_computer.evaluate_sdf_tensor(x, y)
                 bt = torch.as_tensor(boundary_types_np[start:stop], device=device, dtype=dtype)
                 if bt.shape[1] == 0:
                     bt = None
-                inp = loss_computer.build_input_tensor(x, y, sdf, bt)
+                inp = loss_computer.build_input_tensor(x, y, sdf)
                 out = model(inp)
                 u = out[:, 0:1]
                 v = out[:, 1:2]
                 p = out[:, 2:3]
-                if hasattr(loss_computer, "apply_velocity_dirichlet_constraint"):
+                if hasattr(loss_computer, "transform_outputs"):
+                    u, v, p = loss_computer.transform_outputs(
+                        u,
+                        v,
+                        p,
+                        x,
+                        y,
+                        sdf=sdf,
+                    )
+                if (
+                    getattr(loss_computer, "bc_type", "soft") == "hard"
+                    and hasattr(
+                        loss_computer,
+                        "apply_velocity_dirichlet_constraint",
+                    )
+                ):
                     u, v = loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
                 all_u.append(u.detach().cpu().numpy().reshape(-1))
                 all_v.append(v.detach().cpu().numpy().reshape(-1))

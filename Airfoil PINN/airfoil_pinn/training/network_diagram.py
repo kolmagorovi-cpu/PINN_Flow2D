@@ -8,47 +8,21 @@
 формирование PNG-файла со схемой входов, скрытых слоев и выходов сети.
 """
 
-import logging
 import os
 from typing import Any
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 
-from airfoil_pinn.app.paths import PICTURES_DIR, resolve_project_path
-from airfoil_pinn.data.handler import PINNDataset
+from airfoil_pinn.app.paths import PICTURES_DIR
 from airfoil_pinn.training.input_features import InputFeatureAssembler
 
 __all__ = ["PICTURES_DIR", "visualize_network"]
 
-logger = logging.getLogger(__name__)
-
 
 def _input_labels(config: dict[str, Any]) -> list[str]:
     """Return labels in the exact manifest order used during training."""
-    boundary_names: list[str] = []
-    points_file = config.get("data", {}).get("points_file")
-    if points_file:
-        try:
-            dataset = PINNDataset(str(resolve_project_path(points_file)))
-            boundary_names = list(dataset.boundary_type_names)
-        except Exception as exc:
-            logger.warning(
-                "Cannot load boundary names for network diagram: %s",
-                exc,
-            )
-    if not boundary_names:
-        feature_config = config.get("input_features", {}) or {}
-        boundary_config = feature_config.get("boundary_types", {})
-        boundary_enabled = (
-            boundary_config.get("enabled", True)
-            if isinstance(boundary_config, dict)
-            else bool(boundary_config)
-        )
-        if boundary_enabled:
-            boundary_names = ["boundary_type"]
-
-    assembler = InputFeatureAssembler(config, boundary_names)
+    assembler = InputFeatureAssembler(config)
     labels: list[str] = []
     for feature in assembler.manifest.features:
         if feature.name == "coordinates":
@@ -59,8 +33,6 @@ def _input_labels(config: dict[str, Any]) -> list[str]:
             labels.append("scaled log10(Re_c)")
         elif feature.name == "angle_of_attack":
             labels.extend(["cos(alpha)", "sin(alpha)"])
-        elif feature.name == "boundary_types":
-            labels.extend(f"bc:{name}" for name in boundary_names)
         elif feature.name == "pressure_drop_coefficient":
             labels.append("delta_p/q_inf")
         elif feature.name == "geometry_parameters":

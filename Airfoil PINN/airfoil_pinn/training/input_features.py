@@ -88,19 +88,18 @@ class InputFeatureAssembler:
     * ``viscosity`` maps to ``reynolds``;
     * ``density`` is ignored because it is redundant once ``Re_c`` and the
       reference scales are defined.
+    * ``boundary_types`` is ignored because boundary categories belong to
+      constraints and losses rather than the neural-network input.
     """
 
     def __init__(
         self,
         config: Mapping[str, Any],
-        boundary_type_names: Sequence[str],
     ) -> None:
         self.config = config
         self.legacy = config.get("input_params", {}) or {}
         self.features_config = config.get("input_features", {}) or {}
-        self.boundary_type_names = tuple(
-            str(name) for name in boundary_type_names
-        )
+        self._warn_deprecated_boundary_input()
 
         self.coordinates_enabled = self._enabled(
             "coordinates",
@@ -121,11 +120,6 @@ class InputFeatureAssembler:
                 "SDF is a mandatory network input for this project."
             )
 
-        self.boundary_types_enabled = self._enabled(
-            "boundary_types",
-            legacy_name="boundary_types",
-            default=True,
-        )
         self.reynolds_enabled = self._enabled(
             "reynolds",
             legacy_name="viscosity",
@@ -195,6 +189,23 @@ class InputFeatureAssembler:
         )
         self.manifest = self._build_manifest()
 
+    def _warn_deprecated_boundary_input(self) -> None:
+        """Warn when an obsolete boundary feature flag is still configured.
+
+        Boundary categories remain available to loss functions and diagnostic
+        code, but they are intentionally not part of the neural-network input.
+        Keeping this compatibility warning lets existing YAML files load
+        without silently changing the physical input contract.
+        """
+        legacy_present = "boundary_types" in self.legacy
+        modern_present = "boundary_types" in self.features_config
+        if legacy_present or modern_present:
+            logger.warning(
+                "Configured boundary_types input feature is deprecated and "
+                "ignored. Boundary labels are used only for constraints, "
+                "losses and diagnostics, never as neural-network inputs."
+            )
+
     def _feature_mapping(self, name: str) -> Mapping[str, Any]:
         """Return a mapping for one new-style feature configuration."""
         value = self.features_config.get(name, {})
@@ -240,12 +251,6 @@ class InputFeatureAssembler:
             append("reynolds", 1, "log10_minmax[-1,1]")
         if self.angle_enabled:
             append("angle_of_attack", 2, "cos(alpha),sin(alpha)")
-        if self.boundary_types_enabled and self.boundary_type_names:
-            append(
-                "boundary_types",
-                len(self.boundary_type_names),
-                "one_hot:" + ",".join(self.boundary_type_names),
-            )
         if self.pressure_drop_enabled:
             append("pressure_drop_coefficient", 1, "delta_p/q_inf")
         if self.geometry_enabled:
@@ -261,7 +266,6 @@ class InputFeatureAssembler:
         x: torch.Tensor,
         y: torch.Tensor,
         sdf: torch.Tensor,
-        boundary_types: Optional[torch.Tensor],
         flow: Optional[FlowCaseBatch],
     ) -> torch.Tensor:
         """Assemble and validate the tensor described by :attr:`manifest`."""
@@ -286,20 +290,6 @@ class InputFeatureAssembler:
         if self.angle_enabled:
             flow = self._require_flow(flow, x.shape[0])
             inputs.extend((flow.cos_alpha, flow.sin_alpha))
-
-        if self.boundary_types_enabled and self.boundary_type_names:
-            if boundary_types is None:
-                raise ValueError(
-                    "Boundary one-hot features are enabled but missing"
-                )
-            expected = len(self.boundary_type_names)
-            if boundary_types.shape != (x.shape[0], expected):
-                raise ValueError(
-                    "boundary_types shape mismatch: expected "
-                    f"({x.shape[0]}, {expected}), received "
-                    f"{tuple(boundary_types.shape)}"
-                )
-            inputs.append(boundary_types)
 
         if self.pressure_drop_enabled:
             flow = self._require_flow(flow, x.shape[0])

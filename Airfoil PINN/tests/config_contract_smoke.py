@@ -47,7 +47,26 @@ class StaticValidationTests(unittest.TestCase):
     """Reject malformed graph and physical configuration before I/O."""
 
     def test_default_configuration_is_valid(self) -> None:
-        validate_static_config(_default_config())
+        config = _default_config()
+        validate_static_config(config)
+        self.assertNotIn("boundary_types", config["input_params"])
+
+    def test_legacy_boundary_feature_flags_are_removed_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "legacy.yaml")
+            path.write_text(
+                "input_params:\n"
+                "  boundary_types: true\n"
+                "input_features:\n"
+                "  boundary_types:\n"
+                "    enabled: true\n",
+                encoding="utf-8",
+            )
+            manager = ConfigManager()
+            manager.load_from_file(str(path))
+
+        self.assertNotIn("boundary_types", manager.config["input_params"])
+        self.assertNotIn("boundary_types", manager.config["input_features"])
 
     def test_mandatory_sdf_cannot_be_disabled(self) -> None:
         config = _default_config()
@@ -77,6 +96,24 @@ class StaticValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, "unique"):
             validate_static_config(config)
 
+    def test_checkpoint_load_mode_is_validated(self) -> None:
+        config = _default_config()
+        config["checkpoint"]["load_mode"] = "continue_somehow"
+        with self.assertRaisesRegex(ConfigurationError, "load_mode"):
+            validate_static_config(config)
+
+    def test_raw_pressure_output_bias_must_be_zero(self) -> None:
+        config = _default_config()
+        config["architecture"]["output_bias"] = [0.1, 0.0, 1.0]
+        with self.assertRaisesRegex(ConfigurationError, r"output_bias\[2\]"):
+            validate_static_config(config)
+
+    def test_pressure_gauge_cannot_be_disabled(self) -> None:
+        config = _default_config()
+        config["loss_weights"]["pressure_gauge_weight"] = 0.0
+        with self.assertRaisesRegex(ConfigurationError, "pressure_gauge_weight"):
+            validate_static_config(config)
+
 
 class RuntimeValidationTests(unittest.TestCase):
     """Ensure varying case parameters are visible to the neural network."""
@@ -92,10 +129,7 @@ class RuntimeValidationTests(unittest.TestCase):
             reference_scales=_reference_scales(),
             fvm_sdf_geometry_fingerprint="geometry",
         )
-        assembler = InputFeatureAssembler(
-            config,
-            ["interior"],
-        )
+        assembler = InputFeatureAssembler(config)
         with self.assertRaisesRegex(
             ConfigurationError,
             r"cos\(alpha\)",
@@ -114,7 +148,6 @@ class RuntimeValidationTests(unittest.TestCase):
             "sdf": {"enabled": True},
             "reynolds": {"enabled": True, "range": [1e4, 1e6]},
             "angle_of_attack": {"enabled": True},
-            "boundary_types": {"enabled": True},
         }
         handler = SimpleNamespace(
             flow_cases={
@@ -125,7 +158,7 @@ class RuntimeValidationTests(unittest.TestCase):
             reference_scales=_reference_scales(),
             fvm_sdf_geometry_fingerprint="geometry",
         )
-        assembler = InputFeatureAssembler(config, ["interior"])
+        assembler = InputFeatureAssembler(config)
         validate_runtime_contract(
             config,
             handler,
@@ -148,7 +181,7 @@ class RuntimeValidationTests(unittest.TestCase):
             reference_scales=_reference_scales(),
             fvm_sdf_geometry_fingerprint="geometry",
         )
-        assembler = InputFeatureAssembler(config, ["interior"])
+        assembler = InputFeatureAssembler(config)
         with self.assertRaisesRegex(ConfigurationError, "outside case IDs"):
             validate_runtime_contract(
                 config,
@@ -158,10 +191,21 @@ class RuntimeValidationTests(unittest.TestCase):
             )
 
 
-def _training_contract(angle: float = 0.0) -> TrainingContract:
+def _training_contract(
+    angle: float = 0.0,
+    *,
+    wall_enforcement: str = "soft",
+    distance_scale: float = 0.02,
+) -> TrainingContract:
     """Build one realistic contract with a selectable flow angle."""
     config = _default_config()
-    assembler = InputFeatureAssembler(config, ["interior"])
+    config["boundary_conditions"]["wall"].update(
+        {
+            "enforcement": wall_enforcement,
+            "distance_scale": distance_scale,
+        }
+    )
+    assembler = InputFeatureAssembler(config)
     handler = SimpleNamespace(
         reference_scales=_reference_scales(),
         flow_cases={
@@ -173,10 +217,13 @@ def _training_contract(angle: float = 0.0) -> TrainingContract:
         },
         boundary_type_names=["interior"],
         fvm_sdf_geometry_fingerprint="geometry",
+        cached_sdf_geometry_fingerprint="geometry",
+        cached_sdf_method="exact_polyline_segments",
     )
     loss = SimpleNamespace(
         feature_manifest=assembler.manifest,
         sdf_geometry_fingerprint="geometry",
+        sdf_float64_consistency_tolerance=1e-12,
     )
     return build_training_contract(config, handler, loss)
 
@@ -186,6 +233,16 @@ class CheckpointContractTests(unittest.TestCase):
 
     def test_contract_roundtrip_and_mismatch(self) -> None:
         current = _training_contract(angle=0.0)
+        self.assertEqual(
+            current.payload["sdf_value_contract"],
+            {
+                "method": "exact_polyline_segments",
+                "evaluation_dtype": "float64",
+                "consistency_tolerance": 1e-12,
+                "cached_geometry_fingerprint": "geometry",
+                "cached_method": "exact_polyline_segments",
+            },
+        )
         restored = TrainingContract.from_metadata(current.to_metadata())
         self.assertEqual(restored.fingerprint(), current.fingerprint())
         validate_checkpoint_contract(current.to_metadata(), current)
@@ -202,6 +259,22 @@ class CheckpointContractTests(unittest.TestCase):
         metadata["fingerprint"] = "not-a-valid-fingerprint"
         with self.assertRaisesRegex(ValueError, "corrupted"):
             TrainingContract.from_metadata(metadata)
+
+    def test_boundary_transform_changes_checkpoint_fingerprint(self) -> None:
+        soft = _training_contract()
+        hard = _training_contract(wall_enforcement="hard")
+        other_scale = _training_contract(
+            wall_enforcement="hard",
+            distance_scale=0.05,
+        )
+
+        self.assertNotEqual(soft.fingerprint(), hard.fingerprint())
+        self.assertNotEqual(hard.fingerprint(), other_scale.fingerprint())
+        with self.assertRaisesRegex(RuntimeError, "boundary_enforcement"):
+            validate_checkpoint_contract(
+                hard.to_metadata(),
+                other_scale,
+            )
 
     def test_checkpoint_save_is_atomic_and_versioned(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

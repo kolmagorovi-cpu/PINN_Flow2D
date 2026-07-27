@@ -284,7 +284,7 @@ class MetricsCollector:
 
         x = self.data_handler.fvm_x.to(self.device, dtype=self.dtype)
         y = self.data_handler.fvm_y.to(self.device, dtype=self.dtype)
-        sdf = self.data_handler.fvm_sdf.to(self.device, dtype=self.dtype)
+        sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
         bt = (
             self.data_handler.fvm_bt.to(self.device, dtype=self.dtype)
             if self.data_handler.fvm_bt is not None
@@ -301,12 +301,18 @@ class MetricsCollector:
             x,
             y,
             sdf,
-            bt,
             case_ids=case_ids,
         )
         out = self.model(inp)
-        u = out[:, 0:1]
-        v = out[:, 1:2]
+        u, v, _ = self.loss_computer.transform_outputs(
+            out[:, 0:1],
+            out[:, 1:2],
+            out[:, 2:3],
+            x,
+            y,
+            sdf=sdf,
+            case_ids=case_ids,
+        )
 
         if self.loss_computer.bc_type == 'hard' and bt is not None:
             u, v = self._apply_hard_velocity_constraints(
@@ -315,12 +321,6 @@ class MetricsCollector:
                 bt,
                 case_ids=case_ids,
             )
-        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
-            u,
-            v,
-            bt,
-            case_ids=case_ids,
-        )
         return torch.cat([u, v], dim=1)
 
     def _apply_hard_velocity_constraints(
@@ -346,10 +346,12 @@ class MetricsCollector:
             if name in ('inlet', 'velocity_dirichlet'):
                 u = torch.where(mask, target_u, u)
                 v = torch.where(mask, target_v, v)
-            elif name == 'wall':
+            elif (
+                name == 'wall'
+                and self.loss_computer.pde_system
+                == 'incompressible_navier_stokes'
+            ):
                 u = torch.where(mask, torch.zeros_like(u), u)
-                v = torch.where(mask, torch.zeros_like(v), v)
-            elif name == 'symmetry':
                 v = torch.where(mask, torch.zeros_like(v), v)
             elif name == 'axis_symmetry':
                 u = torch.where(mask, torch.zeros_like(u), u)
@@ -473,7 +475,7 @@ class MetricsCollector:
                 ).reshape(-1)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
-                sdf = sdf.to(self.device, dtype=self.dtype)
+                sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
                 bt = bt.to(self.device, dtype=self.dtype) if bt.shape[1] > 0 else None
                 if bt is None:
                     continue
@@ -482,12 +484,18 @@ class MetricsCollector:
                     x,
                     y,
                     sdf,
-                    bt,
                     case_ids=case_ids,
                 )
                 out = self.model(inp)
-                u = out[:, 0:1]
-                v = out[:, 1:2]
+                u, v, _ = self.loss_computer.transform_outputs(
+                    out[:, 0:1],
+                    out[:, 1:2],
+                    out[:, 2:3],
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
                 if self.loss_computer.bc_type == 'hard':
                     u, v = self._apply_hard_velocity_constraints(
                         u,
@@ -495,12 +503,6 @@ class MetricsCollector:
                         bt,
                         case_ids=case_ids,
                     )
-                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
-                    u,
-                    v,
-                    bt,
-                    case_ids=case_ids,
-                )
 
                 names = self.data_handler.boundary_type_names
                 inlet_idx = (
@@ -636,7 +638,7 @@ class MetricsCollector:
                 # Приводим к нужному устройству и типу данных
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
-                sdf = sdf.to(self.device, dtype=self.dtype)
+                sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
                 if bt.shape[1] > 0:
                     bt = bt.to(self.device, dtype=self.dtype)
                 else:
@@ -651,17 +653,23 @@ class MetricsCollector:
                     x,
                     y,
                     sdf,
-                    bt,
                     case_ids=case_ids,
                 )
                 out = self.model(input_tensor)
                 u_raw = out[:, 0:1]
+                u, _, _ = self.loss_computer.transform_outputs(
+                    u_raw,
+                    out[:, 1:2],
+                    out[:, 2:3],
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
 
-                # Применение hard constraints (если нужно)
+                # Legacy pointwise override.
                 if self.loss_computer.bc_type == 'hard':
-                    u = torch.where(mask_u, u_bc, u_raw)
-                else:
-                    u = u_raw
+                    u = torch.where(mask_u, u_bc, u)
 
                 if 'inlet' in self.data_handler.boundary_type_names:
                     inlet_idx = self.data_handler.boundary_type_names.index('inlet')
@@ -952,7 +960,10 @@ class MetricsCollector:
                 dataset = self.data_handler.dataset
                 x_norm = dataset.x.to(self.device, dtype=self.dtype)
                 y_norm = dataset.y.to(self.device, dtype=self.dtype)
-                sdf_norm = dataset.sdf.to(self.device, dtype=self.dtype)
+                sdf_norm = self.loss_computer.evaluate_sdf_tensor(
+                    x_norm,
+                    y_norm,
+                )
                 bt = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
 
                 self.model.eval()
@@ -961,14 +972,24 @@ class MetricsCollector:
                         x_norm,
                         y_norm,
                         sdf_norm,
-                        bt,
                         case_ids=dataset.case_id,
                     )
                     out = self.model(input_tensor)
                     u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+                    u_pred_t, v_pred_t, p_pred_t = (
+                        self.loss_computer.transform_outputs(
+                            u_raw,
+                            v_raw,
+                            p_raw,
+                            x_norm,
+                            y_norm,
+                            sdf=sdf_norm,
+                            case_ids=dataset.case_id,
+                        )
+                    )
                     if self.loss_computer.bc_type == 'hard':
                         u_pred_t, v_pred_t, p_pred_t = self.loss_computer.apply_hard_constraints(
-                            u_raw, v_raw, p_raw,
+                            u_pred_t, v_pred_t, p_pred_t,
                             dataset.mask_u_fixed.to(self.device).view(-1, 1),
                             dataset.mask_v_fixed.to(self.device).view(-1, 1),
                             dataset.mask_p_fixed.to(self.device).view(-1, 1),
@@ -976,14 +997,12 @@ class MetricsCollector:
                             dataset.v_bc.to(self.device, dtype=self.dtype).view(-1, 1),
                             dataset.p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                         )
-                    else:
-                        u_pred_t, v_pred_t, p_pred_t = u_raw, v_raw, p_raw
-                    u_pred_t, v_pred_t = self.loss_computer.apply_velocity_dirichlet_constraint(
-                        u_pred_t,
-                        v_pred_t,
-                        bt,
-                        case_ids=dataset.case_id,
-                    )
+                        u_pred_t, v_pred_t = self.loss_computer.apply_velocity_dirichlet_constraint(
+                            u_pred_t,
+                            v_pred_t,
+                            bt,
+                            case_ids=dataset.case_id,
+                        )
 
                     p_dyn = 0.5 * self.data_handler.rho * self.data_handler.U_inf ** 2
                     u_pred = (u_pred_t * self.data_handler.U_inf).cpu().numpy().flatten()

@@ -28,6 +28,8 @@ class PINNBatch:
     u_bc: torch.Tensor
     v_bc: torch.Tensor
     p_bc: torch.Tensor
+    normal_x: torch.Tensor
+    normal_y: torch.Tensor
     case_id: torch.Tensor
 
     def legacy_tuple(self) -> Tuple[torch.Tensor, ...]:

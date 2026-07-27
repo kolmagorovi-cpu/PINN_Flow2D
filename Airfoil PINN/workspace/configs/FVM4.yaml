@@ -20,7 +20,10 @@ architecture:
   - 0.0
   output_dim: 3
 boundary_conditions:
-  type: soft
+  wall:
+    kind: no_slip
+    enforcement: soft
+    distance_scale: 0.02
 checkpoint:
   interval: 500
   model_name_pattern: '{project_name}_{timestamp}'
@@ -86,7 +89,6 @@ diagnostics:
   strict_autograd: true
 enable_key_listener: true
 input_params:
-  boundary_types: false
   coordinates: true
   density: true
   fluid_file: null
@@ -102,9 +104,7 @@ loss_weights:
     inlet: 10.0
     outlet: 1.0
     outlet_grad: 0.25
-    slip: 2.0
-    slip_tangent_grad: 0.25
-    slip_velocity: 0.05
+    slip_wall: 2.0
     symmetry: 1.0
     symmetry_grad: 1.0
     velocity_dirichlet: 1.0

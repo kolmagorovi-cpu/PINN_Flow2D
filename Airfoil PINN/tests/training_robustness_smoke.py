@@ -201,7 +201,6 @@ class OperationalRobustnessTests(unittest.TestCase):
                 "range": [1e4, 1e6],
             },
             "angle_of_attack": {"enabled": True},
-            "boundary_types": {"enabled": False},
             "geometry_parameters": {
                 "enabled": True,
                 "names": ["thickness_over_chord"],

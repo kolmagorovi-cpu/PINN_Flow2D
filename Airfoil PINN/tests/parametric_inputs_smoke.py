@@ -98,6 +98,8 @@ class TypedBatchTests(unittest.TestCase):
             u_bc=torch.tensor([0.0]),
             v_bc=torch.tensor([0.0]),
             p_bc=torch.tensor([0.0]),
+            normal_x=torch.tensor([float("nan")]),
+            normal_y=torch.tensor([float("nan")]),
             case_id=torch.tensor(case_id),
         )
 
@@ -145,14 +147,10 @@ class InputFeatureAssemblerTests(unittest.TestCase):
 
     def test_manifest_and_encoded_values(self) -> None:
         """Columns follow the manifest and Reynolds uses log-minmax encoding."""
-        assembler = InputFeatureAssembler(
-            self.config,
-            ["interior", "wall"],
-        )
+        assembler = InputFeatureAssembler(self.config)
         x = torch.tensor([[0.1], [0.2]], requires_grad=True)
         y = torch.tensor([[0.3], [0.4]], requires_grad=True)
         sdf = (x + y).requires_grad_(True)
-        boundary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         flow = FlowCaseBatch(
             case_id=torch.tensor([[0], [1]]),
             reynolds=torch.tensor([[1e4], [1e6]]),
@@ -162,7 +160,7 @@ class InputFeatureAssemblerTests(unittest.TestCase):
             geometry_parameters=torch.tensor([[0.12, 0.0], [0.15, 0.02]]),
         )
 
-        result = assembler.build(x, y, sdf, boundary, flow)
+        result = assembler.build(x, y, sdf, flow)
         names = [feature.name for feature in assembler.manifest.features]
 
         self.assertEqual(
@@ -172,20 +170,16 @@ class InputFeatureAssemblerTests(unittest.TestCase):
                 "sdf",
                 "reynolds",
                 "angle_of_attack",
-                "boundary_types",
                 "pressure_drop_coefficient",
                 "geometry_parameters",
             ],
         )
-        self.assertEqual(result.shape, (2, 11))
+        self.assertEqual(result.shape, (2, 9))
         torch.testing.assert_close(result[:, 3], torch.tensor([-1.0, 1.0]))
         torch.testing.assert_close(result[:, 4:6], torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
         self.assertEqual(
             assembler.manifest.fingerprint(),
-            InputFeatureAssembler(
-                self.config,
-                ["interior", "wall"],
-            ).manifest.fingerprint(),
+            InputFeatureAssembler(self.config).manifest.fingerprint(),
         )
 
         derivative = torch.autograd.grad(result.sum(), x)[0]
@@ -204,7 +198,6 @@ class InputFeatureAssemblerTests(unittest.TestCase):
                     "density": True,
                 }
             },
-            [],
         )
         names = [feature.name for feature in assembler.manifest.features]
 
@@ -224,7 +217,6 @@ class InputFeatureAssemblerTests(unittest.TestCase):
                         "sdf": True,
                     }
                 },
-                [],
             )
         with self.assertRaisesRegex(ValueError, "mandatory"):
             InputFeatureAssembler(
@@ -234,7 +226,6 @@ class InputFeatureAssemblerTests(unittest.TestCase):
                         "sdf": False,
                     }
                 },
-                [],
             )
 
 

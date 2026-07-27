@@ -174,10 +174,46 @@ class PolylineDistanceField(nn.Module):
         distance = torch.sqrt(torch.clamp_min(minimum_squared, 0.0))
         return distance.reshape(*original_shape, 1)
 
-    def nearest_two(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return distances to the nearest and second-nearest segments.
+    def wall_distance(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return wall distance as a differentiable function of ``x``/``y``."""
+        if x.shape != y.shape:
+            raise ValueError("x and y must have identical shapes")
+        if x.ndim != 2 or x.shape[1] != 1:
+            raise ValueError("x and y must have shape (N, 1)")
+        return self(torch.cat((x, y), dim=1))
 
-        The second value is ``inf`` for a single-segment open polyline.
+    def nearest_two(
+        self,
+        points: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return distances to the nearest and second-nearest segments."""
+        nearest, second, _, _, _, _ = self.nearest_two_geometry(points)
+        return nearest, second
+
+    def nearest_two_geometry(
+        self,
+        points: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Return the two closest distances, projections and SDF gradients.
+
+        Distance equality alone is insufficient to identify a non-smooth SDF
+        switch.  Adjacent polyline segments often tie because both clamp to
+        their shared vertex; in that case their closest projection and
+        distance gradient are identical, so the minimum is locally smooth.
+
+        The second distance is ``inf`` for a single-segment open polyline.
+        Its projection and gradient are returned as ``NaN``.
         """
         original_shape = self._validate_points(points)
         flat = points.reshape(-1, 2)
@@ -189,41 +225,234 @@ class PolylineDistanceField(nn.Module):
             dtype=dtype,
             device=device,
         )
+        best_indices = torch.full(
+            (flat.shape[0], 2),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
 
         for start in range(0, self.segment_count, self.segment_chunk_size):
             stop = min(start + self.segment_chunk_size, self.segment_count)
             squared = self._squared_distances(flat, start, stop)
             candidates = torch.cat((best, squared), dim=1)
-            best = torch.topk(
+            chunk_indices = torch.arange(
+                start,
+                stop,
+                dtype=torch.long,
+                device=device,
+            ).expand(flat.shape[0], -1)
+            candidate_indices = torch.cat(
+                (best_indices, chunk_indices),
+                dim=1,
+            )
+            best, positions = torch.topk(
                 candidates,
                 k=2,
                 dim=1,
                 largest=False,
                 sorted=True,
-            ).values
+            )
+            best_indices = torch.gather(
+                candidate_indices,
+                dim=1,
+                index=positions,
+            )
 
         distances = torch.sqrt(torch.clamp_min(best, 0.0))
         nearest = distances[:, 0].reshape(*original_shape, 1)
         second = distances[:, 1].reshape(*original_shape, 1)
-        return nearest, second
+        safe_indices = torch.clamp_min(best_indices, 0)
+        segment_starts = self.segment_starts[safe_indices].to(dtype=dtype)
+        segment_vectors = self.segment_vectors[safe_indices].to(dtype=dtype)
+        squared_lengths = self.segment_squared_lengths[safe_indices].to(
+            dtype=dtype
+        )
+        relative = flat[:, None, :] - segment_starts
+        parameters = torch.sum(
+            relative * segment_vectors,
+            dim=-1,
+        ) / squared_lengths
+        parameters = torch.clamp(parameters, min=0.0, max=1.0)
+        projections = (
+            segment_starts
+            + parameters[:, :, None] * segment_vectors
+        )
+        finite = torch.isfinite(distances) & (best_indices >= 0)
+        nan = torch.full_like(projections, float("nan"))
+        projections = torch.where(finite[:, :, None], projections, nan)
 
-    @staticmethod
+        delta = flat[:, None, :] - projections
+        safe_distances = torch.where(
+            distances > torch.finfo(dtype).eps,
+            distances,
+            torch.ones_like(distances),
+        )
+        gradients = delta / safe_distances[:, :, None]
+        gradients = torch.where(
+            finite[:, :, None],
+            gradients,
+            nan,
+        )
+
+        nearest_projection = projections[:, 0].reshape(*original_shape, 2)
+        second_projection = projections[:, 1].reshape(*original_shape, 2)
+        nearest_gradient = gradients[:, 0].reshape(*original_shape, 2)
+        second_gradient = gradients[:, 1].reshape(*original_shape, 2)
+        return (
+            nearest,
+            second,
+            nearest_projection,
+            second_projection,
+            nearest_gradient,
+            second_gradient,
+        )
+
+    def surface_normals(self, points: torch.Tensor) -> torch.Tensor:
+        """Return unit normals from the nearest SDF segment.
+
+        At an exact surface point the unsigned distance is not differentiable
+        across the wall and ``autograd(sqrt(distance_squared))`` may therefore
+        produce ``NaN``.  The normal of the nearest segment is the one-sided
+        surface limit of ``grad(distance)``.  Its sign is intentionally left
+        determined by the polyline orientation; impermeability losses use
+        ``(velocity dot normal)^2`` and are invariant to that sign.
+        """
+        original_shape = self._validate_points(points)
+        flat = points.reshape(-1, 2)
+        minimum_squared = torch.full(
+            (flat.shape[0],),
+            float("inf"),
+            dtype=flat.dtype,
+            device=flat.device,
+        )
+        nearest_indices = torch.zeros(
+            flat.shape[0],
+            dtype=torch.long,
+            device=flat.device,
+        )
+
+        for start in range(0, self.segment_count, self.segment_chunk_size):
+            stop = min(start + self.segment_chunk_size, self.segment_count)
+            squared = self._squared_distances(flat, start, stop)
+            chunk_minimum, chunk_indices = torch.min(squared, dim=1)
+            replace = chunk_minimum < minimum_squared
+            minimum_squared = torch.where(
+                replace,
+                chunk_minimum,
+                minimum_squared,
+            )
+            nearest_indices = torch.where(
+                replace,
+                chunk_indices + start,
+                nearest_indices,
+            )
+
+        tangents = self.segment_vectors[nearest_indices].to(dtype=flat.dtype)
+        tangent_norm = torch.linalg.vector_norm(
+            tangents,
+            dim=1,
+            keepdim=True,
+        )
+        normals = torch.stack((-tangents[:, 1], tangents[:, 0]), dim=1)
+        normals = normals / tangent_norm
+        return normals.reshape(*original_shape, 2)
+
     def tie_mask(
+        self,
         nearest: torch.Tensor,
-        second_nearest: torch.Tensor,
+        second_nearest: Optional[torch.Tensor] = None,
         *,
         absolute_tolerance: float = 1e-7,
         relative_tolerance: float = 1e-5,
+        projection_tolerance: float = 1e-7,
+        gradient_tolerance: float = 1e-5,
+        nearest_projection: Optional[torch.Tensor] = None,
+        second_projection: Optional[torch.Tensor] = None,
+        nearest_gradient: Optional[torch.Tensor] = None,
+        second_gradient: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Identify points near a closest-segment switch/medial axis."""
-        if absolute_tolerance < 0.0 or relative_tolerance < 0.0:
+        """Identify genuine closest-segment switches/medial-axis points.
+
+        The preferred call is ``field.tie_mask(points)``.  It first compares
+        the two closest distances and then verifies that both their closest
+        projections and their SDF gradients differ.  Equal distances caused
+        by adjacent segments clamping to one shared vertex are therefore not
+        misclassified as ties.
+
+        Passing ``(nearest, second_nearest)`` retains the old conservative
+        distance-only check for compatibility with external diagnostic code.
+        """
+        if (
+            absolute_tolerance < 0.0
+            or relative_tolerance < 0.0
+            or projection_tolerance < 0.0
+            or gradient_tolerance < 0.0
+        ):
             raise ValueError("tie tolerances must be non-negative")
-        gap = second_nearest - nearest
+        if second_nearest is None:
+            (
+                nearest_distance,
+                second_distance,
+                nearest_projection,
+                second_projection,
+                nearest_gradient,
+                second_gradient,
+            ) = self.nearest_two_geometry(nearest)
+        else:
+            nearest_distance = nearest
+            second_distance = second_nearest
+            geometry_values = (
+                nearest_projection,
+                second_projection,
+                nearest_gradient,
+                second_gradient,
+            )
+            if any(value is None for value in geometry_values) and not all(
+                value is None for value in geometry_values
+            ):
+                raise ValueError(
+                    "all projection/gradient tensors must be supplied "
+                    "together"
+                )
+
+        gap = second_distance - nearest_distance
         threshold = absolute_tolerance + relative_tolerance * torch.maximum(
-            nearest.abs(),
-            second_nearest.abs(),
+            nearest_distance.abs(),
+            second_distance.abs(),
         )
-        return torch.isfinite(gap) & (gap <= threshold)
+        distance_tie = torch.isfinite(gap) & (gap <= threshold)
+        if nearest_projection is None:
+            return distance_tie
+
+        projection_gap = torch.linalg.vector_norm(
+            second_projection - nearest_projection,
+            dim=-1,
+            keepdim=True,
+        )
+        projection_scale = torch.maximum(
+            torch.linalg.vector_norm(
+                nearest_projection,
+                dim=-1,
+                keepdim=True,
+            ),
+            torch.linalg.vector_norm(
+                second_projection,
+                dim=-1,
+                keepdim=True,
+            ),
+        )
+        projections_differ = projection_gap > (
+            projection_tolerance
+            + relative_tolerance * projection_scale
+        )
+        gradient_gap = torch.linalg.vector_norm(
+            second_gradient - nearest_gradient,
+            dim=-1,
+            keepdim=True,
+        )
+        gradients_differ = gradient_gap > gradient_tolerance
+        return distance_tie & projections_differ & gradients_differ
 
     def diagnostics(
         self,
@@ -234,7 +463,14 @@ class PolylineDistanceField(nn.Module):
     ) -> DistanceFieldDiagnostics:
         """Evaluate distance, Eikonal norm and tie fraction on sample points."""
         sample = points.detach().clone().requires_grad_(True)
-        nearest, second = self.nearest_two(sample)
+        (
+            nearest,
+            second,
+            nearest_projection,
+            second_projection,
+            nearest_gradient,
+            second_gradient,
+        ) = self.nearest_two_geometry(sample)
         gradient = torch.autograd.grad(
             nearest,
             sample,
@@ -248,6 +484,10 @@ class PolylineDistanceField(nn.Module):
             second,
             absolute_tolerance=absolute_tie_tolerance,
             relative_tolerance=relative_tie_tolerance,
+            nearest_projection=nearest_projection,
+            second_projection=second_projection,
+            nearest_gradient=nearest_gradient,
+            second_gradient=second_gradient,
         )
         finite_eikonal = eikonal[torch.isfinite(eikonal)]
         if finite_eikonal.numel() == 0:

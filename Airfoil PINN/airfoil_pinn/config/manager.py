@@ -46,7 +46,6 @@ class ConfigManager:
             'input_params': {
                 'coordinates': True,
                 'sdf': True,
-                'boundary_types': True,
                 'inlet_velocity': False,
                 'viscosity': False,
                 'density': False,
@@ -72,8 +71,37 @@ class ConfigManager:
                 'flow_type': '2d',
                 'pde_on_boundary': False,
             },
+            'sdf': {
+                'segment_chunk_size': 256,
+                'absolute_tie_tolerance': 1e-7,
+                'relative_tie_tolerance': 1e-5,
+                'float64_consistency_tolerance': 1e-12,
+            },
             'boundary_conditions': {
-                'type': 'soft',
+                'wall': {
+                    'kind': 'no_slip',
+                    'enforcement': 'soft',
+                    'distance_scale': 0.02,
+                },
+                'inlet': {'kind': 'freestream', 'enforcement': 'soft'},
+                'farfield': {'kind': 'freestream', 'enforcement': 'soft'},
+                'outlet': {
+                    'kind': 'pressure_outlet',
+                    'enforcement': 'soft',
+                },
+                'velocity_dirichlet': {
+                    'kind': 'freestream',
+                    'enforcement': 'soft',
+                },
+                'slip_wall': {
+                    'kind': 'slip_wall',
+                    'enforcement': 'soft',
+                },
+                'symmetry': {'kind': 'symmetry', 'enforcement': 'soft'},
+                'axis_symmetry': {
+                    'kind': 'axis_symmetry',
+                    'enforcement': 'soft',
+                },
             },
             'loss_weights': {
                 'pde_weights': {'cont': 1.0, 'mom_x': 1.0, 'mom_y': 1.0, 'mom_r': 1.0, 'mom_z': 1.0},
@@ -82,9 +110,7 @@ class ConfigManager:
                     'outlet': 1.0,
                     'outlet_grad': 1.0,
                     'farfield': 1.0,
-                    'slip': 1.0,
-                    'slip_tangent_grad': 1.0,
-                    'slip_velocity': 0.1,
+                    'slip_wall': 1.0,
                     'velocity_dirichlet': 1.0,
                     'wall': 1.0,
                     'symmetry': 1.0,
@@ -95,6 +121,7 @@ class ConfigManager:
                 'adaptive_bc': False,
                 'use_sa_weights': False,
                 'sa_apply_to_bc': False,
+                'pressure_gauge_weight': 1.0,
                 'integral_condition': False,
                 'integral_weight': 0.0,
                 'fvm': {
@@ -188,6 +215,7 @@ class ConfigManager:
             },
             'checkpoint': {
                 'interval': 500,
+                'load_mode': 'resume',
                 'strict_contract': True,
                 'allow_legacy_without_contract': True,
                 'name_pattern': '{project_name}_{timestamp}',
@@ -310,6 +338,7 @@ class ConfigManager:
 
         # Рекурсивно обновляем словарь
         self._deep_update(self.config, loaded)
+        self._remove_deprecated_boundary_input()
 
         # Преобразуем списки в кортежи там, где это необходимо (например, output_bias)
         if 'architecture' in self.config and 'output_bias' in self.config['architecture']:
@@ -330,6 +359,7 @@ class ConfigManager:
         """
         if name:
             self.name = name
+        self._remove_deprecated_boundary_input()
         self.validate()
         # Перед сохранением преобразуем кортежи в списки
         config_copy = self._prepare_for_save(self.config)
@@ -377,7 +407,6 @@ class ConfigManager:
         inp = self.config['input_params']
         print(f"  coordinates     : {inp.get('coordinates', True)}")
         print(f"  sdf             : {inp.get('sdf', True)}")
-        print(f"  boundary_types  : {inp.get('boundary_types', True)}")
         print(f"  inlet_velocity  : {inp.get('inlet_velocity', False)}")
         print(f"  viscosity       : {inp.get('viscosity', False)}")
         print(f"  density         : {inp.get('density', False)}")
@@ -485,6 +514,7 @@ class ConfigManager:
         ck = self.config['checkpoint']
         print("СОХРАНЕНИЕ:")
         print(f"  interval       : {ck['interval']}")
+        print(f"  load_mode      : {ck.get('load_mode', 'resume')}")
         print(f"  name_pattern   : {ck['name_pattern']}")
         print(f"  model_name_pattern: {ck['model_name_pattern']}")
         print(f"  save_flow_images: {ck.get('save_flow_images', True)}")
@@ -540,6 +570,32 @@ class ConfigManager:
                 self._deep_update(target[key], value)
             else:
                 target[key] = value
+
+    def _remove_deprecated_boundary_input(self) -> None:
+        """Remove obsolete boundary one-hot feature flags from the config.
+
+        Boundary labels remain part of the data/loss contract, but are never
+        configurable neural-network inputs.  Loading old YAML files therefore
+        stays supported while subsequent saves use the canonical schema.
+        """
+        removed = False
+        input_params = self.config.get('input_params')
+        if isinstance(input_params, dict) and 'boundary_types' in input_params:
+            input_params.pop('boundary_types')
+            removed = True
+        input_features = self.config.get('input_features')
+        if (
+            isinstance(input_features, dict)
+            and 'boundary_types' in input_features
+        ):
+            input_features.pop('boundary_types')
+            removed = True
+        if removed:
+            logger.warning(
+                "Deprecated boundary_types input setting was removed. "
+                "Boundary labels remain available only to constraints, "
+                "losses and diagnostics."
+            )
 
     def reset_to_defaults(self) -> None:
         """Сбрасывает конфигурацию к значениям по умолчанию."""

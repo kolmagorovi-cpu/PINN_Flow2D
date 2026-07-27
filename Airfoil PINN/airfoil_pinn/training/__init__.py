@@ -9,11 +9,17 @@
 """
 
 from airfoil_pinn.training.checkpoint import CheckpointManager
+from airfoil_pinn.training.boundary import (
+    BoundaryOutputTransform,
+    distance_mask,
+)
 from airfoil_pinn.training.models import PINNIncompressible, SelfAdaptiveWeights, Sine
 
 __all__ = [
+    "BoundaryOutputTransform",
     "CheckpointManager",
     "PINNIncompressible",
     "SelfAdaptiveWeights",
     "Sine",
+    "distance_mask",
 ]

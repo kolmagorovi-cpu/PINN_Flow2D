@@ -115,6 +115,10 @@ point_dtype = np.dtype([
     ('sdf_norm', 'f8'),
     ('boundary_type', 'U20'),
     ('on_boundary', 'bool'),
+    ('on_airfoil', 'bool'),
+    ('segment_id', 'i4'),
+    ('normal_x', 'f8'),
+    ('normal_y', 'f8'),
     ('p_norm', 'f8'),
     ('u_norm', 'f8'),
     ('v_norm', 'f8')
@@ -755,9 +759,20 @@ class Initializer:
 
         N = len(self.points)
         arr_norm = np.zeros(N, dtype=point_dtype)
+        arr_norm['segment_id'] = -1
+        arr_norm['normal_x'] = np.nan
+        arr_norm['normal_y'] = np.nan
 
         # Копируем существующие поля, если они есть
-        for name in ['id', 'boundary_type', 'on_boundary']:
+        for name in [
+            'id',
+            'boundary_type',
+            'on_boundary',
+            'on_airfoil',
+            'segment_id',
+            'normal_x',
+            'normal_y',
+        ]:
             if name in self.points.dtype.names:
                 arr_norm[name] = self.points[name]
 
@@ -826,8 +841,26 @@ class Initializer:
             u_phys[wall_mask] = 0.0
             v_phys[wall_mask] = 0.0
 
-            sym_mask = self.points['boundary_type'] == 'symmetry'
-            v_phys[sym_mask] = 0.0
+            boundary_names = np.char.lower(
+                self.points['boundary_type'].astype(str)
+            )
+            sym_mask = boundary_names == 'symmetry'
+            slip_mask = np.isin(boundary_names, ('slip_wall', 'slip'))
+            valid_normals = (
+                np.isfinite(arr_norm['normal_x'])
+                & np.isfinite(arr_norm['normal_y'])
+            )
+            projected_mask = (sym_mask | slip_mask) & valid_normals
+            normal_velocity = (
+                u_phys[projected_mask] * arr_norm['normal_x'][projected_mask]
+                + v_phys[projected_mask] * arr_norm['normal_y'][projected_mask]
+            )
+            u_phys[projected_mask] -= (
+                normal_velocity * arr_norm['normal_x'][projected_mask]
+            )
+            v_phys[projected_mask] -= (
+                normal_velocity * arr_norm['normal_y'][projected_mask]
+            )
 
             axis_mask = self.points['boundary_type'] == 'axis_symmetry'
             u_phys[axis_mask] = 0.0

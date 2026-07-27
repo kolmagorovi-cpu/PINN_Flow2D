@@ -36,10 +36,6 @@ def _configure_input_params(cfg: ConfigManager) -> None:
 
     inp['coordinates'] = yes_no("Использовать координаты x,y", inp.get('coordinates', True))
     inp['sdf'] = yes_no("Использовать SDF", inp.get('sdf', True))
-    inp['boundary_types'] = yes_no(
-        "Использовать one-hot тип границы как вход сети",
-        inp.get('boundary_types', True),
-    )
     inp['inlet_velocity'] = yes_no("Использовать компоненты скорости на входе", inp.get('inlet_velocity', False))
     inp['viscosity'] = yes_no("Использовать вязкость жидкости", inp.get('viscosity', False))
     inp['density'] = yes_no("Использовать плотность жидкости", inp.get('density', False))
@@ -53,9 +49,8 @@ def _configure_input_params(cfg: ConfigManager) -> None:
     features = cfg.config.setdefault('input_features', {})
     features['coordinates'] = {'enabled': True}
     features['sdf'] = {'enabled': True}
-    features['boundary_types'] = {
-        'enabled': bool(inp['boundary_types']),
-    }
+    features.pop('boundary_types', None)
+    inp.pop('boundary_types', None)
     reynolds = features.get('reynolds', {})
     if not isinstance(reynolds, dict):
         reynolds = {}
@@ -210,12 +205,12 @@ def _configure_output_params(cfg: ConfigManager) -> None:
 
     bias_u = input(f"Начальное смещение для U (текущее: {arch['output_bias'][0]}): ").strip()
     bias_v = input(f"Начальное смещение для V (текущее: {arch['output_bias'][1]}): ").strip()
-    bias_p = input(f"Начальное смещение для P (текущее: {arch['output_bias'][2]}): ").strip()
+    print("Начальное смещение raw pressure фиксировано равным 0.")
 
     arch['output_bias'] = (
         float(bias_u) if bias_u else arch['output_bias'][0],
         float(bias_v) if bias_v else arch['output_bias'][1],
-        float(bias_p) if bias_p else arch['output_bias'][2],
+        0.0,
     )
 
 

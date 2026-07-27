@@ -17,10 +17,13 @@ architecture:
   output_bias:
   - 1.0
   - 0.0
-  - 1.0
+  - 0.0
   output_dim: 3
 boundary_conditions:
-  type: soft
+  wall:
+    kind: no_slip
+    enforcement: soft
+    distance_scale: 0.02
 checkpoint:
   interval: 500
   model_name_pattern: '{project_name}_{timestamp}'

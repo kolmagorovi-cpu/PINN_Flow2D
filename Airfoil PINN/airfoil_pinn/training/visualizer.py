@@ -1080,22 +1080,35 @@ class Visualizer:
         Рекомендуется использовать plot_final_fields_from_tensors.
         """
         logger.warning("Метод plot_final_fields устарел. Используйте plot_final_fields_from_tensors.")
+        if loss_computer is None:
+            raise RuntimeError(
+                "plot_final_fields requires LossComputer so evaluation SDF "
+                "is recomputed by the canonical geometry engine"
+            )
         model.eval()
         dataset = data_handler.dataset
         x_norm = dataset.x.to(device)
         y_norm = dataset.y.to(device)
-        sdf_norm = dataset.sdf.to(device)
+        sdf_norm = loss_computer.evaluate_sdf_tensor(x_norm, y_norm)
         bt = dataset.boundary_types.to(device) if dataset.boundary_types is not None else None
 
         with torch.no_grad():
-            if loss_computer is not None:
-                input_tensor = loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
-            elif bt is not None:
-                input_tensor = torch.cat([x_norm, y_norm, sdf_norm, bt], dim=1)
-            else:
-                input_tensor = torch.cat([x_norm, y_norm, sdf_norm], dim=1)
+            input_tensor = loss_computer.build_input_tensor(
+                x_norm,
+                y_norm,
+                sdf_norm,
+            )
             output = model(input_tensor)
             u_norm, v_norm, p_norm = output[:, 0:1], output[:, 1:2], output[:, 2:3]
+            u_norm, v_norm, p_norm = loss_computer.transform_outputs(
+                u_norm,
+                v_norm,
+                p_norm,
+                x_norm,
+                y_norm,
+                sdf=sdf_norm,
+                case_ids=getattr(dataset, "case_id", None),
+            )
 
         self.plot_final_fields_from_tensors(u_norm, v_norm, p_norm, x_norm, y_norm,
                                             data_handler, savedir, epoch,

@@ -20,7 +20,9 @@ architecture:
   - 0.0
   output_dim: 3
 boundary_conditions:
-  type: soft
+  wall:
+    kind: inviscid_wall
+    enforcement: soft
 checkpoint:
   interval: 500
   model_name_pattern: '{project_name}_{timestamp}'

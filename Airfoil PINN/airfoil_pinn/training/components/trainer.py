@@ -213,6 +213,8 @@ class Trainer:
         """
         idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
         case_ids = getattr(batch, 'case_id', None)
+        normal_x = getattr(batch, 'normal_x', None)
+        normal_y = getattr(batch, 'normal_y', None)
 
         idx = idx.to(self.device)
         if case_ids is not None:
@@ -220,6 +222,10 @@ class Trainer:
         x = x.to(self.device, dtype=self.dtype).requires_grad_(True)
         y = y.to(self.device, dtype=self.dtype).requires_grad_(True)
         sdf = sdf.to(self.device, dtype=self.dtype)
+        if normal_x is not None:
+            normal_x = normal_x.to(self.device, dtype=self.dtype).view(-1, 1)
+        if normal_y is not None:
+            normal_y = normal_y.to(self.device, dtype=self.dtype).view(-1, 1)
 
         if bt.shape[1] > 0:
             bt = bt.to(self.device, dtype=self.dtype)
@@ -245,7 +251,6 @@ class Trainer:
             x,
             y,
             sdf,
-            bt,
             case_ids=case_ids,
         )
 
@@ -253,19 +258,30 @@ class Trainer:
         out = self.model(input_tensor)
         u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
-        # Применение жёстких граничных условий (если необходимо)
-        if self.loss_computer.bc_type == 'hard':
-            u, v, p = self.loss_computer.apply_hard_constraints(
-                u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
-            )
-        else:
-            u, v, p = u_raw, v_raw, p_raw
-        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
-            u,
-            v,
-            bt,
+        # The distance-based wall transform is part of the differentiated
+        # solution used by both PDE and boundary losses.
+        u, v, p = self.loss_computer.transform_outputs(
+            u_raw,
+            v_raw,
+            p_raw,
+            x,
+            y,
+            sdf=sdf,
             case_ids=case_ids,
         )
+
+        # Legacy pointwise override for old direct callers only. Static
+        # configuration validation rejects global type=hard.
+        if self.loss_computer.bc_type == 'hard':
+            u, v, p = self.loss_computer.apply_hard_constraints(
+                u, v, p, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+            )
+            u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                u,
+                v,
+                bt,
+                case_ids=case_ids,
+            )
 
         # Вычисление невязок PDE
         res = self.loss_computer.compute_pde_residuals(
@@ -279,7 +295,22 @@ class Trainer:
         cont = res['cont']
         mom1 = res[self.loss_computer.pde_components[1]]
         mom2 = res[self.loss_computer.pde_components[2]]
-        pde_mask = self._pde_loss_mask(bt, cont) & sdf_pde_mask
+        interior_pde_mask = self._pde_loss_mask(bt, cont)
+        pde_mask = interior_pde_mask & sdf_pde_mask
+        pde_candidate_count = int(interior_pde_mask.sum().detach().cpu())
+        pde_point_count = int(pde_mask.sum().detach().cpu())
+        pde_coverage = (
+            float(pde_point_count / pde_candidate_count)
+            if pde_candidate_count > 0
+            else 1.0
+        )
+        near_wall_pde_count = int(
+            (
+                pde_mask
+                & (sdf.detach() > 0.0)
+                & (sdf.detach() < 0.01)
+            ).sum().cpu()
+        )
         pde_score = cont + mom1 + mom2
         self._update_pde_point_residual(
             idx,
@@ -325,8 +356,8 @@ class Trainer:
             self.loss_computer.loss_weights[self.loss_computer.pde_components[2]] * loss_2
         )
 
-        # Граничные условия (только для soft)
-        if self.loss_computer.bc_type == 'soft':
+        # Unsupported operators remain soft even when the wall is hard.
+        if self.loss_computer.bc_type != 'hard':
             bc_comp, extra_grad = self.loss_computer.compute_bc_loss(
                 u,
                 v,
@@ -335,6 +366,8 @@ class Trainer:
                 x,
                 y,
                 case_ids=case_ids,
+                normal_x=normal_x,
+                normal_y=normal_y,
             )
             # Если SA-веса применяются к BC, используем только их; иначе — фиксированные веса
             if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
@@ -342,9 +375,13 @@ class Trainer:
                     u=u,
                     v=v,
                     p=p,
+                    x=x,
+                    y=y,
                     boundary_types=bt,
                     w_bc=w_bc,
                     case_ids=case_ids,
+                    normal_x=normal_x,
+                    normal_y=normal_y,
                 ) + extra_grad
             else:
                 bc_loss = sum(
@@ -355,6 +392,18 @@ class Trainer:
             bc_comp = {}
             # Создаём нулевой тензор, который требует градиент (чтобы избежать ошибок в диагностике)
             bc_loss = torch.zeros(1, device=self.device, dtype=self.dtype, requires_grad=True).squeeze()
+
+        pressure_gauge_raw = (
+            self.loss_computer.compute_pressure_gauge_loss(
+                p,
+                case_ids=case_ids,
+                mask=interior_pde_mask,
+            )
+        )
+        pressure_gauge_loss = (
+            self.loss_computer.pressure_gauge_weight
+            * pressure_gauge_raw
+        )
 
         # RAR использует локальный аналог Total Loss: взвешенная PDE-часть
         # плюс точечные BC-вклады. Глобальные integral/FVM не имеют координатной
@@ -374,6 +423,8 @@ class Trainer:
             w_pde=w_pde,
             w_bc=w_bc,
             case_ids=case_ids,
+            normal_x=normal_x,
+            normal_y=normal_y,
         )
         self._update_rar_point_score(idx, rar_point_score)
 
@@ -439,12 +490,20 @@ class Trainer:
             fvm_loss_val = fvm_weighted_t.item()
             fvm_t = fvm_weighted_t * float(fvm_scale)
 
-        # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют
-        total_loss = pde_loss + bc_loss + integral_t + fvm_t
+        # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют.
+        # Pressure gauge removes the independent additive pressure nullspace
+        # for every flow case represented in this batch.
+        total_loss = (
+            pde_loss
+            + bc_loss
+            + pressure_gauge_loss
+            + integral_t
+            + fvm_t
+        )
 
         # Средняя скорость на стенке (для мониторинга)
         wall_speed = None
-        if self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp['wall'].item() > 0 and bt is not None:
+        if 'wall' in bc_comp and bc_comp['wall'].item() > 0 and bt is not None:
             wall_idx = self.data_handler.boundary_type_names.index('wall')
             u_wall = u[bt[:, wall_idx] > 0.5]
             v_wall = v[bt[:, wall_idx] > 0.5]
@@ -455,10 +514,18 @@ class Trainer:
             'total': total_loss,
             'pde_raw': pde_raw,
             'pde_max': pde_max,
-            'bc_comp': {k: v.item() for k, v in bc_comp.items()} if self.loss_computer.bc_type == 'soft' else {},
-            'extra_grad': extra_grad.item() if self.loss_computer.bc_type == 'soft' else 0.0,
+            'bc_comp': {k: v.item() for k, v in bc_comp.items()},
+            'extra_grad': extra_grad.item() if self.loss_computer.bc_type != 'hard' else 0.0,
             'integral_loss': integral_raw_t.item() if torch.is_tensor(integral_raw_t) else integral_raw_t,
             'fvm_loss': fvm_loss_val,
+            'pressure_gauge_raw': pressure_gauge_raw.item(),
+            'pressure_gauge_loss': pressure_gauge_loss.item(),
+            'pde_coverage': {
+                'candidate_points': pde_candidate_count,
+                'active_points': pde_point_count,
+                'fraction': pde_coverage,
+                'near_wall_0_01_chord_points': near_wall_pde_count,
+            },
             'wall_speed': wall_speed,
             # Возвращаем отдельные тензоры потерь для градиентного анализа
             'loss_components': {
@@ -466,6 +533,7 @@ class Trainer:
                 'mom1': loss_1,
                 'mom2': loss_2,
                 'bc': bc_loss,          # теперь всегда тензор
+                'pressure_gauge': pressure_gauge_loss,
                 'integral': integral_t
             },
             'u': u.detach(),  # для профилей и спектров
@@ -516,9 +584,13 @@ class Trainer:
         u: torch.Tensor,
         v: torch.Tensor,
         p: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
         w_bc: torch.Tensor,
         case_ids: Optional[torch.Tensor] = None,
+        normal_x: Optional[torch.Tensor] = None,
+        normal_y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Pointwise BC-loss с self-adaptive весами по активным boundary-точкам."""
         if boundary_types is None or boundary_types.shape[1] == 0:
@@ -547,11 +619,24 @@ class Trainer:
             elif name == 'outlet':
                 point_loss = p ** 2
             elif name == 'wall':
-                point_loss = u ** 2 + v ** 2
-            elif name == 'slip':
-                point_loss = (v - target_v) ** 2
-            elif name == 'symmetry':
-                point_loss = v ** 2
+                point_loss = self.loss_computer.compute_wall_point_loss(
+                    u,
+                    v,
+                    x,
+                    y,
+                    mask,
+                )
+            elif name in ('slip_wall', 'slip', 'symmetry'):
+                nx, ny = self.loss_computer._boundary_normals(
+                    normal_x,
+                    normal_y,
+                    mask,
+                    boundary_name=name,
+                )
+                point_loss = torch.zeros_like(u)
+                point_loss[mask] = (
+                    u[mask] * nx + v[mask] * ny
+                ).square()
             elif name == 'axis_symmetry':
                 point_loss = u ** 2
             else:
@@ -593,10 +678,12 @@ class Trainer:
                 v = torch.where(mask, target_v, v)
             elif name == 'outlet':
                 p = torch.where(mask, torch.zeros_like(p), p)
-            elif name == 'wall':
+            elif (
+                name == 'wall'
+                and self.loss_computer.pde_system
+                == 'incompressible_navier_stokes'
+            ):
                 u = torch.where(mask, torch.zeros_like(u), u)
-                v = torch.where(mask, torch.zeros_like(v), v)
-            elif name == 'symmetry':
                 v = torch.where(mask, torch.zeros_like(v), v)
             elif name == 'axis_symmetry':
                 u = torch.where(mask, torch.zeros_like(u), u)
@@ -619,6 +706,8 @@ class Trainer:
         w_pde: Optional[torch.Tensor],
         w_bc: Optional[torch.Tensor],
         case_ids: Optional[torch.Tensor] = None,
+        normal_x: Optional[torch.Tensor] = None,
+        normal_y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Возвращает локальный score для RAR.
@@ -658,6 +747,8 @@ class Trainer:
                 boundary_types=boundary_types,
                 w_bc=w_bc,
                 case_ids=case_ids,
+                normal_x=normal_x,
+                normal_y=normal_y,
             ).view(-1, 1)
 
         return torch.nan_to_num(score.flatten(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -672,6 +763,8 @@ class Trainer:
         boundary_types: torch.Tensor,
         w_bc: Optional[torch.Tensor],
         case_ids: Optional[torch.Tensor] = None,
+        normal_x: Optional[torch.Tensor] = None,
+        normal_y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Точечный вклад BC-loss для RAR total_loss score."""
         score = torch.zeros_like(u).flatten()
@@ -699,62 +792,58 @@ class Trainer:
             elif name == 'outlet':
                 point_loss = p ** 2
             elif name == 'wall':
-                point_loss = u ** 2 + v ** 2
-            elif name == 'slip':
-                tol = getattr(self.loss_computer, 'tol', 1e-6)
-                x_min = getattr(self.loss_computer, 'x_min', 0.0)
-                x_max = getattr(self.loss_computer, 'x_max', 0.0)
-                y_min = getattr(self.loss_computer, 'y_min', 0.0)
-                y_max = getattr(self.loss_computer, 'y_max', 0.0)
-                left = mask & (x <= x_min + tol)
-                right = mask & (x >= x_max - tol)
-                bottom = mask & (y <= y_min + tol)
-                top = mask & (y >= y_max - tol)
-                vertical = left | right
-                horizontal = bottom | top
-                if bool(horizontal.any()) or bool(vertical.any()):
-                    point_loss = torch.where(
-                        horizontal,
-                        (v - target_v) ** 2,
-                        point_loss,
+                point_loss = self.loss_computer.compute_wall_point_loss(
+                    u,
+                    v,
+                    x,
+                    y,
+                    mask,
+                )
+            elif name in ('slip_wall', 'slip', 'symmetry'):
+                nx, ny = self.loss_computer._boundary_normals(
+                    normal_x,
+                    normal_y,
+                    mask,
+                    boundary_name=name,
+                )
+                point_loss[mask] = (
+                    u[mask] * nx + v[mask] * ny
+                ).square()
+                if name == 'symmetry':
+                    full_length = torch.sqrt(
+                        normal_x.square() + normal_y.square()
                     )
-                    point_loss = torch.where(
-                        vertical,
-                        (u - target_u) ** 2,
-                        point_loss,
+                    safe_length = torch.where(
+                        mask,
+                        full_length,
+                        torch.ones_like(full_length),
                     )
-                    slip_velocity = self.loss_computer.loss_weights.get('slip_velocity', 0.1)
-                    slip_tangent_grad = self.loss_computer.loss_weights.get('slip_tangent_grad', 1.0)
-                    if bool(horizontal.any()):
-                        du_dy = self._grad(u, y, create_graph=True, silent=True)
-                        extra_point_loss = torch.where(
-                            horizontal,
-                            extra_point_loss + slip_tangent_grad * du_dy ** 2
-                            + slip_velocity * (u - target_u) ** 2,
-                            extra_point_loss,
+                    nx_full = torch.where(
+                        mask,
+                        normal_x / safe_length,
+                        torch.zeros_like(u),
+                    )
+                    ny_full = torch.where(
+                        mask,
+                        normal_y / safe_length,
+                        torch.zeros_like(v),
+                    )
+                    tangential_velocity = -u * ny_full + v * nx_full
+                    dut_dn = self.loss_computer._normal_derivative(
+                        tangential_velocity,
+                        x,
+                        y,
+                        nx,
+                        ny,
+                        mask,
+                    )
+                    extra_point_loss[mask] = (
+                        self.loss_computer.loss_weights.get(
+                            'symmetry_grad',
+                            10.0,
                         )
-                    if bool(vertical.any()):
-                        dv_dx = self._grad(v, x, create_graph=True, silent=True)
-                        extra_point_loss = torch.where(
-                            vertical,
-                            extra_point_loss + slip_tangent_grad * dv_dx ** 2
-                            + slip_velocity * (v - target_v) ** 2,
-                            extra_point_loss,
-                        )
-                else:
-                    point_loss = (v - target_v) ** 2
-                    du_dy = self._grad(u, y, create_graph=True, silent=True)
-                    extra_point_loss = (
-                        self.loss_computer.loss_weights.get('slip_tangent_grad', 1.0) * du_dy ** 2
-                        + self.loss_computer.loss_weights.get('slip_velocity', 0.1)
-                        * (u - target_u) ** 2
+                        * dut_dn.square()
                     )
-            elif name == 'symmetry':
-                # create_graph=True keeps the training graph intact for the
-                # subsequent total_loss.backward().
-                du_dy = self._grad(u, y, create_graph=True, silent=True)
-                point_loss = v ** 2
-                extra_point_loss = self.loss_computer.loss_weights.get('symmetry_grad', 10.0) * du_dy ** 2
             elif name == 'axis_symmetry':
                 # create_graph=True keeps the training graph intact for the
                 # subsequent total_loss.backward().
@@ -854,7 +943,6 @@ class Trainer:
         x = x[:n].to(self.device, dtype=self.dtype)
         y = y[:n].to(self.device, dtype=self.dtype)
         sdf = sdf[:n].to(self.device, dtype=self.dtype)
-        bt = bt[:n].to(self.device, dtype=self.dtype) if bt.shape[1] > 0 else None
         params = [p for p in self.model.parameters() if p.requires_grad]
         rows = []
 
@@ -863,7 +951,6 @@ class Trainer:
                 x[i:i + 1],
                 y[i:i + 1],
                 sdf[i:i + 1],
-                bt[i:i + 1] if bt is not None else None,
                 case_ids=(
                     case_ids[i:i + 1].to(self.device, dtype=torch.long)
                     if case_ids is not None
@@ -913,7 +1000,7 @@ class Trainer:
                 case_ids = getattr(batch, 'case_id', None)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
-                sdf = sdf.to(self.device, dtype=self.dtype)
+                sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
                 if bt.shape[1] > 0:
                     bt = bt.to(self.device, dtype=self.dtype)
                 else:
@@ -923,13 +1010,21 @@ class Trainer:
                     x,
                     y,
                     sdf,
-                    bt,
                     case_ids=case_ids,
                 )
                 out = self.model(input_tensor)
                 u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+                u, v, p = self.loss_computer.transform_outputs(
+                    u_raw,
+                    v_raw,
+                    p_raw,
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
 
-                # Применяем hard constraints, если нужно
+                # Legacy pointwise override.
                 if self.loss_computer.bc_type == 'hard':
                     mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
                     mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
@@ -938,16 +1033,14 @@ class Trainer:
                     v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     u, v, p = self.loss_computer.apply_hard_constraints(
-                        u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                        u, v, p, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
                     )
-                else:
-                    u, v, p = u_raw, v_raw, p_raw
-                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
-                    u,
-                    v,
-                    bt,
-                    case_ids=case_ids,
-                )
+                    u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                        u,
+                        v,
+                        bt,
+                        case_ids=case_ids,
+                    )
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -1059,17 +1152,23 @@ class Trainer:
         self.model.eval()
         x_pts = dataset.x[indices].to(self.device, dtype=self.dtype)
         y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).requires_grad_(True)
-        sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype)
-        bt_pts = dataset.boundary_types[indices].to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
+        sdf_pts = self.loss_computer.evaluate_sdf_tensor(x_pts, y_pts)
         input_tensor = self.loss_computer.build_input_tensor(
             x_pts,
             y_pts,
             sdf_pts,
-            bt_pts,
             case_ids=dataset.case_id[indices],
         )
         out = self.model(input_tensor)
-        u_vals = out[:, 0:1]
+        u_vals, _, _ = self.loss_computer.transform_outputs(
+            out[:, 0:1],
+            out[:, 1:2],
+            out[:, 2:3],
+            x_pts,
+            y_pts,
+            sdf=sdf_pts,
+            case_ids=dataset.case_id[indices],
+        )
         # Обнуляем накопленные градиенты перед вычислением du/dy
         self.model.zero_grad()
         if y_pts.grad is not None:
@@ -1171,6 +1270,11 @@ class Trainer:
         if added == 0:
             logger.info("Adaptive RAR: DataHandler не добавил новых точек.")
             return 0
+
+        # DataHandler stores network coordinates in its dataset dtype.  Rebuild
+        # the derived SDF cache after that cast so every accepted RAR point is
+        # tied to its actual stored coordinates and active geometry.
+        self.loss_computer.synchronize_cached_training_sdf()
 
         new_residual = torch.zeros(added, device='cpu', dtype=self.dtype)
         self.point_residual = torch.cat([self.point_residual, new_residual], dim=0)
@@ -1342,7 +1446,6 @@ class Trainer:
         if dh.mesh_airfoil_coords is not None:
             foil_norm = np.asarray(dh.mesh_airfoil_coords, dtype=np.float64) / float(dh.chord)
 
-        wall_tree = self._build_wall_tree(coords, ds)
         accepted: List[np.ndarray] = []
         accepted_sdf: List[float] = []
         accepted_arr = np.empty((0, 2), dtype=np.float64)
@@ -1381,17 +1484,17 @@ class Trainer:
                 cand = cand[valid]
                 min_dist = min_dist[valid]
 
-            if wall_tree is not None:
-                sdf_vals, _ = wall_tree.query(cand, k=1, workers=-1)
-                min_sdf = self.rar_min_boundary_distance_factor * median_h
-                valid = sdf_vals >= min_sdf
-                if not np.any(valid):
-                    continue
-                cand = cand[valid]
-                min_dist = min_dist[valid]
-                sdf_vals = sdf_vals[valid]
-            else:
-                sdf_vals = np.zeros(len(cand), dtype=np.float64)
+            sdf_vals = self.loss_computer.evaluate_sdf_numpy(
+                cand,
+                point_chunk_size=4096,
+            )
+            min_sdf = self.rar_min_boundary_distance_factor * median_h
+            valid = sdf_vals >= min_sdf
+            if not np.any(valid):
+                continue
+            cand = cand[valid]
+            min_dist = min_dist[valid]
+            sdf_vals = sdf_vals[valid]
 
             batch_pts: List[np.ndarray] = []
             batch_sdf: List[float] = []
@@ -1431,16 +1534,6 @@ class Trainer:
             len(pts),
         )
         return pts[:, 0], pts[:, 1], sdf
-
-    @staticmethod
-    def _build_wall_tree(coords: np.ndarray, dataset) -> Optional[cKDTree]:
-        """KDTree по wall-точкам для быстрого SDF новых RAR-точек."""
-        if dataset.boundary_types is None or 'wall' not in dataset.type_to_idx:
-            return None
-        wall_mask = (dataset.boundary_types[:, dataset.type_to_idx['wall']] > 0.5).cpu().numpy()
-        if not np.any(wall_mask):
-            return None
-        return cKDTree(coords[wall_mask])
 
     @staticmethod
     def _valid_interior_mask(
@@ -1598,11 +1691,25 @@ class Trainer:
                 x,
                 y,
                 sdf,
-                boundary_types,
                 case_ids=case_ids,
             )
             raw = self.model(inputs)
-            u, v, p = raw[:, 0:1], raw[:, 1:2], raw[:, 2:3]
+            if hasattr(self.loss_computer, "transform_outputs"):
+                u, v, p = self.loss_computer.transform_outputs(
+                    raw[:, 0:1],
+                    raw[:, 1:2],
+                    raw[:, 2:3],
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
+            else:
+                u, v, p = (
+                    raw[:, 0:1],
+                    raw[:, 1:2],
+                    raw[:, 2:3],
+                )
             if (
                 self.loss_computer.bc_type == "hard"
                 and boundary_types is not None
@@ -1614,12 +1721,6 @@ class Trainer:
                     boundary_types,
                     case_ids=case_ids,
                 )
-            u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
-                u,
-                v,
-                boundary_types,
-                case_ids=case_ids,
-            )
             target_u, target_v = (
                 self.loss_computer.get_freestream_targets(
                     x[:1],
@@ -1656,24 +1757,32 @@ class Trainer:
 
         x = ds.x[mask].to(self.device, dtype=self.dtype)
         y = ds.y[mask].to(self.device, dtype=self.dtype)
-        sdf = ds.sdf[mask].to(self.device, dtype=self.dtype)
+        sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
         bt = ds.boundary_types[mask].to(self.device, dtype=self.dtype)
 
         inp = self.loss_computer.build_input_tensor(
             x,
             y,
             sdf,
-            bt,
             case_ids=ds.case_id[mask],
         )
         out = self.model(inp)
         u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+        u, v, p = self.loss_computer.transform_outputs(
+            u_raw,
+            v_raw,
+            p_raw,
+            x,
+            y,
+            sdf=sdf,
+            case_ids=ds.case_id[mask],
+        )
 
         if self.loss_computer.bc_type == 'hard':
-            u, v, _ = self.loss_computer.apply_hard_constraints(
-                u_raw,
-                v_raw,
-                p_raw,
+            u, v, p = self.loss_computer.apply_hard_constraints(
+                u,
+                v,
+                p,
                 ds.mask_u_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
                 ds.mask_v_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
                 ds.mask_p_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
@@ -1681,14 +1790,12 @@ class Trainer:
                 ds.v_bc[mask].to(self.device, dtype=self.dtype).view(-1, 1),
                 ds.p_bc[mask].to(self.device, dtype=self.dtype).view(-1, 1),
             )
-        else:
-            u, v = u_raw, v_raw
-        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
-            u,
-            v,
-            bt,
-            case_ids=ds.case_id[mask],
-        )
+            u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                u,
+                v,
+                bt,
+                case_ids=ds.case_id[mask],
+            )
         selected_case_ids = ds.case_id[mask].to(
             self.device,
             dtype=torch.long,
@@ -1838,6 +1945,7 @@ class Trainer:
             components={
                 "pde": sum(fwd["pde_raw"].values()),
                 "bc": sum(fwd["bc_comp"].values()),
+                "pressure_gauge": fwd["pressure_gauge_loss"],
                 "integral": fwd["integral_loss"],
                 "fvm": fwd.get("fvm_loss", 0.0),
             },
@@ -1900,6 +2008,8 @@ class Trainer:
             'extra_grad': fwd['extra_grad'],
             'integral_loss': fwd['integral_loss'],
             'fvm_loss': fwd.get('fvm_loss', 0.0),
+            'pressure_gauge_loss': fwd['pressure_gauge_loss'],
+            'pde_coverage': fwd['pde_coverage'],
             'wall_speed': fwd['wall_speed'],
             'grad_norm': grad_norm
         }

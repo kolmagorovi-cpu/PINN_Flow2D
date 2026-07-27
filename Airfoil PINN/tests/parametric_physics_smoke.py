@@ -105,7 +105,6 @@ def _loss_config() -> dict:
         "input_params": {
             "coordinates": True,
             "sdf": True,
-            "boundary_types": True,
             "viscosity": True,
             "inlet_velocity": True,
         },
@@ -179,6 +178,81 @@ def _loss_computer() -> LossComputer:
 
 class CaseAwareLossTests(unittest.TestCase):
     """Verify that the same case IDs drive inputs, physics and BC targets."""
+
+    def test_pressure_gauge_breaks_casewise_additive_nullspace(self) -> None:
+        """A raw-pressure constant changes total loss for every case."""
+        loss = _loss_computer()
+        x = torch.tensor(
+            [[-0.5], [0.5], [-0.5], [0.5]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        y = torch.tensor(
+            [[-0.25], [0.25], [-0.25], [0.25]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        case_ids = torch.tensor([0, 0, 1, 1])
+        u = x.square() + y.square()
+        v = x.square() - y.square()
+        pressure = (
+            0.0 * x
+            + 0.0 * y
+            + torch.tensor(
+                [[1.0], [-1.0], [2.0], [-2.0]],
+                dtype=torch.float64,
+            )
+        )
+        shifted_pressure = pressure + 0.5
+
+        residual = loss.compute_pde_residuals(
+            u,
+            v,
+            pressure,
+            x,
+            y,
+            case_ids=case_ids,
+        )
+        shifted_residual = loss.compute_pde_residuals(
+            u,
+            v,
+            shifted_pressure,
+            x,
+            y,
+            case_ids=case_ids,
+        )
+        pde_total = sum(value.mean() for value in residual.values())
+        shifted_pde_total = sum(
+            value.mean() for value in shifted_residual.values()
+        )
+        torch.testing.assert_close(pde_total, shifted_pde_total)
+
+        gauge = loss.compute_pressure_gauge_loss(
+            pressure,
+            case_ids=case_ids,
+        )
+        shifted_gauge = loss.compute_pressure_gauge_loss(
+            shifted_pressure,
+            case_ids=case_ids,
+        )
+        total = pde_total + loss.pressure_gauge_weight * gauge
+        shifted_total = (
+            shifted_pde_total
+            + loss.pressure_gauge_weight * shifted_gauge
+        )
+
+        torch.testing.assert_close(
+            gauge,
+            torch.zeros((), dtype=torch.float64),
+        )
+        torch.testing.assert_close(
+            shifted_gauge,
+            torch.tensor(0.25, dtype=torch.float64),
+        )
+        self.assertNotEqual(
+            float(total.detach()),
+            float(shifted_total.detach()),
+        )
 
     def test_soft_boundary_targets_use_sin_cos_alpha(self) -> None:
         """Exact freestream vectors for alpha=0 and 30 degrees give zero."""

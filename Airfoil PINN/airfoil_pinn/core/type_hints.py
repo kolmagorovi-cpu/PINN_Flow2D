@@ -157,7 +157,8 @@ class CollocationPointDict(TypedDict):
         id: Уникальный идентификатор точки
         x: X-координата [м]
         y: Y-координата [м]
-        boundary_type: Тип границы ('inlet', 'outlet', 'wall', 'symmetry', 'axis_symmetry', 'interior')
+        boundary_type: Тип границы ('inlet', 'outlet', 'farfield',
+            'slip_wall', 'wall', 'symmetry', 'axis_symmetry', 'interior')
         on_airfoil: Находится ли точка на профиле
         on_boundary: Находится ли точка на границе
         segment_id: ID сегмента границы
@@ -169,6 +170,8 @@ class CollocationPointDict(TypedDict):
     on_airfoil: bool
     on_boundary: bool
     segment_id: int
+    normal_x: float
+    normal_y: float
 
 
 class SamplerConfigDict(TypedDict, total=False):
@@ -381,7 +384,6 @@ class InputParamsDict(TypedDict, total=False):
     """Параметры входа модели."""
     coordinates: bool
     sdf: bool
-    boundary_types: bool
     inlet_velocity: bool
     viscosity: bool
     density: bool
@@ -409,7 +411,6 @@ class InputFeaturesDict(TypedDict, total=False):
     sdf: Union[bool, FeatureToggleDict]
     reynolds: Union[bool, ReynoldsFeatureDict]
     angle_of_attack: Union[bool, FeatureToggleDict]
-    boundary_types: Union[bool, FeatureToggleDict]
     pressure_drop_coefficient: Union[bool, FeatureToggleDict]
     geometry_parameters: Union[bool, GeometryFeaturesDict]
 
@@ -442,7 +443,24 @@ class PDEConfigDict(TypedDict, total=False):
 
 class BoundaryConditionsConfigDict(TypedDict, total=False):
     """Конфигурация граничных условий."""
+    wall: 'BoundaryRuleConfigDict'
+    inlet: 'BoundaryRuleConfigDict'
+    farfield: 'BoundaryRuleConfigDict'
+    outlet: 'BoundaryRuleConfigDict'
+    velocity_dirichlet: 'BoundaryRuleConfigDict'
+    slip_wall: 'BoundaryRuleConfigDict'
+    slip: 'BoundaryRuleConfigDict'  # Legacy alias for slip_wall.
+    symmetry: 'BoundaryRuleConfigDict'
+    axis_symmetry: 'BoundaryRuleConfigDict'
+    # Legacy input accepted only as ``soft``; global hard is invalid.
     type: str
+
+
+class BoundaryRuleConfigDict(TypedDict, total=False):
+    """Physical kind and enforcement mode of one named boundary."""
+    kind: str
+    enforcement: Literal['soft', 'hard']
+    distance_scale: float
 
 
 class LossWeightsConfigDict(TypedDict, total=False):
@@ -521,6 +539,7 @@ class GraphicalWindowDict(TypedDict, total=False):
 class CheckpointConfigDict(TypedDict, total=False):
     """Конфигурация контрольных точек."""
     interval: int
+    load_mode: str
     strict_contract: bool
     allow_legacy_without_contract: bool
     name_pattern: str

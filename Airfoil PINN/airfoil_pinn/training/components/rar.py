@@ -251,8 +251,6 @@ class FlowRAR:
 
         domain_norm = _domain_norm(dh, coords)
         foil_norm = _foil_norm(dh)
-        wall_tree = _build_wall_tree(coords, ds)
-
         accepted: List[np.ndarray] = []
         accepted_sdf: List[float] = []
         accepted_case_ids: List[int] = []
@@ -297,20 +295,17 @@ class FlowRAR:
                 min_dist = min_dist[valid]
                 candidate_case_ids = candidate_case_ids[valid]
 
-            if wall_tree is not None:
-                sdf_vals, _ = wall_tree.query(cand, k=1, workers=-1)
-                min_sdf = float(tr.rar_min_boundary_distance_factor) * median_h
-                if exclude_sdf_delta is not None and delta_norm is not None:
-                    min_sdf = max(min_sdf, exclude_sdf_delta * float(delta_norm))
-                valid = sdf_vals >= min_sdf
-                if not np.any(valid):
-                    continue
-                cand = cand[valid]
-                min_dist = min_dist[valid]
-                sdf_vals = sdf_vals[valid]
-                candidate_case_ids = candidate_case_ids[valid]
-            else:
-                sdf_vals = np.zeros(len(cand), dtype=np.float64)
+            sdf_vals = _canonical_sdf_numpy(tr, cand)
+            min_sdf = float(tr.rar_min_boundary_distance_factor) * median_h
+            if exclude_sdf_delta is not None and delta_norm is not None:
+                min_sdf = max(min_sdf, exclude_sdf_delta * float(delta_norm))
+            valid = sdf_vals >= min_sdf
+            if not np.any(valid):
+                continue
+            cand = cand[valid]
+            min_dist = min_dist[valid]
+            sdf_vals = sdf_vals[valid]
+            candidate_case_ids = candidate_case_ids[valid]
 
             batch_pts: List[np.ndarray] = []
             batch_sdf: List[float] = []
@@ -351,6 +346,9 @@ class FlowRAR:
             "source_residual_min": float(source_res.min()),
             "source_residual_max": float(source_res.max()),
             "exclude_sdf_delta": exclude_sdf_delta,
+            "sdf_geometry_fingerprint": (
+                tr.loss_computer.sdf_geometry_fingerprint
+            ),
         }
         logger.info(
             "Flow RAR: source=%d выше %.0f%% квантиля, residual=[%.3e, %.3e], accepted=%d",
@@ -492,6 +490,9 @@ class BoundaryLayerRAR:
             "score_min": float(np.min(scores)),
             "score_max": float(np.max(scores)),
             "eta_levels": [float(v) for v in eta_levels],
+            "sdf_geometry_fingerprint": (
+                tr.loss_computer.sdf_geometry_fingerprint
+            ),
         }
         logger.info(
             "Boundary-Layer RAR: candidates=%d, accepted=%d, eta=[%.3g, %.3g, %.3g], score=[%.3e, %.3e]",
@@ -570,11 +571,7 @@ class BoundaryLayerRAR:
         contour_idx = contour_idx[valid]
         eta_idx = eta_idx[valid]
 
-        wall_tree = _build_wall_tree(coords, ds)
-        if wall_tree is not None:
-            sdf_vals, _ = wall_tree.query(candidates, k=1, workers=-1)
-        else:
-            sdf_vals = eta_levels[eta_idx] * float(delta_norm)
+        sdf_vals = _canonical_sdf_numpy(self.trainer, candidates)
 
         eta_actual = sdf_vals / float(delta_norm)
         eta_max = float(cfg.get("delta_max", cfg.get("eta_max", max(eta_levels))))
@@ -696,11 +693,18 @@ class BoundaryLayerRAR:
                         x,
                         y,
                         sdf_t,
-                        bt,
                         case_ids=case_ids,
                     )
                     out = model(inp)
-                    u, v, p = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+                    u, v, p = loss_computer.transform_outputs(
+                        out[:, 0:1],
+                        out[:, 1:2],
+                        out[:, 2:3],
+                        x,
+                        y,
+                        sdf=sdf_t,
+                        case_ids=case_ids,
+                    )
                     res = loss_computer.compute_pde_residuals(
                         u,
                         v,
@@ -853,13 +857,20 @@ def _foil_norm(data_handler: Any) -> Optional[np.ndarray]:
     return _remove_adjacent_duplicates(arr)
 
 
-def _build_wall_tree(coords: np.ndarray, dataset: Any) -> Optional[cKDTree]:
-    if dataset.boundary_types is None or "wall" not in dataset.type_to_idx:
-        return None
-    wall_mask = (dataset.boundary_types[:, dataset.type_to_idx["wall"]] > 0.5).cpu().numpy()
-    if not np.any(wall_mask):
-        return None
-    return cKDTree(coords[wall_mask])
+def _canonical_sdf_numpy(
+    trainer: Any,
+    points: np.ndarray,
+) -> np.ndarray:
+    """Evaluate RAR SDF with the active training geometry and value engine."""
+    loss_computer = getattr(trainer, "loss_computer", None)
+    if loss_computer is None or loss_computer.sdf_module is None:
+        raise RuntimeError(
+            "RAR requires the canonical PolylineDistanceField geometry"
+        )
+    return loss_computer.evaluate_sdf_numpy(
+        np.asarray(points, dtype=np.float64),
+        point_chunk_size=4096,
+    )
 
 
 def _interior_boundary_types(trainer: Any, n_points: int) -> Optional[torch.Tensor]:

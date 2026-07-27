@@ -44,6 +44,7 @@ BC_CODES: Dict[str, int] = {
     'axis_symmetry': 4,
     'interior':      5,
     'farfield':      6,
+    'slip_wall':     7,
     'slip':          7,
     'velocity_dirichlet': 8,
 }

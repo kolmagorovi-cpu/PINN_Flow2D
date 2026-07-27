@@ -82,7 +82,13 @@ def start_training(
 
     # Старые конфигурации могли быть сохранены до появления этого раздела.
     if "boundary_conditions" not in cfg.config:
-        cfg.config["boundary_conditions"] = {"type": "soft"}
+        cfg.config["boundary_conditions"] = {
+            "wall": {
+                "kind": "no_slip",
+                "enforcement": "soft",
+                "distance_scale": 0.02,
+            }
+        }
         logger.warning(
             "В конфигурации отсутствует раздел 'boundary_conditions', "
             "установлен 'soft' по умолчанию."
