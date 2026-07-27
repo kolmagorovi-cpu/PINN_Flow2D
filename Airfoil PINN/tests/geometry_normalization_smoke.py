@@ -16,6 +16,8 @@ from airfoil_pinn.data.normalization import (
     extract_geometry_reference,
 )
 from airfoil_pinn.data.sdf_diagnostics import estimate_boundary_layer_delta
+from airfoil_pinn.geometry import Geometry2D, GeometryConfig
+from airfoil_pinn.sampling.core import CollocationPoints, SamplerConfig
 from airfoil_pinn.sampling.normal_layer import estimate_boundary_layer_thickness
 
 
@@ -42,6 +44,93 @@ class GeometryNormalizationTests(unittest.TestCase):
 
         self.assertAlmostEqual(initializer._load_chord_from_metadata(), 1.0)
         self.assertEqual(initializer.geometry_reference["geom_name"], "sampled")
+
+    def test_initializer_loads_only_sampler_linked_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domains_dir = os.path.join(directory, "domains")
+            metadata_dir = os.path.join(directory, "metadata")
+            os.makedirs(domains_dir)
+            os.makedirs(metadata_dir)
+
+            active_domain = np.array(
+                [[-1.0, -1.0], [2.0, -1.0], [2.0, 1.0], [-1.0, -1.0]]
+            )
+            decoy_domain = np.array(
+                [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, -10.0]]
+            )
+            active_foil = np.array([[0.0, 0.0], [1.0, 0.0]])
+            np.save(os.path.join(domains_dir, "active_domain.npy"), active_domain)
+            np.save(os.path.join(domains_dir, "newer_decoy_domain.npy"), decoy_domain)
+            np.save(os.path.join(metadata_dir, "active_foil.npy"), active_foil)
+
+            initializer = Initializer()
+            initializer.geometry_dir = domains_dir
+            initializer.sampler_metadata = {
+                "geom_name": "active",
+                "geometry_reference": {"geom_name": "active", "chord": 1.0},
+            }
+            with patch(
+                "airfoil_pinn.data.initializer.GEOMETRY_METADATA_DIR",
+                metadata_dir,
+            ):
+                np.testing.assert_allclose(
+                    initializer._load_geometry_coords("domain"),
+                    active_domain,
+                )
+                np.testing.assert_allclose(
+                    initializer._load_geometry_coords("foil"),
+                    active_foil,
+                )
+
+    def test_initializer_reconstructs_domain_from_sampler_bounds(self) -> None:
+        initializer = Initializer()
+        initializer.sampler_metadata = {
+            "bounds": {
+                "x_min": -1.5,
+                "x_max": 6.0,
+                "y_min": -1.0,
+                "y_max": 0.5,
+            }
+        }
+        initializer.load_domain_coords()
+
+        expected = np.array(
+            [
+                [-1.5, -1.0],
+                [6.0, -1.0],
+                [6.0, 0.5],
+                [-1.5, 0.5],
+                [-1.5, -1.0],
+            ]
+        )
+        np.testing.assert_allclose(initializer.domain_coords, expected)
+
+    def test_sampler_requires_explicit_geometry_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = SamplerConfig(
+                geometry_dir=directory,
+                output_dir=directory,
+                geom_name=None,
+            )
+            sampler = CollocationPoints(config)
+            with self.assertRaisesRegex(ValueError, "geom_name"):
+                sampler.load_geometries()
+
+    def test_geometry2d_loads_an_explicit_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            foil_path = os.path.join(directory, "foil.txt")
+            with open(foil_path, "w", encoding="utf-8") as handle:
+                handle.write("0.0 0.0\n1.0 0.0\n")
+
+            geometry = Geometry2D(
+                GeometryConfig(output_dir=directory, verbose=False)
+            )
+            self.assertTrue(geometry.load_from_file(foil_path))
+            self.assertAlmostEqual(geometry.chord, 1.0)
+            np.testing.assert_allclose(
+                geometry.geometry_coords,
+                [[0.0, 0.0], [1.0, 0.0]],
+            )
 
     def test_delta_reference_uses_one_model(self) -> None:
         delta, delta_norm = estimate_boundary_layer_delta(

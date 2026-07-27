@@ -5,13 +5,14 @@ r"""
 
 ВСЕ КООРДИНАТЫ В МЕТРАХ (без нормализации).
 
-Автоматическая загрузка из geom_config.yaml:
-    - source_type: 'file' → загрузка из файла (file_path, file_format)
-    - source_type: 'inline' → загрузка из foil_geoms.yaml по имени (geom_name)
+Источник геометрии задаётся явно:
+    - ``load_from_file`` загружает конкретный файл координат;
+    - ``load_from_yaml`` загружает профиль по имени из библиотеки.
 
 Example:
-    >>> geom = load_geometry_from_config()
-    >>> geom.create_domain()
+    >>> geom = Geometry2D()
+    >>> geom.load_from_file("workspace/geometry/foils/naca0012.dat")
+    >>> geom.create_domain(front=1.5, rear=3.0, top=1.2, bottom=1.2)
     >>> geom.save('my_geometry')
 
 Автор: Колмагоров И.Д.
@@ -28,7 +29,6 @@ import logging
 from scipy import interpolate
 
 from airfoil_pinn.app.paths import (
-    GEOM_CONFIG_PATH,
     GEOMETRY_DOMAINS_DIR,
     GEOMETRY_FOILS_DIR,
     GEOMETRY_METADATA_DIR,
@@ -571,6 +571,29 @@ class Geometry2D:
         if self.config.verbose:
             logger.info("✅ Инициализирована геометрия профиля")
 
+    def load_from_file(self, filepath: str) -> bool:
+        """
+        Загружает профиль из явно указанного файла координат.
+
+        Относительные пути разрешаются от корня проекта. После успешной загрузки
+        координаты, хорда и признак замкнутости синхронизируются с внутренним
+        объектом :class:`AirfoilGeometry`.
+        """
+        resolved_path = filepath
+        if not os.path.isabs(resolved_path):
+            resolved_path = os.path.join(PROJECT_ROOT, resolved_path)
+
+        result = self._airfoil_geom.load_airfoil(resolved_path)
+        if result:
+            self.geometry_coords = self._airfoil_geom.foil_coords
+            self.is_closed = self._airfoil_geom.is_closed
+            self.chord = self._airfoil_geom.chord
+            self.geom_metadata = {
+                "source_type": "file",
+                "file_path": os.path.abspath(resolved_path),
+            }
+        return result
+
     def load_from_yaml(self, yaml_path: str = None, geom_name: str = None) -> bool:
         """
         Загрузка профиля из YAML-библиотеки foil_geoms.yaml.
@@ -604,83 +627,6 @@ class Geometry2D:
 
         except Exception as e:
             logger.error(f"❌ Ошибка при загрузке геометрии: {e}")
-            return False
-
-    def load_from_config(self, config_path: str = None) -> bool:
-        """
-        Загрузка профиля напрямую из geom_config.yaml.
-
-        Args:
-            config_path: Путь к geom_config.yaml (по умолчанию workspace/geometry/geom_config.yaml)
-
-        Returns:
-            True если загрузка успешна
-        """
-        if config_path is None:
-            config_path = GEOM_CONFIG_PATH
-
-        if not os.path.exists(config_path):
-            logger.error(f"❌ Конфигурационный файл не найден: {config_path}")
-            return False
-
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                geom_config = yaml.safe_load(f)
-            return self._load_airfoil_from_config(geom_config)
-        except Exception as e:
-            logger.error(f"❌ Ошибка при загрузке конфигурации: {e}")
-            return False
-
-    def _load_airfoil_from_config(self, geom_config: Dict) -> bool:
-        """
-        Загрузка профиля из параметров geom_config.yaml.
-
-        Args:
-            geom_config: Словарь конфигурации
-
-        Returns:
-            True если загрузка успешна
-        """
-        airfoil_params = geom_config.get('airfoil_params', {})
-        source_type = airfoil_params.get('source_type', 'inline')
-        geom_name = geom_config.get('geom_name')
-
-        if source_type == 'file':
-            file_path = airfoil_params.get('file_path')
-            file_format = airfoil_params.get('file_format', 'txt')  # читается из конфига, но не используется напрямую —
-            # формат определяется автоматически по расширению файла внутри load_airfoil()
-
-            if file_path is None:
-                logger.error("❌ Не указан file_path в airfoil_params")
-                return False
-
-            # Если путь относительный, добавляем PROJECT_ROOT
-            if not os.path.isabs(file_path):
-                file_path = os.path.join(PROJECT_ROOT, file_path)
-
-            if self.config.verbose:
-                logger.info(f"📂 Загрузка профиля из файла: {file_path}")
-
-            result = self._airfoil_geom.load_airfoil(file_path)
-            if result:
-                self.geometry_coords = self._airfoil_geom.foil_coords
-                self.is_closed = self._airfoil_geom.is_closed
-                self.chord = self._airfoil_geom.chord
-            return result
-
-        elif source_type == 'inline':
-            # Загрузка из foil_geoms.yaml по имени
-            if geom_name is None:
-                logger.error("❌ Не указан geom_name для inline профиля")
-                return False
-
-            if self.config.verbose:
-                logger.info(f"📂 Загрузка inline-профиля '{geom_name}' из {FOIL_GEOMS_PATH}")
-
-            return self.load_from_yaml(yaml_path=FOIL_GEOMS_PATH, geom_name=geom_name)
-
-        else:
-            logger.error(f"❌ Неизвестный source_type: {source_type}")
             return False
 
     def _load_airfoil_from_yaml(self, geom_data: Dict) -> bool:
@@ -752,51 +698,6 @@ class Geometry2D:
     def print_stats(self) -> None:
         """Вывод статистики геометрии."""
         self._airfoil_geom.print_stats()
-
-
-# ============================================================================
-# ГЛАВНАЯ ФУНКЦИЯ
-# ============================================================================
-
-def load_geometry_from_config(config_path: str = None, verbose: bool = True) -> Geometry2D:
-    """
-    Автоматическая загрузка профиля из geom_config.yaml.
-
-    Args:
-        config_path: Путь к geom_config.yaml (по умолчанию workspace/geometry/geom_config.yaml)
-        verbose: Выводить ли информацию о процессе
-
-    Returns:
-        Geometry2D: Инициализированный объект геометрии
-
-    Example:
-        >>> geom = load_geometry_from_config()
-        >>> geom.create_domain()
-        >>> geom.save('my_geometry')
-    """
-    if config_path is None:
-        config_path = GEOM_CONFIG_PATH
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Конфигурационный файл не найден: {config_path}")
-
-    with open(config_path, 'r', encoding='utf-8') as f:
-        geom_config = yaml.safe_load(f)
-
-    geom_name = geom_config.get('geom_name')
-    if geom_name is None:
-        raise ValueError("В geom_config.yaml не указан параметр 'geom_name'")
-
-    config = GeometryConfig(verbose=verbose)
-    geom = Geometry2D(config=config, geom_type='airfoil')
-
-    if not geom.load_from_config(config_path):
-        raise RuntimeError(f"Не удалось загрузить геометрию '{geom_name}'")
-
-    if verbose:
-        logger.info(f"✅ Геометрия загружена: airfoil/{geom_name}")
-
-    return geom
 
 
 FOILS_DIR = GEOMETRY_FOILS_DIR
@@ -881,32 +782,15 @@ def g2d() -> None:
         verbose=True,
     )
 
-    # Читаем базовую конфигурацию для параметров области
-    geom_config_path = GEOM_CONFIG_PATH
-    geom_config: Dict = {}
-    if os.path.exists(geom_config_path):
-        try:
-            with open(geom_config_path, 'r', encoding='utf-8') as f:
-                geom_config = yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.warning(f"Не удалось прочитать geom_config.yaml: {e}")
-
     # Имя геометрии = имя файла без расширения
     geom_name = os.path.splitext(os.path.basename(selected_file))[0]
-
-    # Подставляем выбранный файл в конфигурацию
-    airfoil_params = geom_config.setdefault('airfoil_params', {})
-    airfoil_params['source_type'] = 'file'
-    airfoil_params['file_path'] = selected_file
-    geom_config['geom_type'] = 'airfoil'
-    geom_config['geom_name'] = geom_name
 
     print(f"\n  Файл профиля : {os.path.relpath(selected_file, PROJECT_ROOT)}")
     print(f"  Имя геометрии: {geom_name}")
 
     # Загрузка профиля
     geom = Geometry2D(config=config, geom_type='airfoil')
-    if not geom._load_airfoil_from_config(geom_config):
+    if not geom.load_from_file(selected_file):
         input("\n❌ Ошибка загрузки. Нажмите Enter...")
         return
 
@@ -915,8 +799,9 @@ def g2d() -> None:
     print("\n🔧 СОЗДАНИЕ РАСЧЁТНОЙ ОБЛАСТИ")
     print("-" * 40)
 
-    domain_params = airfoil_params.get('domain_params', {})
-    geom.create_domain(**domain_params)
+    # Размеры области запрашиваются явно в интерактивном режиме. Они больше не
+    # берутся из глобального файла и поэтому всегда относятся к выбранному профилю.
+    geom.create_domain()
 
     geom.print_stats()
 

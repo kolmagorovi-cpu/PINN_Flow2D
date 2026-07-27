@@ -20,7 +20,11 @@
 а также выбрать тип верхней границы (INLET или OUTLET).
 
 Example:
-    >>> config = SamplerConfig(step_size=0.01, num_processes=4)
+    >>> config = SamplerConfig(
+    ...     step_size=0.01,
+    ...     num_processes=4,
+    ...     geom_name="NACA0012",
+    ... )
     >>> sampler = CollocationPoints(config)
     >>> domain, foil = sampler.load_geometries()
     >>> sampler.generate_all_points(domain, foil)
@@ -38,7 +42,6 @@ from multiprocessing import Process, Queue, freeze_support
 import os
 import time
 import logging
-import yaml
 from typing import List, Tuple, Optional, Dict, Union, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -49,10 +52,8 @@ import queue
 from scipy.spatial import cKDTree
 
 from airfoil_pinn.app.paths import (
-    GEOM_CONFIG_PATH,
     GEOMETRY_DOMAINS_DIR,
     GEOMETRY_METADATA_DIR,
-    PATHS,
     SAMPLING_COLLOCATION_DIR,
     SAMPLING_MESH_DIR,
 )
@@ -70,7 +71,6 @@ except ImportError:
 
 # Сэмплинг читает геометрию из workspace/geometry и пишет свои артефакты
 # в workspace/sampling. Пути остаются строками для совместимости с os.path.
-PROJECT_ROOT = str(PATHS.project_root)
 DEFAULT_GEOMETRY_DIR = GEOMETRY_DOMAINS_DIR
 DEFAULT_METADATA_DIR = GEOMETRY_METADATA_DIR
 DEFAULT_OUTPUT_DIR = SAMPLING_COLLOCATION_DIR
@@ -321,6 +321,8 @@ class SamplerConfig:
             normal_layer_min_point_distance_factor=self.normal_layer_min_point_distance_factor,
             normal_layer_max_points=self.normal_layer_max_points,
             normal_layer_fill_remaining=self.normal_layer_fill_remaining,
+            geom_type=self.geom_type,
+            geom_name=self.geom_name,
         )
 
 
@@ -512,66 +514,15 @@ class CollocationPoints:
         self.output_base: Optional[str] = None
         self._last_normal_layer_stats: Dict[str, Any] = {}
 
-        # Загрузка конфигурации геометрии
-        self.load_geometry_config()
-
         os.makedirs(config.output_dir, exist_ok=True)
 
     def _get_next_id(self) -> int:
         self.next_id += 1
         return self.next_id - 1
 
-    def load_geometry_config(self, config_path: str = None) -> None:
-        """
-        Загрузка конфигурации геометрии из YAML-файла.
-
-        Args:
-            config_path: Путь к geom_config.yaml (по умолчанию:
-                         workspace/geometry/geom_config.yaml)
-        """
-        if config_path is None:
-            # Основной путь живёт в workspace/geometry. Старые варианты оставлены
-            # только как мягкий fallback для пользовательских рабочих копий.
-            possible_paths = [
-                GEOM_CONFIG_PATH,
-                os.path.join(PROJECT_ROOT, "geom_config.yaml"),
-                "geom_config.yaml"
-            ]
-            logger.info("🔍 Поиск geom_config.yaml по путям:")
-            for path in possible_paths:
-                exists = "✅" if os.path.exists(path) else "❌"
-                logger.info(f"   {exists} {path}")
-
-            for path in possible_paths:
-                if os.path.exists(path):
-                    config_path = path
-                    logger.info(f"✅ Найден: {config_path}")
-                    break
-
-        if config_path is None or not os.path.exists(config_path):
-            logger.warning("⚠️ geom_config.yaml не найден, используется конфигурация по умолчанию (airfoil)")
-            return
-
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                geom_config = yaml.safe_load(f)
-
-            self.config.geom_type = geom_config.get('geom_type', 'airfoil')
-            # Не перезаписываем geom_name если он уже задан (например, через меню S2DR)
-            if self.config.geom_name is None:
-                self.config.geom_name = geom_config.get('geom_name')
-
-            logger.info(f"✅ Конфигурация геометрии загружена: {config_path}")
-            logger.info(f"   geom_type: {self.config.geom_type}")
-            logger.info(f"   geom_name: {self.config.geom_name or 'default'}")
-
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось загрузить geom_config.yaml: {e}")
-            logger.info("   Используется конфигурация по умолчанию (airfoil)")
-
     def find_geometry_files(self) -> Dict[str, Optional[str]]:
         """
-        Поиск файлов геометрии по geom_name из конфига.
+        Поиск файлов геометрии по ``SamplerConfig.geom_name``.
 
         domain   → workspace/geometry/domains/   ({geom_name}_domain.npy)
         foil     → workspace/geometry/metadata/  ({geom_name}_foil.npy)
@@ -623,13 +574,22 @@ class CollocationPoints:
             Кортеж (domain, foil) — массивы координат области и профиля
 
         Raises:
+            ValueError: Если имя геометрии не передано явно
             FileNotFoundError: Если файл области не найден
         """
+        if not self.config.geom_name:
+            raise ValueError(
+                "SamplerConfig.geom_name не задан. Выберите геометрию в S2DR "
+                "или передайте имя явно при создании SamplerConfig."
+            )
         print("\n📂 Поиск файлов геометрии...")
 
         files = self.find_geometry_files()
         if files['domain'] is None:
-            raise FileNotFoundError(f"Файл области не найден в {self.config.geometry_dir}")
+            raise FileNotFoundError(
+                f"Геометрия '{self.config.geom_name}' не найдена в "
+                f"{self.config.geometry_dir}"
+            )
 
         print(f"\n📂 Загрузка области: {os.path.basename(files['domain'])}")
         domain = self._load_coords(files['domain'])

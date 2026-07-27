@@ -33,8 +33,6 @@ class WorkspacePaths:
     geometry_foils_dir: Path
     geometry_domains_dir: Path
     geometry_metadata_dir: Path
-    geom_config_path: Path
-    geom_config_example_path: Path
     foil_geoms_path: Path
     sampling_dir: Path
     sampling_collocation_dir: Path
@@ -69,8 +67,6 @@ def for_project_root(project_root: str | os.PathLike[str] | None = None) -> Work
         geometry_foils_dir=geometry_dir / "foils",
         geometry_domains_dir=geometry_dir / "domains",
         geometry_metadata_dir=geometry_dir / "metadata",
-        geom_config_path=geometry_dir / "geom_config.yaml",
-        geom_config_example_path=geometry_dir / "geom_config.yaml.example",
         foil_geoms_path=geometry_dir / "foil_geoms.yaml",
         sampling_dir=sampling_dir,
         sampling_collocation_dir=sampling_dir / "collocation",
@@ -138,7 +134,6 @@ CONDITIONS_DIR = str(PATHS.conditions_dir)
 GEOMETRY_DOMAINS_DIR = str(PATHS.geometry_domains_dir)
 GEOMETRY_FOILS_DIR = str(PATHS.geometry_foils_dir)
 GEOMETRY_METADATA_DIR = str(PATHS.geometry_metadata_dir)
-GEOM_CONFIG_PATH = str(PATHS.geom_config_path)
 FOIL_GEOMS_PATH = str(PATHS.foil_geoms_path)
 SAMPLING_COLLOCATION_DIR = str(PATHS.sampling_collocation_dir)
 SAMPLING_MESH_DIR = str(PATHS.sampling_mesh_dir)

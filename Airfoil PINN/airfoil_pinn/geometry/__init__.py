@@ -14,7 +14,6 @@ from airfoil_pinn.geometry.core import (
     Geometry2D,
     GeometryConfig,
     g2d,
-    load_geometry_from_config,
 )
 from airfoil_pinn.geometry.sdf import (
     DistanceFieldDiagnostics,
@@ -30,5 +29,4 @@ __all__ = [
     "PolylineDistanceField",
     "differentiable_sdf_for_interior",
     "g2d",
-    "load_geometry_from_config",
 ]

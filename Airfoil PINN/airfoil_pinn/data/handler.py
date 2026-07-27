@@ -29,9 +29,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from scipy.spatial import cKDTree
 
 from airfoil_pinn.app.paths import (
-    GEOM_CONFIG_PATH,
-    GEOMETRY_DOMAINS_DIR,
-    GEOMETRY_METADATA_DIR,
     PATHS,
     SAMPLING_COLLOCATION_DIR,
     resolve_project_path,
@@ -586,7 +583,6 @@ class DataHandler:
         self._load_sampler_point_metadata()
         self._reconcile_geometry_normalization()
         self._log_flow_cases()
-        self.load_mesh_geometry_from_geom_config()
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
         self.dataloader = self._make_dataloader(self.dataset, batch_size=batch_size, shuffle=shuffle)
@@ -1029,88 +1025,6 @@ class DataHandler:
             self.boundary_layer_model,
         )
 
-    def load_mesh_geometry_from_geom_config(self, config_path: str = GEOM_CONFIG_PATH) -> bool:
-        """
-        Загружает контуры домена/профиля для последующих rebuild Mesh2D.
-
-        Новые mesh2d.npz сохраняют эти контуры прямо в файле. Для старых сеток
-        остаётся fallback через geom_config.yaml и сохранённые контуры геометрии.
-        """
-        if self.mesh_domain_coords is not None:
-            return True
-
-        project_dir = PROJECT_ROOT
-        cfg_path = config_path
-        if not os.path.isabs(cfg_path):
-            cfg_path = os.path.join(project_dir, cfg_path)
-        if not os.path.exists(cfg_path):
-            return False
-
-        try:
-            import yaml
-            with open(cfg_path, 'r', encoding='utf-8') as f:
-                cfg = yaml.safe_load(f) or {}
-        except Exception as exc:
-            logger.debug("Не удалось прочитать geom_config.yaml: %s", exc)
-            return False
-
-        geom_name = cfg.get('geom_name')
-        if not geom_name:
-            return False
-
-        def _load_coords(path_base: str) -> Optional[np.ndarray]:
-            for ext in (".npy", ".txt", ".csv"):
-                path = path_base + ext
-                if not os.path.exists(path):
-                    continue
-                if ext == ".npy":
-                    return np.asarray(np.load(path), dtype=np.float64)
-                return np.asarray(np.loadtxt(path, delimiter=',' if ext == ".csv" else None), dtype=np.float64)
-            return None
-
-        search_pairs = [
-            (GEOMETRY_DOMAINS_DIR, GEOMETRY_METADATA_DIR),
-            (
-                os.path.join(project_dir, "Geometry", "Data"),
-                os.path.join(project_dir, "Geometry", "Metadata"),
-            ),
-        ]
-        domain = None
-        foil = None
-        for data_dir, meta_dir in search_pairs:
-            domain = _load_coords(os.path.join(data_dir, f"{geom_name}_domain"))
-            foil = _load_coords(os.path.join(meta_dir, f"{geom_name}_foil"))
-            if foil is None:
-                foil = _load_coords(os.path.join(data_dir, f"{geom_name}_foil"))
-            if domain is not None:
-                break
-
-        if domain is None or len(domain) < 2:
-            return False
-        if len(domain) > 2 and not np.allclose(domain[0], domain[-1], atol=1e-9):
-            domain = np.vstack([domain, domain[0]])
-
-        self.mesh_domain_coords = domain
-        config_foil = foil if foil is not None and len(foil) >= 2 else None
-        if self.mesh_airfoil_coords is None:
-            self.mesh_airfoil_coords = config_foil
-        elif config_foil is not None:
-            sampler_chord = float(np.ptp(self.mesh_airfoil_coords[:, 0]))
-            config_chord = float(np.ptp(config_foil[:, 0]))
-            if not np.isclose(sampler_chord, config_chord, rtol=0.02, atol=1e-12):
-                logger.warning(
-                    "Профиль из текущего geom_config имеет хорду %.6g м, а collocation-точки "
-                    "%.6g м; для диагностики сохранён контур collocation-точек.",
-                    config_chord,
-                    sampler_chord,
-                )
-        logger.info(
-            "Геометрия для FVM rebuild загружена: domain=%d, foil=%s",
-            len(domain),
-            len(self.mesh_airfoil_coords) if self.mesh_airfoil_coords is not None else "нет",
-        )
-        return True
-
     def load_mesh(self, mesh_file: str) -> None:
         """
         Загружает FVM-сетку из файла .npz (созданного mesh2d.Mesh2D.save()).
@@ -1213,11 +1127,10 @@ class DataHandler:
     def build_mesh_from_current_points(self, verbose: bool = False):
         """Строит новую Mesh2D по текущим точкам датасета без графиков и записи на диск."""
         if self.mesh_domain_coords is None:
-            self.load_mesh_geometry_from_geom_config()
-        if self.mesh_domain_coords is None:
             raise RuntimeError(
-                "Нет domain_coords для перестройки FVM-сетки. "
-                "Пересоздайте mesh2d.npz через S2DR или проверьте geom_config.yaml."
+                "В загруженном mesh2d.npz отсутствует domain_coords. "
+                "Пересоздайте сетку через S2DR: актуальный mesh-артефакт должен "
+                "хранить контур расчётной области внутри самого файла."
             )
 
         from airfoil_pinn.sampling.mesh import Mesh2D

@@ -31,7 +31,6 @@ It can:
 - load `.txt`, `.dat`, `.csv`, `.npy` airfoil coordinate files;
 - accept drag-and-drop geometry files;
 - accept manual coordinates in `x y`, `x,y`, or `x; y` form;
-- load from `workspace/geometry/geom_config.yaml`;
 - load from `workspace/geometry/foil_geoms.yaml` when that library exists;
 - detect closed and open profiles;
 - build a domain using `front`, `rear`, `top`, and `bottom`;

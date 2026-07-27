@@ -734,7 +734,6 @@ class MainWindow(QMainWindow):
             "workspace/geometry/foils",
             "External file",
             "Manual input",
-            "workspace/geometry/geom_config.yaml",
             "Foil library",
             "Built-in closed NACA 0012",
             "Built-in NACA 2412",
@@ -1119,10 +1118,6 @@ class MainWindow(QMainWindow):
             elif mode == "Manual input":
                 self._open_manual_coordinates_dialog()
                 return
-            elif mode == "workspace/geometry/geom_config.yaml":
-                self.geometry_session.load_from_config()
-                self._apply_domain_params_to_controls()
-                self._apply_save_format_to_controls()
             elif mode == "Foil library":
                 geom_name = self.library_combo.currentData()
                 if not geom_name:

@@ -45,7 +45,6 @@ except ImportError:
 from airfoil_pinn.app.paths import (
     CONDITIONS_DIR,
     FLUIDS_DIR,
-    GEOM_CONFIG_PATH,
     GEOMETRY_DOMAINS_DIR,
     GEOMETRY_METADATA_DIR,
     INITIAL_FIELDS_DIR,
@@ -345,58 +344,127 @@ class Initializer:
                 logger.debug("Не удалось загрузить координаты из %s: %s", path, exc)
         return None
 
-    @staticmethod
-    def _current_geom_name() -> Optional[str]:
-        cfg_path = GEOM_CONFIG_PATH
-        if not os.path.exists(cfg_path):
-            return None
+    def _sampler_metadata_matches_points(self) -> bool:
+        """Проверяет, что companion metadata относится к загруженному массиву."""
+        if not isinstance(self.sampler_metadata, dict):
+            return False
+        expected_count = self.sampler_metadata.get("num_points")
+        if expected_count is None or self.points is None:
+            return True
         try:
-            import yaml
-            with open(cfg_path, 'r', encoding='utf-8') as f:
-                cfg = yaml.safe_load(f) or {}
-            geom_name = cfg.get('geom_name')
-            return str(geom_name) if geom_name else None
-        except Exception as exc:
-            logger.debug("Не удалось прочитать geom_config.yaml: %s", exc)
+            matches = int(expected_count) == len(self.points)
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            logger.warning(
+                "Companion metadata содержит num_points=%r, а загружено %d точек; "
+                "геометрические ссылки из metadata игнорируются.",
+                expected_count,
+                len(self.points),
+            )
+        return matches
+
+    def _sampler_geom_name(self) -> Optional[str]:
+        """
+        Возвращает имя геометрии, записанное вместе с текущими collocation-точками.
+
+        Имя берётся только из companion metadata загруженного массива. Это
+        исключает смешивание точек одного расчёта с геометрией другого расчёта.
+        """
+        if not self._sampler_metadata_matches_points():
             return None
 
+        reference = extract_geometry_reference(self.sampler_metadata)
+        candidates = (
+            reference.get("geom_name") if reference is not None else None,
+            self.sampler_metadata.get("geom_name"),
+        )
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            geom_name = str(candidate).strip()
+            if not geom_name:
+                continue
+            if os.path.basename(geom_name) != geom_name:
+                logger.warning(
+                    "Некорректное geom_name в metadata collocation-точек: %r",
+                    geom_name,
+                )
+                return None
+            return geom_name
+        return None
+
     def _load_geometry_coords(self, suffix: str) -> Optional[np.ndarray]:
-        geom_name = self._current_geom_name()
+        """Загружает только артефакт геометрии, связанный с текущим sampler metadata."""
+        if suffix not in {"domain", "foil"}:
+            raise ValueError(f"Неизвестный тип геометрического артефакта: {suffix!r}")
+
+        geom_name = self._sampler_geom_name()
+        if not geom_name:
+            return None
+
         search_dirs = [self.geometry_dir]
         metadata_dir = GEOMETRY_METADATA_DIR
         if suffix == "foil":
             search_dirs.append(metadata_dir)
 
-        if geom_name:
-            for directory in search_dirs:
-                coords = self._load_coords(os.path.join(directory, f"{geom_name}_{suffix}"))
-                if coords is not None:
-                    return coords
-
-        pattern = os.path.join(self.geometry_dir, f"*_{suffix}.*")
-        files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-        for path in files:
-            base, _ = os.path.splitext(path)
-            coords = self._load_coords(base)
+        for directory in search_dirs:
+            coords = self._load_coords(os.path.join(directory, f"{geom_name}_{suffix}"))
             if coords is not None:
                 return coords
         return None
 
+    def _domain_coords_from_sampler_bounds(self) -> Optional[np.ndarray]:
+        """Восстанавливает прямоугольник домена из metadata текущих точек."""
+        if not self._sampler_metadata_matches_points():
+            return None
+        bounds = self.sampler_metadata.get("bounds")
+        if not isinstance(bounds, dict):
+            return None
+        try:
+            x_min = float(bounds["x_min"])
+            x_max = float(bounds["x_max"])
+            y_min = float(bounds["y_min"])
+            y_max = float(bounds["y_max"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        values = np.asarray([x_min, x_max, y_min, y_max], dtype=np.float64)
+        if not np.all(np.isfinite(values)) or x_max <= x_min or y_max <= y_min:
+            return None
+        return np.asarray(
+            [
+                [x_min, y_min],
+                [x_max, y_min],
+                [x_max, y_max],
+                [x_min, y_max],
+                [x_min, y_min],
+            ],
+            dtype=np.float64,
+        )
+
     def load_domain_coords(self) -> None:
         """Загружает контур расчётного домена для маски визуализации."""
         data = self._load_geometry_coords("domain")
+        source = "именного артефакта геометрии"
+        if data is None:
+            data = self._domain_coords_from_sampler_bounds()
+            source = "bounds текущих collocation metadata"
         if data is not None:
             if len(data) > 2 and not np.allclose(data[0], data[-1], atol=1e-12):
                 data = np.vstack([data, data[0]])
             self.domain_coords = data
-            logger.info("Загружены координаты домена для визуализации.")
+            logger.info("Координаты домена для визуализации получены из %s.", source)
 
     def load_foil_coords(self) -> None:
         """Загружает координаты профиля/пластины для визуализации."""
         data = self._load_geometry_coords("foil")
+        source = "именного артефакта геометрии"
+        if data is None and self.wall_points is not None and len(self.wall_points) >= 2:
+            data = np.asarray(self.wall_points, dtype=np.float64)
+            source = "WALL-точек текущего collocation-массива"
         if data is not None:
             self.foil_coords = data
-            logger.info("Загружены координаты профиля для визуализации.")
+            logger.info("Координаты профиля для визуализации получены из %s.", source)
 
     def _load_chord_from_metadata(self) -> float:
         """Определяет хорду из артефактов, связанных с загруженными точками."""
@@ -429,8 +497,8 @@ class Initializer:
                 len(self.points) if self.points is not None else "нет",
             )
 
-        # WALL-точки принадлежат тому же массиву, поэтому это безопаснее, чем
-        # metadata другой геометрии из изменённого после сэмплинга geom_config.
+        # WALL-точки принадлежат тому же массиву, поэтому не могут незаметно
+        # подменить геометрический масштаб артефактом другого расчёта.
         if self.wall_points is not None and len(self.wall_points) >= 2:
             wall_reference = build_geometry_reference(self.wall_points)
             if wall_reference is not None:
@@ -447,7 +515,7 @@ class Initializer:
 
         metadata_dir = GEOMETRY_METADATA_DIR
         search_dirs = [metadata_dir, self.geometry_dir]
-        geom_name = self._current_geom_name()
+        geom_name = self._sampler_geom_name()
         meta_files: List[str] = []
 
         if geom_name:
@@ -455,15 +523,6 @@ class Initializer:
                 path = os.path.join(directory, f"{geom_name}_metadata.npy")
                 if os.path.exists(path):
                     meta_files.append(path)
-
-        if not meta_files:
-            seen = set()
-            for directory in search_dirs:
-                for path in glob.glob(os.path.join(directory, "*_metadata.npy")):
-                    if path not in seen:
-                        meta_files.append(path)
-                        seen.add(path)
-            meta_files.sort(key=os.path.getmtime, reverse=True)
 
         for meta_path in meta_files:
             try:

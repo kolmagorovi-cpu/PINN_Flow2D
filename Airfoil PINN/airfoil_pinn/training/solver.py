@@ -965,8 +965,6 @@ class PINNSolver:
             y_np = self.data_handler.dataset.y.cpu().numpy().flatten() * self.data_handler.chord
             residual_src = getattr(self.trainer, 'point_pde_residual', self.trainer.point_residual)
             residual = residual_src.numpy()
-            if getattr(self.data_handler, 'mesh_domain_coords', None) is None:
-                self.data_handler.load_mesh_geometry_from_geom_config()
             clip_polygon = getattr(self.data_handler, 'mesh_domain_coords', None)
             airfoil_polyline = getattr(self.data_handler, 'mesh_airfoil_coords', None)
             outline_polylines = [airfoil_polyline] if airfoil_polyline is not None else None

@@ -760,11 +760,6 @@ class Visualizer:
         v_np = v_plot.cpu().numpy().flatten()
         p_np = p_plot.cpu().numpy().flatten()
 
-        if (
-            getattr(data_handler, 'mesh_domain_coords', None) is None
-            and hasattr(data_handler, 'load_mesh_geometry_from_geom_config')
-        ):
-            data_handler.load_mesh_geometry_from_geom_config()
         geom_scale = 1.0 if plot_physical else 1.0 / float(getattr(data_handler, 'chord', 1.0) or 1.0)
         clip_polygon = self._scale_geometry_for_plot(
             getattr(data_handler, 'mesh_domain_coords', None),

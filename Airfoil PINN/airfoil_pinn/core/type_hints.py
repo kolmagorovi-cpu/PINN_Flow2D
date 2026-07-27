@@ -45,20 +45,6 @@ class GeometryConfigDict(TypedDict):
     verbose: bool
 
 
-class GeomConfigFileParamsDict(TypedDict, total=False):
-    """
-    Параметры для загрузки геометрии из файла.
-
-    Attributes:
-        source_type: Тип источника ('file' или 'inline' для профиля, 'config' или 'file' для тройника)
-        file_path: Путь к файлу с геометрией
-        file_format: Формат файла ('csv', 'txt', 'dat', 'npy', 'step', 'iges')
-    """
-    source_type: Literal['file', 'inline', 'config']
-    file_path: str
-    file_format: str
-
-
 class AirfoilDomainParamsDict(TypedDict, total=False):
     """
     Параметры расчётной области для профиля.
@@ -198,6 +184,8 @@ class SamplerConfigDict(TypedDict, total=False):
         sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all', 'normal_layer')
         adaptive_alpha: Степень сгущения (для адаптивных методов)
         adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
+        geom_type: Тип геометрии
+        geom_name: Явное имя геометрического артефакта
     """
     num_processes: int
     step_size: float
@@ -236,6 +224,8 @@ class SamplerConfigDict(TypedDict, total=False):
     normal_layer_min_point_distance_factor: float
     normal_layer_max_points: Optional[int]
     normal_layer_fill_remaining: bool
+    geom_type: str
+    geom_name: Optional[str]
 
 
 # =============================================================================
@@ -675,7 +665,6 @@ class L2ErrorDict(TypedDict):
 __all__ = [
     # Геометрия
     'GeometryConfigDict',
-    'GeomConfigFileParamsDict',
     'AirfoilDomainParamsDict',
     'AirfoilParamsDict',
     'DomainParamsDict',

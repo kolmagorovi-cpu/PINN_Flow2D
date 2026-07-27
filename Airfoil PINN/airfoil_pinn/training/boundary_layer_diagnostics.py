@@ -577,12 +577,8 @@ def plot_wall_normal_deficit(path: str, profiles: Dict[str, np.ndarray], foil_no
 
 
 def _load_geometry(data_handler: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Return domain and airfoil geometry, loading metadata if the handler can."""
+    """Return geometry embedded in the active mesh artifact."""
 
-    if getattr(data_handler, "mesh_domain_coords", None) is None or getattr(data_handler, "mesh_airfoil_coords", None) is None:
-        loader = getattr(data_handler, "load_mesh_geometry_from_geom_config", None)
-        if callable(loader):
-            loader()
     domain = getattr(data_handler, "mesh_domain_coords", None)
     foil = getattr(data_handler, "mesh_airfoil_coords", None)
     if domain is None or foil is None:
