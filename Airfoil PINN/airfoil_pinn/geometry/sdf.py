@@ -363,8 +363,8 @@ class PolylineDistanceField(nn.Module):
         nearest: torch.Tensor,
         second_nearest: Optional[torch.Tensor] = None,
         *,
-        absolute_tolerance: float = 1e-7,
-        relative_tolerance: float = 1e-5,
+        absolute_tolerance: float = 1e-12,
+        relative_tolerance: float = 1e-10,
         projection_tolerance: float = 1e-7,
         gradient_tolerance: float = 1e-5,
         nearest_projection: Optional[torch.Tensor] = None,
@@ -458,8 +458,8 @@ class PolylineDistanceField(nn.Module):
         self,
         points: torch.Tensor,
         *,
-        absolute_tie_tolerance: float = 1e-7,
-        relative_tie_tolerance: float = 1e-5,
+        absolute_tie_tolerance: float = 1e-12,
+        relative_tie_tolerance: float = 1e-10,
     ) -> DistanceFieldDiagnostics:
         """Evaluate distance, Eikonal norm and tie fraction on sample points."""
         sample = points.detach().clone().requires_grad_(True)

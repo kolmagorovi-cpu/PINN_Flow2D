@@ -843,7 +843,7 @@ class Visualizer:
 
         plt.figure(figsize=(10, 6))
         for x, (y, u) in profiles.items():
-            plt.plot(u, y, label=f'x = {x:.3f} м')
+            plt.plot(u, y, label=f'x/c = {x:.3f}')
         plt.xlabel('u, м/с')
         plt.ylabel('y, м')
         plt.title(f'Профили скорости в сечениях - {self.config_name}')

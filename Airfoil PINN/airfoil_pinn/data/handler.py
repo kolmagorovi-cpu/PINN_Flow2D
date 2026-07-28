@@ -1573,7 +1573,7 @@ class DataHandler:
         logger.info("DataHandler восстановлен из чекпоинта: %d точек", self.n_points)
 
     # ------------------------------------------------------------------
-    # Методы для диагностики (с фильтрацией по y)
+    # Методы для диагностики профилей и границ
     # ------------------------------------------------------------------
     def get_points_by_type(self, type_name: str) -> Dict[str, torch.Tensor]:
         """
@@ -1645,57 +1645,676 @@ class DataHandler:
         u_vals: Optional[torch.Tensor] = None,
         y_grid: Optional[torch.Tensor] = None,
         num_points: int = 100,
-        y_max_ratio: float = 0.95
+        y_max_ratio: float = 0.95,
+        case_id: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Интерполирует профиль u(y) в сечении x = x_target (нормированное).
+        Интерполирует профиль ``u(y)`` строго на линии ``x=x_target``.
+
+        Если загружена FVM-сетка, значения сначала однозначно сопоставляются
+        её узлам, после чего используется кусочно-линейная интерполяция по
+        исходным треугольникам. Поэтому профиль не смешивает точки из широкой
+        полосы по X, а область внутри профиля остаётся замаскированной.
 
         Args:
             x_target: Целевая X-координата (нормированная)
             u_vals: Значения скорости U (если None, используются начальные значения)
             y_grid: Сетка по Y для интерполяции
             num_points: Количество точек для равномерной сетки
-            y_max_ratio: Доля от y_max для ограничения по Y
+            y_max_ratio: Доля полной высоты области, симметрично относительно
+                её середины
+            case_id: Индекс режима для параметрического датасета
 
         Returns:
             Кортеж (y_coords, u_interp) – массивы numpy
         """
-        tol = 0.05 * (self.x_max - self.x_min)
-        # Выбираем точки, близкие к x_target
-        mask_x = torch.abs(self.dataset.x.flatten() - x_target) < tol
-        # Ограничение по y
-        y_limit = y_max_ratio * self.y_max
-        mask_y = self.dataset.y.flatten() < y_limit
-        mask = mask_x & mask_y
+        source = self.dataset.u_target if u_vals is None else u_vals
+        if self.mesh_data is not None:
+            node_values = self._dataset_values_on_mesh_nodes(
+                source,
+                case_id=case_id,
+            )
+            return self.interpolate_fvm_profile(
+                x_target,
+                node_values,
+                y_grid=y_grid,
+                num_points=num_points,
+                y_max_ratio=y_max_ratio,
+            )
 
-        if mask.sum() == 0:
-            logger.warning(f"Нет точек в сечении x={x_target} (tol={tol:.4f}), пропускаем интерполяцию.")
-            if y_grid is None:
-                y_grid = np.linspace(self.y_min, y_limit, num_points)
-            return y_grid, np.full_like(y_grid, np.nan)
+        logger.warning(
+            "Точная профильная интерполяция x=%.6g недоступна без "
+            "FVM-треугольников; используется узкий scattered fallback.",
+            x_target,
+        )
+        return self._interpolate_profile_without_mesh(
+            x_target,
+            source,
+            y_grid=y_grid,
+            num_points=num_points,
+            y_max_ratio=y_max_ratio,
+            case_id=case_id,
+        )
 
-        if mask.sum() < 3:
-            logger.warning(f"Мало точек в сечении x={x_target} после ограничения y<{y_limit:.3f}, интерполяция может быть неточной.")
+    def interpolate_fvm_profile(
+        self,
+        x_target: float,
+        node_values: Any,
+        y_grid: Optional[Any] = None,
+        num_points: int = 100,
+        y_max_ratio: float = 0.95,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample a nodal FVM field on the exact vertical line ``x=x_target``."""
+        if self.mesh_data is None:
+            raise RuntimeError(
+                "interpolate_fvm_profile requires a loaded FVM mesh"
+            )
+        if not 0.0 < float(y_max_ratio) <= 1.0:
+            raise ValueError("y_max_ratio must be in the interval (0, 1]")
+        if int(num_points) < 2:
+            raise ValueError("num_points must be at least 2")
 
-        y_vals = self.dataset.y[mask].cpu().numpy().flatten()
+        values = (
+            node_values.detach().cpu().numpy()
+            if torch.is_tensor(node_values)
+            else np.asarray(node_values)
+        )
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if values.size != self.mesh_data.n_nodes:
+            raise ValueError(
+                "node_values length does not match the FVM mesh: "
+                f"{values.size} != {self.mesh_data.n_nodes}"
+            )
 
-        if u_vals is not None:
-            # Используем переданные значения (предсказания)
-            u_vals_np = u_vals[mask].cpu().numpy().flatten()
-        else:
-            # Используем начальные значения (u_target) – для обратной совместимости
-            u_vals_np = self.dataset.u_target[mask].cpu().numpy().flatten()
-
-        # Сортируем по y
-        sort_idx = np.argsort(y_vals)
-        y_sorted = y_vals[sort_idx]
-        u_sorted = u_vals_np[sort_idx]
-
-        # Если нужна равномерная сетка
+        triangulation = self._get_profile_triangulation()
+        coords_norm = (
+            np.asarray(self.mesh_data.coords, dtype=np.float64)
+            / float(self.chord)
+        )
+        y_min = float(np.min(coords_norm[:, 1]))
+        y_max = float(np.max(coords_norm[:, 1]))
         if y_grid is None:
-            y_grid = np.linspace(self.y_min, y_limit, num_points)
-        u_interp = np.interp(y_grid, y_sorted, u_sorted, left=np.nan, right=np.nan)
-        # Заполняем NaN ближайшими значениями (экстраполяция)
-        if np.any(np.isnan(u_interp)):
-            u_interp = np.interp(y_grid, y_sorted, u_sorted, left=u_sorted[0], right=u_sorted[-1])
-        return y_grid, u_interp
+            centre = 0.5 * (y_min + y_max)
+            half_height = (
+                0.5 * float(y_max_ratio) * (y_max - y_min)
+            )
+            y_query = np.linspace(
+                centre - half_height,
+                centre + half_height,
+                int(num_points),
+                dtype=np.float64,
+            )
+        else:
+            y_query = (
+                y_grid.detach().cpu().numpy()
+                if torch.is_tensor(y_grid)
+                else np.asarray(y_grid)
+            )
+            y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+
+        x_query = np.full_like(y_query, float(x_target))
+        nodes, weights, valid = self._get_profile_stencil(
+            triangulation,
+            x_query,
+            y_query,
+        )
+        sampled = np.full(y_query.shape, np.nan, dtype=np.float64)
+        if bool(np.any(valid)):
+            sampled[valid] = np.sum(
+                values[nodes[valid]] * weights[valid],
+                axis=1,
+            )
+        return y_query, sampled
+
+    def integrate_fvm_vertical_flux(
+        self,
+        x_target: float,
+        node_values: Any,
+    ) -> float:
+        """Exactly integrate a piecewise-linear nodal field on ``x=x_target``.
+
+        The vertical line is split at every intersected triangle edge.  Each
+        fluid interval therefore lies in one triangle and the trapezoidal
+        integral is exact for the mesh's linear interpolant.  Intervals inside
+        an airfoil hole or outside the domain are omitted.
+        """
+        if self.mesh_data is None:
+            raise RuntimeError(
+                "integrate_fvm_vertical_flux requires a loaded FVM mesh"
+            )
+        values = (
+            node_values.detach().cpu().numpy()
+            if torch.is_tensor(node_values)
+            else np.asarray(node_values)
+        )
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if values.size != self.mesh_data.n_nodes:
+            raise ValueError(
+                "node_values length does not match the FVM mesh: "
+                f"{values.size} != {self.mesh_data.n_nodes}"
+            )
+
+        triangulation = self._get_profile_triangulation()
+        (
+            nodes,
+            lower_weights,
+            upper_weights,
+            interval_heights,
+        ) = self._get_vertical_integration_stencil(
+            triangulation,
+            float(x_target),
+        )
+        if interval_heights.size == 0:
+            return float("nan")
+        lower_values = np.sum(
+            values[nodes] * lower_weights,
+            axis=1,
+        )
+        upper_values = np.sum(
+            values[nodes] * upper_weights,
+            axis=1,
+        )
+        return float(
+            np.sum(
+                0.5
+                * (lower_values + upper_values)
+                * interval_heights
+            )
+        )
+
+    def _get_profile_triangulation(self):
+        """Return a cached Matplotlib triangulation in chord coordinates."""
+        if self.mesh_data is None:
+            raise RuntimeError("FVM mesh is not loaded")
+        cache_key = (
+            id(self.mesh_data.coords),
+            id(self.mesh_data.triangles),
+            float(self.chord),
+        )
+        cached = getattr(self, "_profile_triangulation_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        import matplotlib.tri as mtri
+
+        coords = (
+            np.asarray(self.mesh_data.coords, dtype=np.float64)
+            / float(self.chord)
+        )
+        triangulation = mtri.Triangulation(
+            coords[:, 0],
+            coords[:, 1],
+            np.asarray(self.mesh_data.triangles, dtype=np.int32),
+        )
+        # A rebuilt adaptive mesh invalidates every geometry-only profile
+        # stencil.  Resetting here also prevents stale cache growth across RAR
+        # remeshing events.
+        self._profile_stencil_cache = {}
+        self._vertical_integration_stencil_cache = {}
+        self._profile_mesh_index_cache = None
+        self._profile_triangulation_cache = (
+            cache_key,
+            triangulation,
+        )
+        return triangulation
+
+    def _get_profile_stencil(
+        self,
+        triangulation,
+        x_query: np.ndarray,
+        y_query: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build/cache triangle nodes and barycentric weights for a query line."""
+        x_query = np.asarray(x_query, dtype=np.float64).reshape(-1)
+        y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+        if x_query.shape != y_query.shape:
+            raise ValueError("x_query and y_query must have equal shapes")
+
+        stencil_key = (
+            id(triangulation),
+            x_query.tobytes(),
+            y_query.tobytes(),
+        )
+        cache = getattr(self, "_profile_stencil_cache", None)
+        if cache is None:
+            cache = {}
+            self._profile_stencil_cache = cache
+        cached = cache.get(stencil_key)
+        if cached is not None:
+            return cached
+
+        triangle_ids = np.asarray(
+            triangulation.get_trifinder()(x_query, y_query),
+            dtype=np.int64,
+        )
+        valid = triangle_ids >= 0
+        nodes = np.zeros((x_query.size, 3), dtype=np.int64)
+        weights = np.zeros((x_query.size, 3), dtype=np.float64)
+        if bool(np.any(valid)):
+            valid_nodes = np.asarray(
+                triangulation.triangles[triangle_ids[valid]],
+                dtype=np.int64,
+            )
+            nodes[valid] = valid_nodes
+            x_vertices = np.asarray(
+                triangulation.x[valid_nodes],
+                dtype=np.float64,
+            )
+            y_vertices = np.asarray(
+                triangulation.y[valid_nodes],
+                dtype=np.float64,
+            )
+            x_points = x_query[valid]
+            y_points = y_query[valid]
+            denominator = (
+                (y_vertices[:, 1] - y_vertices[:, 2])
+                * (x_vertices[:, 0] - x_vertices[:, 2])
+                + (x_vertices[:, 2] - x_vertices[:, 1])
+                * (y_vertices[:, 0] - y_vertices[:, 2])
+            )
+            nondegenerate = np.abs(denominator) > np.finfo(
+                np.float64
+            ).eps
+            if not bool(np.all(nondegenerate)):
+                valid_positions = np.flatnonzero(valid)
+                valid[valid_positions[~nondegenerate]] = False
+                valid_nodes = valid_nodes[nondegenerate]
+                x_vertices = x_vertices[nondegenerate]
+                y_vertices = y_vertices[nondegenerate]
+                x_points = x_points[nondegenerate]
+                y_points = y_points[nondegenerate]
+                denominator = denominator[nondegenerate]
+
+            w0 = (
+                (y_vertices[:, 1] - y_vertices[:, 2])
+                * (x_points - x_vertices[:, 2])
+                + (x_vertices[:, 2] - x_vertices[:, 1])
+                * (y_points - y_vertices[:, 2])
+            ) / denominator
+            w1 = (
+                (y_vertices[:, 2] - y_vertices[:, 0])
+                * (x_points - x_vertices[:, 2])
+                + (x_vertices[:, 0] - x_vertices[:, 2])
+                * (y_points - y_vertices[:, 2])
+            ) / denominator
+            valid_weights = np.column_stack(
+                (w0, w1, 1.0 - w0 - w1)
+            )
+            weights[valid] = valid_weights
+
+        result = (nodes, weights, valid)
+        cache[stencil_key] = result
+        return result
+
+    def _get_vertical_integration_stencil(
+        self,
+        triangulation,
+        x_target: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Cache exact linear-integration intervals for one vertical cut."""
+        cache_key = (id(triangulation), float(x_target))
+        cache = getattr(
+            self,
+            "_vertical_integration_stencil_cache",
+            None,
+        )
+        if cache is None:
+            cache = {}
+            self._vertical_integration_stencil_cache = cache
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        triangle_nodes = np.asarray(
+            triangulation.triangles,
+            dtype=np.int64,
+        )
+        edge_start = triangle_nodes[:, [0, 1, 2]].reshape(-1)
+        edge_end = triangle_nodes[:, [1, 2, 0]].reshape(-1)
+        x0 = np.asarray(
+            triangulation.x[edge_start],
+            dtype=np.float64,
+        )
+        y0 = np.asarray(
+            triangulation.y[edge_start],
+            dtype=np.float64,
+        )
+        x1 = np.asarray(
+            triangulation.x[edge_end],
+            dtype=np.float64,
+        )
+        y1 = np.asarray(
+            triangulation.y[edge_end],
+            dtype=np.float64,
+        )
+        coordinate_scale = max(
+            1.0,
+            float(
+                np.max(
+                    np.abs(
+                        np.concatenate(
+                            (
+                                np.asarray(
+                                    triangulation.x,
+                                    dtype=np.float64,
+                                ),
+                                np.asarray(
+                                    triangulation.y,
+                                    dtype=np.float64,
+                                ),
+                            )
+                        )
+                    )
+                )
+            ),
+        )
+        tolerance = 1e-12 * coordinate_scale
+        dx = x1 - x0
+        nonvertical = np.abs(dx) > tolerance
+        parameter = np.zeros_like(dx)
+        parameter[nonvertical] = (
+            (float(x_target) - x0[nonvertical])
+            / dx[nonvertical]
+        )
+        crosses = (
+            nonvertical
+            & (parameter >= -tolerance)
+            & (parameter <= 1.0 + tolerance)
+        )
+        intersections = [
+            y0[crosses]
+            + parameter[crosses] * (y1[crosses] - y0[crosses])
+        ]
+        coincident = (
+            ~nonvertical
+            & (np.abs(x0 - float(x_target)) <= tolerance)
+        )
+        if bool(np.any(coincident)):
+            intersections.extend(
+                (y0[coincident], y1[coincident])
+            )
+        y_intersections = np.concatenate(intersections)
+        y_intersections = y_intersections[
+            np.isfinite(y_intersections)
+        ]
+        y_intersections.sort()
+        if y_intersections.size < 2:
+            empty_nodes = np.empty((0, 3), dtype=np.int64)
+            empty_weights = np.empty((0, 3), dtype=np.float64)
+            result = (
+                empty_nodes,
+                empty_weights,
+                empty_weights.copy(),
+                np.empty(0, dtype=np.float64),
+            )
+            cache[cache_key] = result
+            return result
+
+        keep = np.concatenate(
+            (
+                np.array([True]),
+                np.diff(y_intersections) > tolerance,
+            )
+        )
+        breakpoints = y_intersections[keep]
+        lower = breakpoints[:-1]
+        upper = breakpoints[1:]
+        heights = upper - lower
+        nonempty = heights > tolerance
+        lower = lower[nonempty]
+        upper = upper[nonempty]
+        heights = heights[nonempty]
+        midpoint = 0.5 * (lower + upper)
+        triangle_ids = np.asarray(
+            triangulation.get_trifinder()(
+                np.full_like(midpoint, float(x_target)),
+                midpoint,
+            ),
+            dtype=np.int64,
+        )
+        fluid = triangle_ids >= 0
+        lower = lower[fluid]
+        upper = upper[fluid]
+        heights = heights[fluid]
+        nodes = np.asarray(
+            triangulation.triangles[triangle_ids[fluid]],
+            dtype=np.int64,
+        )
+        x_values = np.full(lower.shape, float(x_target))
+        lower_weights = self._barycentric_weights(
+            triangulation,
+            nodes,
+            x_values,
+            lower,
+        )
+        upper_weights = self._barycentric_weights(
+            triangulation,
+            nodes,
+            x_values,
+            upper,
+        )
+        result = (
+            nodes,
+            lower_weights,
+            upper_weights,
+            heights,
+        )
+        cache[cache_key] = result
+        return result
+
+    @staticmethod
+    def _barycentric_weights(
+        triangulation,
+        nodes: np.ndarray,
+        x_query: np.ndarray,
+        y_query: np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate barycentric weights in explicitly selected triangles."""
+        nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+        x_query = np.asarray(x_query, dtype=np.float64).reshape(-1)
+        y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+        x_vertices = np.asarray(
+            triangulation.x[nodes],
+            dtype=np.float64,
+        )
+        y_vertices = np.asarray(
+            triangulation.y[nodes],
+            dtype=np.float64,
+        )
+        denominator = (
+            (y_vertices[:, 1] - y_vertices[:, 2])
+            * (x_vertices[:, 0] - x_vertices[:, 2])
+            + (x_vertices[:, 2] - x_vertices[:, 1])
+            * (y_vertices[:, 0] - y_vertices[:, 2])
+        )
+        if bool(
+            np.any(
+                np.abs(denominator)
+                <= np.finfo(np.float64).eps
+            )
+        ):
+            raise RuntimeError(
+                "Degenerate triangle in vertical integration stencil"
+            )
+        w0 = (
+            (y_vertices[:, 1] - y_vertices[:, 2])
+            * (x_query - x_vertices[:, 2])
+            + (x_vertices[:, 2] - x_vertices[:, 1])
+            * (y_query - y_vertices[:, 2])
+        ) / denominator
+        w1 = (
+            (y_vertices[:, 2] - y_vertices[:, 0])
+            * (x_query - x_vertices[:, 2])
+            + (x_vertices[:, 0] - x_vertices[:, 2])
+            * (y_query - y_vertices[:, 2])
+        ) / denominator
+        return np.column_stack((w0, w1, 1.0 - w0 - w1))
+
+    def _dataset_values_on_mesh_nodes(
+        self,
+        values: Any,
+        *,
+        case_id: int,
+    ) -> np.ndarray:
+        """Map dataset-ordered values to FVM-node order by physical position."""
+        if self.mesh_data is None:
+            raise RuntimeError("FVM mesh is not loaded")
+        values_np = (
+            values.detach().cpu().numpy()
+            if torch.is_tensor(values)
+            else np.asarray(values)
+        )
+        values_np = np.asarray(values_np, dtype=np.float64).reshape(-1)
+        if values_np.size != self.dataset.n_points:
+            raise ValueError(
+                "Profile values must follow dataset order: "
+                f"{values_np.size} != {self.dataset.n_points}"
+            )
+
+        case_ids = getattr(self.dataset, "case_id", None)
+        if case_ids is None:
+            selected = np.ones(self.dataset.n_points, dtype=bool)
+        else:
+            selected = (
+                case_ids.detach().cpu().numpy().reshape(-1)
+                == int(case_id)
+            )
+        if not bool(np.any(selected)):
+            raise ValueError(f"case_id={case_id} is absent from the dataset")
+
+        mesh_x = getattr(self.dataset, "mesh_x_phys", None)
+        mesh_y = getattr(self.dataset, "mesh_y_phys", None)
+        if mesh_x is None or mesh_y is None:
+            dataset_coords = np.column_stack(
+                (
+                    self.dataset.x.detach().cpu().numpy().reshape(-1),
+                    self.dataset.y.detach().cpu().numpy().reshape(-1),
+                )
+            ) * float(self.chord)
+        else:
+            dataset_coords = np.column_stack(
+                (
+                    mesh_x.detach().cpu().numpy().reshape(-1),
+                    mesh_y.detach().cpu().numpy().reshape(-1),
+                )
+            )
+        dataset_coords = np.asarray(
+            dataset_coords[selected],
+            dtype=np.float64,
+        )
+        selected_values = values_np[selected]
+
+        cache_key = (
+            id(self.mesh_data.coords),
+            id(self.dataset.x),
+            int(self.dataset.n_points),
+            int(case_id),
+        )
+        cached = getattr(self, "_profile_mesh_index_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            node_indices = cached[1]
+        else:
+            tree = cKDTree(dataset_coords)
+            distances, node_indices = tree.query(
+                np.asarray(self.mesh_data.coords, dtype=np.float64),
+                k=1,
+            )
+            coordinate_scale = max(
+                1.0,
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(
+                                self.mesh_data.coords,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                ),
+            )
+            tolerance = 1e-10 * coordinate_scale
+            max_distance = float(np.max(distances))
+            if max_distance > tolerance:
+                raise RuntimeError(
+                    "Cannot map profile values to every FVM node: "
+                    f"max coordinate mismatch={max_distance:.3e}, "
+                    f"tolerance={tolerance:.3e}"
+                )
+            node_indices = np.asarray(node_indices, dtype=np.int64)
+            self._profile_mesh_index_cache = (
+                cache_key,
+                node_indices,
+            )
+        return selected_values[node_indices]
+
+    def _interpolate_profile_without_mesh(
+        self,
+        x_target: float,
+        values: Any,
+        *,
+        y_grid: Optional[Any],
+        num_points: int,
+        y_max_ratio: float,
+        case_id: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Compatibility fallback for legacy point clouds without triangles."""
+        if not 0.0 < float(y_max_ratio) <= 1.0:
+            raise ValueError("y_max_ratio must be in the interval (0, 1]")
+        x = self.dataset.x.detach().cpu().numpy().reshape(-1)
+        y = self.dataset.y.detach().cpu().numpy().reshape(-1)
+        values_np = (
+            values.detach().cpu().numpy()
+            if torch.is_tensor(values)
+            else np.asarray(values)
+        )
+        values_np = np.asarray(values_np, dtype=np.float64).reshape(-1)
+        case_ids = getattr(self.dataset, "case_id", None)
+        if case_ids is not None:
+            case_mask = (
+                case_ids.detach().cpu().numpy().reshape(-1)
+                == int(case_id)
+            )
+        else:
+            case_mask = np.ones_like(x, dtype=bool)
+
+        distance = np.abs(x - float(x_target))
+        available = distance[case_mask]
+        if available.size == 0:
+            raise ValueError(f"case_id={case_id} is absent from the dataset")
+        nearest = float(np.min(available))
+        x_span = max(float(np.max(x) - np.min(x)), 1.0)
+        tolerance = max(nearest + 1e-12, 2.5e-3 * x_span)
+        mask = case_mask & (distance <= tolerance)
+
+        y_min = float(np.min(y))
+        y_max = float(np.max(y))
+        centre = 0.5 * (y_min + y_max)
+        half_height = 0.5 * float(y_max_ratio) * (y_max - y_min)
+        if y_grid is None:
+            y_query = np.linspace(
+                centre - half_height,
+                centre + half_height,
+                int(num_points),
+                dtype=np.float64,
+            )
+        else:
+            y_query = (
+                y_grid.detach().cpu().numpy()
+                if torch.is_tensor(y_grid)
+                else np.asarray(y_grid)
+            )
+            y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+        if int(np.count_nonzero(mask)) < 2:
+            return y_query, np.full_like(y_query, np.nan)
+
+        order = np.argsort(y[mask])
+        y_sorted = y[mask][order]
+        value_sorted = values_np[mask][order]
+        sampled = np.interp(
+            y_query,
+            y_sorted,
+            value_sorted,
+            left=np.nan,
+            right=np.nan,
+        )
+        return y_query, sampled

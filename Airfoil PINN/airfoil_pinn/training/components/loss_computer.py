@@ -178,8 +178,8 @@ class LossComputer:
         )
         self.sdf_module: Optional[PolylineDistanceField] = None
         self.sdf_geometry_fingerprint: Optional[str] = None
-        self.sdf_absolute_tie_tolerance = 1e-7
-        self.sdf_relative_tie_tolerance = 1e-5
+        self.sdf_absolute_tie_tolerance = 1e-12
+        self.sdf_relative_tie_tolerance = 1e-10
         self.sdf_float64_consistency_tolerance = float(
             (self.config.get('sdf', {}) or {}).get(
                 'float64_consistency_tolerance',
@@ -281,10 +281,10 @@ class LossComputer:
         sdf_cfg = self.config.get('sdf', {}) or {}
         chunk_size = int(sdf_cfg.get('segment_chunk_size', 256))
         self.sdf_absolute_tie_tolerance = float(
-            sdf_cfg.get('absolute_tie_tolerance', 1e-7)
+            sdf_cfg.get('absolute_tie_tolerance', 1e-12)
         )
         self.sdf_relative_tie_tolerance = float(
-            sdf_cfg.get('relative_tie_tolerance', 1e-5)
+            sdf_cfg.get('relative_tie_tolerance', 1e-10)
         )
         if (
             self.sdf_absolute_tie_tolerance < 0.0

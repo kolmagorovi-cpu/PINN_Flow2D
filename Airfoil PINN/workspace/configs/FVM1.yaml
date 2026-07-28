@@ -100,6 +100,18 @@ diagnostics:
   compute_ntk_condition: false
   interval: 50
   mass_metrics_interval: 1
+  section_flow:
+    enabled: true
+    sections:
+    - -5.0
+    - -1.0
+    - 1.001
+    - 1.2
+    - 1.5
+    - 2.0
+    - 3.0
+    - 5.0
+    - 10.0
   plot_2d_spectrum: false
   plot_profiles: true
   plot_rar_error_map: true
@@ -193,9 +205,9 @@ project_name: fvm1
 reference:
   path: null
 sdf:
-  absolute_tie_tolerance: 1.0e-07
+  absolute_tie_tolerance: 1.0e-12
   float64_consistency_tolerance: 1.0e-12
-  relative_tie_tolerance: 1.0e-05
+  relative_tie_tolerance: 1.0e-10
   segment_chunk_size: 256
 training:
   batch_size: 5000

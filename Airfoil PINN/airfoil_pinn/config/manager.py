@@ -73,8 +73,8 @@ class ConfigManager:
             },
             'sdf': {
                 'segment_chunk_size': 256,
-                'absolute_tie_tolerance': 1e-7,
-                'relative_tie_tolerance': 1e-5,
+                'absolute_tie_tolerance': 1e-12,
+                'relative_tie_tolerance': 1e-10,
                 'float64_consistency_tolerance': 1e-12,
             },
             'boundary_conditions': {
@@ -264,6 +264,10 @@ class ConfigManager:
                 'strict_autograd': True,
                 'save_rar_history': True,
                 'mass_metrics_interval': 1,
+                'section_flow': {
+                    'enabled': True,
+                    'sections': [0.2, 0.5, 0.8],
+                },
                 'boundary_layer': {
                     'enabled': False,
                     'interval': 50,

@@ -415,6 +415,51 @@ class PolylineDistanceFieldTests(unittest.TestCase):
         self.assertGreaterEqual(coverage, 0.95)
         self.assertTrue(bool(near_wall_pde.any()))
 
+    def test_reduced_tolerances_preserve_real_fvm_mesh_coverage(self) -> None:
+        """Reduced float64 tolerances must not erase coherent mesh regions."""
+        root = Path(__file__).resolve().parents[1]
+        contour_path = next(
+            (
+                root / "workspace" / "geometry" / "foils"
+            ).glob("NACA 0012*.txt")
+        )
+        contour = np.loadtxt(contour_path, dtype=np.float64)
+        if np.allclose(contour[0], contour[-1]):
+            contour = contour[:-1]
+        field = PolylineDistanceField(
+            contour,
+            closed=True,
+            segment_chunk_size=256,
+        )
+
+        mesh_path = root / "workspace" / "sampling" / "mesh" / "mesh2d.npz"
+        with np.load(mesh_path, allow_pickle=False) as mesh:
+            # A deterministic quarter of the full production mesh is enough
+            # to catch the previous percent-level over-masking regression.
+            coords = np.asarray(mesh["coords"], dtype=np.float64)[::4]
+        query = torch.tensor(coords, dtype=torch.float64)
+
+        reduced = field.tie_mask(
+            query,
+            absolute_tolerance=1e-12,
+            relative_tolerance=1e-10,
+        )
+        previous = field.tie_mask(
+            query,
+            absolute_tolerance=1e-7,
+            relative_tolerance=1e-5,
+        )
+        reduced_fraction = float(
+            reduced.to(torch.float64).mean()
+        )
+        previous_fraction = float(
+            previous.to(torch.float64).mean()
+        )
+
+        self.assertLess(reduced_fraction, 1e-3)
+        self.assertGreater(previous_fraction, 1e-2)
+        self.assertGreater(previous_fraction, 20.0 * reduced_fraction)
+
 
 if __name__ == "__main__":
     unittest.main()

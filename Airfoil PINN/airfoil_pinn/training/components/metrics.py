@@ -66,6 +66,20 @@ class MetricsCollector:
         self.logs_dir = logs_dir
         self.config_name = config_name
         self.reference_data = reference_data
+        diagnostics_config = config.get("diagnostics", {}) or {}
+        section_flow_config = (
+            diagnostics_config.get("section_flow", {}) or {}
+        )
+        self.section_flow_enabled = bool(
+            section_flow_config.get("enabled", True)
+        )
+        self.section_flow_sections = tuple(
+            float(value)
+            for value in section_flow_config.get(
+                "sections",
+                diagnostics_config.get("profile_sections", ()),
+            )
+        )
 
         # История обучения (расширенная)
         self.history = {
@@ -358,7 +372,11 @@ class MetricsCollector:
         self._last_avg_epoch = -1
         self._last_mass_epoch = -1
 
-    def get_mass_flow_metrics(self, epoch: int, interval: int = 1) -> Dict[str, float]:
+    def get_mass_flow_metrics(
+        self,
+        epoch: int,
+        interval: int = 1,
+    ) -> Dict[str, Any]:
         """
         Возвращает интегральный баланс массы через inlet/outlet.
 
@@ -371,7 +389,7 @@ class MetricsCollector:
             self._last_mass_epoch = epoch
         return dict(self._cached_mass_metrics)
 
-    def _compute_mass_flow_metrics(self) -> Dict[str, float]:
+    def _compute_mass_flow_metrics(self) -> Dict[str, Any]:
         result = self._compute_mass_flow_from_fvm_faces()
         if result is None:
             result = self._compute_mass_flow_from_boundary_points()
@@ -460,7 +478,9 @@ class MetricsCollector:
                 u = torch.where(mask, torch.zeros_like(u), u)
         return u, v
 
-    def _compute_mass_flow_from_fvm_faces(self) -> Optional[Dict[str, float]]:
+    def _compute_mass_flow_from_fvm_faces(
+        self,
+    ) -> Optional[Dict[str, Any]]:
         fvm = self.loss_computer.fvm
         if fvm is None:
             return None
@@ -519,7 +539,7 @@ class MetricsCollector:
                         else 0.0
                     )
                     denominator = abs(q_in) + 1e-12
-                    case_metrics[int(case_id)] = {
+                    values = {
                         "mass_flux_in": q_in,
                         "mass_flux_out": q_out,
                         "mass_balance_error": (
@@ -528,6 +548,13 @@ class MetricsCollector:
                             else 0.0
                         ),
                     }
+                    values.update(
+                        self._compute_section_flow_metrics(
+                            velocity,
+                            reference_flux=q_in,
+                        )
+                    )
+                    case_metrics[int(case_id)] = values
         finally:
             if was_training:
                 self.model.train()
@@ -540,10 +567,240 @@ class MetricsCollector:
                 "mass_balance_error",
             )
         }
+        section_maps = [
+            values["section_volume_flux"]
+            for values in case_metrics.values()
+            if values.get("section_volume_flux")
+        ]
+        unavailable_sections = sorted(
+            {
+                section
+                for values in case_metrics.values()
+                for section in values.get(
+                    "section_volume_flux_unavailable",
+                    (),
+                )
+            },
+            key=float,
+        )
+        if unavailable_sections:
+            result["section_volume_flux_unavailable"] = (
+                unavailable_sections
+            )
+        if section_maps:
+            result["section_volume_flux_normalization"] = (
+                "Q/(U_inf*c)=integral((u/U_inf), d(y/c))"
+            )
+            common_sections = set(section_maps[0])
+            for section_map in section_maps[1:]:
+                common_sections.intersection_update(section_map)
+            result["section_volume_flux"] = {
+                section: float(
+                    np.mean(
+                        [
+                            section_map[section]
+                            for section_map in section_maps
+                        ]
+                    )
+                )
+                for section in sorted(
+                    common_sections,
+                    key=float,
+                )
+            }
+            relative_maps = [
+                values["section_volume_flux_relative_error"]
+                for values in case_metrics.values()
+                if values.get("section_volume_flux_relative_error")
+            ]
+            result["section_volume_flux_relative_error"] = {
+                section: float(
+                    np.mean(
+                        [
+                            section_map[section]
+                            for section_map in relative_maps
+                            if section in section_map
+                        ]
+                    )
+                )
+                for section in sorted(
+                    common_sections,
+                    key=float,
+                )
+            }
+            deviation_maps = [
+                values["section_volume_flux_relative_deviation"]
+                for values in case_metrics.values()
+                if values.get(
+                    "section_volume_flux_relative_deviation"
+                )
+            ]
+            result["section_volume_flux_relative_deviation"] = {
+                section: float(
+                    np.mean(
+                        [
+                            section_map[section]
+                            for section_map in deviation_maps
+                            if section in section_map
+                        ]
+                    )
+                )
+                for section in sorted(
+                    common_sections,
+                    key=float,
+                )
+            }
+            result["section_volume_flux_relative_spread"] = float(
+                np.mean(
+                    [
+                        values[
+                            "section_volume_flux_relative_spread"
+                        ]
+                        for values in case_metrics.values()
+                        if (
+                            "section_volume_flux_relative_spread"
+                            in values
+                        )
+                    ]
+                )
+            )
+            result["section_volume_flux_max_relative_error"] = float(
+                np.mean(
+                    [
+                        values[
+                            "section_volume_flux_max_relative_error"
+                        ]
+                        for values in case_metrics.values()
+                        if (
+                            "section_volume_flux_max_relative_error"
+                            in values
+                        )
+                    ]
+                )
+            )
         for case_id, values in case_metrics.items():
             for key, value in values.items():
                 result[f"{key}_case_{case_id}"] = value
         return result
+
+    def _compute_section_flow_metrics(
+        self,
+        velocity: torch.Tensor,
+        *,
+        reference_flux: float,
+    ) -> Dict[str, Any]:
+        """Integrate ``u`` on exact vertical cuts through the FVM mesh."""
+        if (
+            not self.section_flow_enabled
+            or not self.section_flow_sections
+            or self.data_handler.mesh_data is None
+            or getattr(
+                getattr(self, "loss_computer", None),
+                "flow_type",
+                "2d",
+            )
+            == "axisymmetric"
+        ):
+            return {}
+
+        u_nodes = (
+            velocity[:, 0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
+        section_fluxes: Dict[str, float] = {}
+        unavailable_sections: List[str] = []
+        for x_section in self.section_flow_sections:
+            flux = self.data_handler.integrate_fvm_vertical_flux(
+                x_section,
+                u_nodes,
+            )
+            if np.isfinite(flux):
+                section_fluxes[
+                    self._format_section_coordinate(x_section)
+                ] = float(flux)
+            else:
+                unavailable_sections.append(
+                    self._format_section_coordinate(x_section)
+                )
+
+        if not section_fluxes:
+            return {
+                "section_volume_flux": {},
+                "section_volume_flux_unavailable": (
+                    unavailable_sections
+                ),
+            }
+        denominator = abs(float(reference_flux)) + 1e-12
+        relative_errors = {
+            section: abs(flux - float(reference_flux)) / denominator
+            for section, flux in section_fluxes.items()
+        }
+        relative_deviations = {
+            section: (flux - float(reference_flux)) / denominator
+            for section, flux in section_fluxes.items()
+        }
+        flux_values = np.asarray(
+            list(section_fluxes.values()),
+            dtype=np.float64,
+        )
+        relative_spread = (
+            float(np.ptp(flux_values) / denominator)
+            if flux_values.size > 1
+            else 0.0
+        )
+        return {
+            "section_volume_flux": section_fluxes,
+            "section_volume_flux_unavailable": unavailable_sections,
+            "section_volume_flux_relative_error": relative_errors,
+            "section_volume_flux_relative_deviation": (
+                relative_deviations
+            ),
+            "section_volume_flux_relative_spread": relative_spread,
+            "section_volume_flux_max_relative_error": float(
+                max(relative_errors.values(), default=0.0)
+            ),
+        }
+
+    @staticmethod
+    def _format_section_coordinate(value: float) -> str:
+        """Return a stable compact JSON key for a section coordinate."""
+        return f"{float(value):.12g}"
+
+    @staticmethod
+    def format_section_flow_log(
+        metrics: Dict[str, Any],
+    ) -> Optional[str]:
+        """Format exact section-flow diagnostics for the text run log."""
+        section_fluxes = metrics.get("section_volume_flux", {})
+        unavailable = metrics.get(
+            "section_volume_flux_unavailable",
+            (),
+        )
+        if not section_fluxes and not unavailable:
+            return None
+        parts = [
+            f"Q*(x/c={section})={value:.6g}"
+            for section, value in section_fluxes.items()
+        ]
+        line = (
+            "   section Q*=integral(u* d(y/c)): "
+            + (", ".join(parts) if parts else "no valid sections")
+        )
+        if section_fluxes:
+            line += (
+                "; relative spread="
+                f"{metrics.get('section_volume_flux_relative_spread', 0.0):.3e}"
+                "; max relative error vs inlet="
+                f"{metrics.get('section_volume_flux_max_relative_error', 0.0):.3e}"
+            )
+        if unavailable:
+            line += "; unavailable x/c=" + ",".join(
+                str(section) for section in unavailable
+            )
+        return line
 
     @staticmethod
     def _trapz_integral(values: np.ndarray, tangent: np.ndarray) -> float:
@@ -554,7 +811,9 @@ class MetricsCollector:
         tangent = tangent[order]
         if values.size == 1:
             return float(values[0])
-        trapezoid = getattr(np, 'trapezoid', np.trapz)
+        trapezoid = getattr(np, 'trapezoid', None)
+        if trapezoid is None:
+            trapezoid = np.trapz
         return float(trapezoid(values, tangent))
 
     def _compute_mass_flow_from_boundary_points(self) -> Dict[str, float]:

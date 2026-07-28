@@ -586,6 +586,7 @@ class DiagnosticsConfigDict(TypedDict, total=False):
     strict_autograd: bool
     save_rar_history: bool
     mass_metrics_interval: int
+    section_flow: Dict[str, Any]
 
 
 class FullConfigDict(TypedDict, total=False):

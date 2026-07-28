@@ -984,13 +984,14 @@ class PINNSolver:
                     outline_polylines=outline_polylines,
                 )
 
-        # 2. Профили скорости в нескольких сечениях с фильтрацией по y
+        # 2. Профили скорости на точных вертикальных сечениях x/c=const.
         if self.diagnostics_config.get('plot_profiles', True) and pred_norm is not None:
             u_pred_norm = pred_norm['u_norm']  # одномерный массив numpy
             profiles = {}
             for x_sec in self.profile_sections:
-                x_norm = x_sec  # profile_sections — уже нормированные доли хорды (0..1)
-                # Передаём предсказанные значения u_norm в interpolate_profile
+                # profile_sections задаются как x/c и могут лежать до/после
+                # профиля, например -1 и 5.
+                x_norm = x_sec
                 y_grid, u_interp_norm = self.data_handler.interpolate_profile(
                     x_norm,
                     u_vals=torch.from_numpy(u_pred_norm).to(dtype=self.dtype),
@@ -1014,7 +1015,7 @@ class PINNSolver:
                 num_points=256,
                 y_max_ratio=self.profile_y_max_ratio
             )
-            if not np.all(np.isnan(u_interp_norm)):
+            if np.all(np.isfinite(u_interp_norm)):
                 self.visualizer.plot_1d_spectrum(
                     y_grid * self.data_handler.chord,
                     u_interp_norm * self.data_handler.U_inf,
@@ -1023,7 +1024,11 @@ class PINNSolver:
                     x_section=x_sec * self.data_handler.chord
                 )
             else:
-                logger.warning(f"1D спектр пропущен: нет данных в сечении x={x_sec}.")
+                logger.warning(
+                    "1D спектр пропущен: сечение x=%s выходит за сетку "
+                    "или пересекает твёрдое тело; FFT через разрыв не определён.",
+                    x_sec,
+                )
 
         # 4. Двумерный спектр (если включено) – с фильтрацией граничных точек
         if self.plot_2d_spectrum and pred_norm is not None:
@@ -1448,6 +1453,9 @@ class PINNSolver:
                     f"avg u_outlet = {avg_u_out:.4f} (норм.), "
                     f"mass err = {mass_metrics['mass_balance_error']:.3e}"
                 )
+                section_line = self.metrics.format_section_flow_log(
+                    mass_metrics
+                )
                 mse_text = ", ".join(
                     f"{name}={value:.2e}"
                     for name, value in pde_raw.items()
@@ -1474,6 +1482,8 @@ class PINNSolver:
                     f"fvm_rms={self.trainer._last_fvm_rms:.2e}"
                 )
                 self.metrics.save_log(line2)
+                if section_line is not None:
+                    self.metrics.save_log(section_line)
 
                 # Сохранение чекпоинта
                 checkpoint_interval = self.config['checkpoint']['interval']
