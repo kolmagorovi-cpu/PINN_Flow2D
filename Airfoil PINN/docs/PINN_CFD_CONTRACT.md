@@ -227,6 +227,10 @@ contract.
 +\mathcal L_{\mathrm{extra}}.
 \]
 
+- Все оптимизируемые компоненты имеют квадратичную семантику: это средний
+  квадрат скалярной невязки либо средний квадрат евклидовой нормы векторной
+  невязки. RMS вычисляется только как диагностический `sqrt(MSE)` и не входит
+  в `total loss`.
 - PDE использует pointwise \(1/Re_c\) того же `case_id`, что и вход сети.
 - Pressure gauge вычисляется отдельно для каждого `case_id`, затем
   усредняется между случаями. `pressure_gauge_weight` строго положителен,
@@ -341,8 +345,9 @@ Runtime validation после загрузки данных проверяет:
 
 В `logs/run_manifest.json` сохраняются эффективный контракт, версии runtime,
 устройство, dtype, размеры модели и DataLoader. `logs/epochs.jsonl` содержит
-строгий JSON по каждой эпохе: loss-компоненты, нормы градиента, mass/FVM
-метрики, learning rate и времена. Запись `NaN`/`Inf` в telemetry запрещена.
+строгий JSON по каждой эпохе: раздельные `*_mse` и `*_rms` для PDE, BC,
+pressure gauge, integral/FVM, нормы градиента, mass/FVM-метрики, learning rate
+и времена. Запись `NaN`/`Inf` в telemetry запрещена.
 
 `output.progress_bar` включает tqdm в интерактивном терминале;
 `progress_bar_force` предназначен для явного включения вне TTY. Sampling и

@@ -18,6 +18,7 @@
 """
 
 import logging
+import math
 import os
 import random
 from collections import deque
@@ -168,6 +169,8 @@ class Trainer:
         self._last_fvm_rms = 0.0
         self._last_fvm_evaluations = 0
         self._last_integral_loss = 0.0
+        self._last_pressure_gauge_mse = 0.0
+        self._last_pressure_gauge_loss = 0.0
         self._rar_fvm_rebuild_counter = 0
         self._rar_new_points_since_fvm = 0
         self._rar_step_counter = 0
@@ -307,6 +310,10 @@ class Trainer:
         pde_mask = interior_pde_mask & sdf_pde_mask
         pde_candidate_count = int(interior_pde_mask.sum().detach().cpu())
         pde_point_count = int(pde_mask.sum().detach().cpu())
+        pde_counts = {
+            component: pde_point_count
+            for component in self.loss_computer.pde_components
+        }
         pde_coverage = (
             float(pde_point_count / pde_candidate_count)
             if pde_candidate_count > 0
@@ -325,7 +332,8 @@ class Trainer:
             torch.where(pde_mask, pde_score, torch.zeros_like(pde_score)),
         )
 
-        # Средние и максимальные значения для отчёта
+        # MSE и максимальные квадраты невязок для отчёта. Корни берутся только
+        # в диагностике, никогда в оптимизируемой функции потерь.
         pde_raw = {
             'cont': self._masked_mean(cont, pde_mask).item(),
             self.loss_computer.pde_components[1]: self._masked_mean(mom1, pde_mask).item(),
@@ -377,6 +385,25 @@ class Trainer:
                 normal_x=normal_x,
                 normal_y=normal_y,
             )
+            bc_counts = {}
+            for boundary_index, boundary_name in enumerate(
+                self.data_handler.boundary_type_names
+            ):
+                boundary_config = self.loss_computer.boundary_conditions.get(
+                    boundary_name,
+                    {"enforcement": "soft"},
+                )
+                if boundary_config.get("enforcement", "soft") == "hard":
+                    bc_counts[boundary_name] = 0
+                    continue
+                boundary_mask = (
+                    bt[:, boundary_index].view(-1, 1) > 0.5
+                    if bt is not None and boundary_index < bt.shape[1]
+                    else torch.zeros_like(cont, dtype=torch.bool)
+                )
+                bc_counts[boundary_name] = int(
+                    boundary_mask.sum().detach().cpu()
+                )
             # Если SA-веса применяются к BC, используем только их; иначе — фиксированные веса
             if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
                 bc_loss = self._compute_sa_bc_loss(
@@ -398,6 +425,7 @@ class Trainer:
                 ) + extra_grad
         else:
             bc_comp = {}
+            bc_counts = {}
             # Создаём нулевой тензор, который требует градиент (чтобы избежать ошибок в диагностике)
             bc_loss = torch.zeros(1, device=self.device, dtype=self.dtype, requires_grad=True).squeeze()
 
@@ -542,12 +570,17 @@ class Trainer:
         return {
             'total': total_loss,
             'pde_raw': pde_raw,
+            'pde_mse': pde_raw,
             'pde_max': pde_max,
+            'pde_counts': pde_counts,
             'bc_comp': {k: v.item() for k, v in bc_comp.items()},
+            'bc_mse': {k: v.item() for k, v in bc_comp.items()},
+            'bc_counts': bc_counts,
             'extra_grad': extra_grad.item() if self.loss_computer.bc_type != 'hard' else 0.0,
             'integral_loss': integral_raw_t.item() if torch.is_tensor(integral_raw_t) else integral_raw_t,
             'fvm_loss': fvm_loss_val,
             'fvm_raw_loss': fvm_raw_val,
+            'fvm_mse': fvm_raw_val,
             'fvm_weighted_loss': fvm_loss_val,
             'fvm_rms': fvm_rms_val,
             'pressure_gauge_raw': pressure_gauge_raw.item(),
@@ -1230,6 +1263,8 @@ class Trainer:
             'last_fvm_rms': self._last_fvm_rms,
             'last_fvm_evaluations': self._last_fvm_evaluations,
             'last_integral_loss': self._last_integral_loss,
+            'last_pressure_gauge_mse': self._last_pressure_gauge_mse,
+            'last_pressure_gauge_loss': self._last_pressure_gauge_loss,
             'rar_fvm_rebuild_counter': self._rar_fvm_rebuild_counter,
             'rar_new_points_since_fvm': self._rar_new_points_since_fvm,
             'rar_step_counter': self._rar_step_counter,
@@ -1284,6 +1319,18 @@ class Trainer:
             state.get('last_fvm_evaluations', self._last_fvm_evaluations)
         )
         self._last_integral_loss = float(state.get('last_integral_loss', self._last_integral_loss))
+        self._last_pressure_gauge_mse = float(
+            state.get(
+                'last_pressure_gauge_mse',
+                self._last_pressure_gauge_mse,
+            )
+        )
+        self._last_pressure_gauge_loss = float(
+            state.get(
+                'last_pressure_gauge_loss',
+                self._last_pressure_gauge_loss,
+            )
+        )
         self._rar_fvm_rebuild_counter = int(state.get('rar_fvm_rebuild_counter', self._rar_fvm_rebuild_counter))
         self._rar_new_points_since_fvm = int(state.get('rar_new_points_since_fvm', self._rar_new_points_since_fvm))
         self._rar_step_counter = int(state.get('rar_step_counter', self._rar_step_counter))
@@ -2080,15 +2127,21 @@ class Trainer:
         return {
             'total': fwd['total'].item(),
             'pde_raw': fwd['pde_raw'],
+            'pde_mse': fwd['pde_mse'],
             'pde_max': fwd['pde_max'],
+            'pde_counts': fwd['pde_counts'],
             'bc_comp': fwd['bc_comp'],
+            'bc_mse': fwd['bc_mse'],
+            'bc_counts': fwd['bc_counts'],
             'extra_grad': fwd['extra_grad'],
             'integral_loss': fwd['integral_loss'],
             'fvm_loss': fwd.get('fvm_loss', 0.0),
             'fvm_raw_loss': fwd.get('fvm_raw_loss', 0.0),
+            'fvm_mse': fwd.get('fvm_mse', 0.0),
             'fvm_weighted_loss': fwd.get('fvm_weighted_loss', 0.0),
             'fvm_rms': fwd.get('fvm_rms', 0.0),
             'pressure_gauge_loss': fwd['pressure_gauge_loss'],
+            'pressure_gauge_mse': fwd['pressure_gauge_raw'],
             'pde_coverage': fwd['pde_coverage'],
             'wall_speed': fwd['wall_speed'],
             'grad_norm': grad_norm
@@ -2129,18 +2182,28 @@ class Trainer:
         # Инициализация накопителей
         epoch_losses = {
             'total': 0.0,
-            'pde_raw': {c: 0.0 for c in self.loss_computer.pde_components},
+            'pde_squared_error_sum': {
+                c: 0.0 for c in self.loss_computer.pde_components
+            },
+            'pde_count': {c: 0 for c in self.loss_computer.pde_components},
             'pde_max': {c: 0.0 for c in self.loss_computer.pde_components},
-            'bc_comp': {b: 0.0 for b in self.data_handler.boundary_type_names} if self.loss_computer.bc_type == 'soft' else {},
+            'bc_squared_error_sum': {
+                b: 0.0 for b in self.data_handler.boundary_type_names
+            } if self.loss_computer.bc_type == 'soft' else {},
+            'bc_count': {
+                b: 0 for b in self.data_handler.boundary_type_names
+            } if self.loss_computer.bc_type == 'soft' else {},
             'extra_grad': 0.0,
             'integral_loss': 0.0,
+            'pressure_gauge_mse_sum': 0.0,
+            'pressure_gauge_loss_sum': 0.0,
             'wall_speed_sum': 0.0,
             'n_wall_batches': 0,
             'grad_norm_sum': 0.0,
             'grad_norm_count': 0,
             'fvm_loss_sum': 0.0,
             'fvm_raw_loss_sum': 0.0,
-            'fvm_rms_sum': 0.0,
+            'fvm_rms_squared_sum': 0.0,
             'fvm_loss_count': 0,
         }
         n_batches = 0
@@ -2183,15 +2246,32 @@ class Trainer:
             )
 
             epoch_losses['total'] += batch_losses['total']
+            pde_counts = batch_losses.get('pde_counts', {})
             for k, v in batch_losses['pde_raw'].items():
-                epoch_losses['pde_raw'][k] += v
+                count = int(pde_counts.get(k, 1))
+                epoch_losses['pde_squared_error_sum'][k] += v * count
+                epoch_losses['pde_count'][k] += count
             for k, v in batch_losses['pde_max'].items():
-                epoch_losses['pde_max'][k] += v
+                epoch_losses['pde_max'][k] = max(
+                    epoch_losses['pde_max'][k],
+                    v,
+                )
             if self.loss_computer.bc_type == 'soft':
+                bc_counts = batch_losses.get('bc_counts', {})
                 for k, v in batch_losses['bc_comp'].items():
-                    epoch_losses['bc_comp'][k] += v
+                    count = int(bc_counts.get(k, 1))
+                    epoch_losses['bc_squared_error_sum'][k] += v * count
+                    epoch_losses['bc_count'][k] += count
                 epoch_losses['extra_grad'] += batch_losses['extra_grad']
             epoch_losses['integral_loss'] += batch_losses['integral_loss']
+            epoch_losses['pressure_gauge_mse_sum'] += batch_losses.get(
+                'pressure_gauge_mse',
+                0.0,
+            )
+            epoch_losses['pressure_gauge_loss_sum'] += batch_losses.get(
+                'pressure_gauge_loss',
+                0.0,
+            )
             if batch_losses['wall_speed'] is not None:
                 epoch_losses['wall_speed_sum'] += batch_losses['wall_speed']
                 epoch_losses['n_wall_batches'] += 1
@@ -2204,7 +2284,9 @@ class Trainer:
                     'fvm_raw_loss',
                     0.0,
                 )
-                epoch_losses['fvm_rms_sum'] += batch_losses.get('fvm_rms', 0.0)
+                epoch_losses['fvm_rms_squared_sum'] += (
+                    batch_losses.get('fvm_rms', 0.0) ** 2
+                )
                 epoch_losses['fvm_loss_count'] += 1
                 self._last_fvm_evaluations += 1
             if add_integral:
@@ -2216,15 +2298,37 @@ class Trainer:
 
         # Усреднение
         avg_loss = epoch_losses['total'] / n_batches
-        avg_pde = {k: v / n_batches for k, v in epoch_losses['pde_raw'].items()}
-        avg_max = {k: v / n_batches for k, v in epoch_losses['pde_max'].items()}
+        avg_pde = {
+            key: (
+                epoch_losses['pde_squared_error_sum'][key]
+                / epoch_losses['pde_count'][key]
+                if epoch_losses['pde_count'][key] > 0
+                else 0.0
+            )
+            for key in self.loss_computer.pde_components
+        }
+        avg_max = dict(epoch_losses['pde_max'])
         if self.loss_computer.bc_type == 'soft':
-            avg_bc = {k: v / n_batches for k, v in epoch_losses['bc_comp'].items()}
+            avg_bc = {
+                key: (
+                    epoch_losses['bc_squared_error_sum'][key]
+                    / epoch_losses['bc_count'][key]
+                    if epoch_losses['bc_count'][key] > 0
+                    else 0.0
+                )
+                for key in self.data_handler.boundary_type_names
+            }
             avg_extra_grad = epoch_losses['extra_grad'] / n_batches
         else:
             avg_bc = {}
             avg_extra_grad = 0.0
         avg_integral = self._last_integral_loss if self.loss_computer.integral_condition else 0.0
+        self._last_pressure_gauge_mse = (
+            epoch_losses['pressure_gauge_mse_sum'] / n_batches
+        )
+        self._last_pressure_gauge_loss = (
+            epoch_losses['pressure_gauge_loss_sum'] / n_batches
+        )
         avg_wall_speed = (epoch_losses['wall_speed_sum'] / epoch_losses['n_wall_batches']
                           if epoch_losses['n_wall_batches'] > 0 else 0.0)
         avg_grad_norm = epoch_losses['grad_norm_sum'] / epoch_losses['grad_norm_count'] if epoch_losses['grad_norm_count'] > 0 else 0.0
@@ -2245,7 +2349,9 @@ class Trainer:
             self._last_fvm_raw_loss = (
                 epoch_losses['fvm_raw_loss_sum'] / count
             )
-            self._last_fvm_rms = epoch_losses['fvm_rms_sum'] / count
+            self._last_fvm_rms = math.sqrt(
+                max(epoch_losses['fvm_rms_squared_sum'] / count, 0.0)
+            )
         else:
             self._last_fvm_loss = 0.0
             self._last_fvm_raw_loss = 0.0
@@ -2278,8 +2384,12 @@ class Trainer:
 
         pde_raw_list = []
         pde_max_list = []
+        pde_count_list = []
         bc_comp_list = []
+        bc_count_list = []
         integral_loss_list = []
+        pressure_gauge_mse_list = []
+        pressure_gauge_loss_list = []
         fvm_loss_list = []
         fvm_raw_loss_list = []
         fvm_rms_list = []
@@ -2302,8 +2412,12 @@ class Trainer:
             nonlocal n_batches, fvm_evaluations
             pde_raw_list.clear()
             pde_max_list.clear()
+            pde_count_list.clear()
             bc_comp_list.clear()
+            bc_count_list.clear()
             integral_loss_list.clear()
+            pressure_gauge_mse_list.clear()
+            pressure_gauge_loss_list.clear()
             fvm_loss_list.clear()
             fvm_raw_loss_list.clear()
             fvm_rms_list.clear()
@@ -2340,11 +2454,15 @@ class Trainer:
 
                 pde_raw_list.append(fwd['pde_raw'])
                 pde_max_list.append(fwd['pde_max'])
+                pde_count_list.append(fwd['pde_counts'])
                 if self.loss_computer.bc_type == 'soft':
                     bc_comp_list.append(fwd['bc_comp'])
+                    bc_count_list.append(fwd['bc_counts'])
                 if add_integral_b:
                     integral_loss_list.append(fwd['integral_loss'])
                     self._last_integral_loss = fwd['integral_loss']
+                pressure_gauge_mse_list.append(fwd['pressure_gauge_raw'])
+                pressure_gauge_loss_list.append(fwd['pressure_gauge_loss'])
                 if fwd['wall_speed'] is not None:
                     wall_speed_list.append(fwd['wall_speed'])
                 if add_fvm_b:
@@ -2379,20 +2497,48 @@ class Trainer:
         avg_pde = {}
         avg_max = {}
         for key in self.loss_computer.pde_components:
-            vals_pde = [d[key] for d in pde_raw_list]
             vals_max = [d[key] for d in pde_max_list]
-            avg_pde[key] = np.mean(vals_pde) if vals_pde else 0.0
-            avg_max[key] = np.mean(vals_max) if vals_max else 0.0
+            squared_error_sum = sum(
+                mse[key] * int(counts.get(key, 1))
+                for mse, counts in zip(pde_raw_list, pde_count_list)
+            )
+            point_count = sum(
+                int(counts.get(key, 1))
+                for counts in pde_count_list
+            )
+            avg_pde[key] = (
+                squared_error_sum / point_count if point_count > 0 else 0.0
+            )
+            avg_max[key] = max(vals_max) if vals_max else 0.0
 
         if self.loss_computer.bc_type == 'soft':
             avg_bc = {}
             for key in self.data_handler.boundary_type_names:
-                vals = [d.get(key, 0.0) for d in bc_comp_list]
-                avg_bc[key] = np.mean(vals) if vals else 0.0
+                squared_error_sum = sum(
+                    mse.get(key, 0.0) * int(counts.get(key, 1))
+                    for mse, counts in zip(bc_comp_list, bc_count_list)
+                )
+                point_count = sum(
+                    int(counts.get(key, 1))
+                    for counts in bc_count_list
+                )
+                avg_bc[key] = (
+                    squared_error_sum / point_count if point_count > 0 else 0.0
+                )
         else:
             avg_bc = {}
 
         avg_integral = np.mean(integral_loss_list) if integral_loss_list else 0.0
+        self._last_pressure_gauge_mse = (
+            float(np.mean(pressure_gauge_mse_list))
+            if pressure_gauge_mse_list
+            else 0.0
+        )
+        self._last_pressure_gauge_loss = (
+            float(np.mean(pressure_gauge_loss_list))
+            if pressure_gauge_loss_list
+            else 0.0
+        )
         avg_wall_speed = np.mean(wall_speed_list) if wall_speed_list else 0.0
         avg_loss = loss.item() if torch.is_tensor(loss) else loss
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
@@ -2401,7 +2547,9 @@ class Trainer:
         if fvm_loss_list:
             self._last_fvm_loss = float(np.mean(fvm_loss_list))
             self._last_fvm_raw_loss = float(np.mean(fvm_raw_loss_list))
-            self._last_fvm_rms = float(np.mean(fvm_rms_list))
+            self._last_fvm_rms = float(
+                np.sqrt(np.mean(np.square(fvm_rms_list)))
+            )
         else:
             self._last_fvm_loss = 0.0
             self._last_fvm_raw_loss = 0.0

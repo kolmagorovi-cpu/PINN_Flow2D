@@ -204,7 +204,7 @@ class ConfigManager:
             },
             'output': {
                 'console_only': True,
-                'progress_bar': True,
+                'progress_bar': False,
                 'progress_bar_force': False,
                 'progress_mininterval': 0.5,
                 'graphical_window': {

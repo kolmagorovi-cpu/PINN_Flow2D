@@ -100,11 +100,13 @@ class Visualizer:
                 line, = ax.plot([], [])
                 self.lines_pde[key] = line
                 ax.set_xlabel('Epoch')
-                ax.set_ylabel('Value')
+                ax.set_ylabel('MSE / loss')
                 ax.set_title(title)
                 ax.set_yscale('log', nonpositive='clip')
                 ax.grid(True)
-            self.fig_pde.suptitle(f'PDE Residuals & Total Loss - {self.config_name}')
+            self.fig_pde.suptitle(
+                f'PDE MSE & Total Loss - {self.config_name}'
+            )
 
             # Окно для граничных условий (6 графиков: Inlet, Outlet, Wall, Symmetry, Axis Symmetry, Wall Speed)
             self.fig_bc, self.axes_bc = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
@@ -115,11 +117,13 @@ class Visualizer:
                 line, = ax.plot([], [])
                 self.lines_bc[title.lower().replace(' ', '_')] = (ax, line)
                 ax.set_xlabel('Epoch')
-                ax.set_ylabel('Value')
+                ax.set_ylabel('MSE / diagnostic')
                 ax.set_title(title)
                 ax.set_yscale('log', nonpositive='clip')
                 ax.grid(True)
-            self.fig_bc.suptitle(f'Boundary Conditions - {self.config_name}')
+            self.fig_bc.suptitle(
+                f'Boundary-condition MSE - {self.config_name}'
+            )
 
             # Окно для диагностики (3 графика: градиенты, средние скорости, ошибка масс)
             self.fig_diag, self.axes_diag = plt.subplots(1, 3, figsize=(18, 4), constrained_layout=True)

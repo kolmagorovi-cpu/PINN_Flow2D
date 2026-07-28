@@ -188,9 +188,10 @@ class FVMObjectiveTests(unittest.TestCase):
             metrics["weighted"],
             25.0 * metrics["raw"],
         )
+        torch.testing.assert_close(metrics["mse"], metrics["raw"])
         torch.testing.assert_close(
             metrics["rms"].square(),
-            metrics["raw"],
+            metrics["mse"],
         )
 
     def test_invalid_volumes_are_rejected_instead_of_clamped(self) -> None:

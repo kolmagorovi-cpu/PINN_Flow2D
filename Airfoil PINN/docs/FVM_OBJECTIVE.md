@@ -1,6 +1,6 @@
-# FVM continuity objective
+# FVM continuity mean-square objective
 
-The canonical FVM loss measures the spatial, volume-weighted L2 norm of the
+The canonical FVM loss is the spatial, volume-weighted mean square of the
 discrete divergence. For control volume `i`,
 
 \[
@@ -11,9 +11,11 @@ L_{\mathrm{FVM}} =
 \frac{\sum_i V_i R_i^2}{\sum_i V_i}.
 \]
 
-The production reduction is named `divergence_l2_volume`. Its square root is
-reported as `fvm_rms`. It has a non-zero, grid-independent limit for a fixed
-non-solenoidal velocity field.
+The production reduction retains the historical name
+`divergence_l2_volume`, but the optimized value is the squared L2 quantity
+(MSE), not its square root. Its square root is reported separately as
+`fvm_rms`. The MSE is exposed as `fvm_mse` (`fvm_raw_loss` remains a
+compatibility alias).
 
 `flux_balance_l2` measures the absolute face-flux imbalance instead:
 
@@ -54,5 +56,5 @@ schedule, interval/probability, mesh identifier and SHA-256 fingerprint,
 normalization rule, and dimensional state. A mismatch rejects exact `resume`;
 an explicitly selected `finetune` still loads model weights only.
 
-Per-epoch telemetry records `fvm_raw_loss`, `fvm_weighted_loss`, `fvm_rms`, and
-`fvm_evaluations` separately.
+Per-epoch telemetry records `fvm_mse`, `fvm_raw_loss`,
+`fvm_weighted_loss`, `fvm_rms`, and `fvm_evaluations` separately.

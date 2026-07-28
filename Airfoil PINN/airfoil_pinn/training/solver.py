@@ -21,6 +21,7 @@ import platform
 import sys
 import time
 import logging
+from collections import deque
 from datetime import datetime
 from typing import Dict, Optional, Union
 
@@ -1176,6 +1177,9 @@ class PINNSolver:
 
         self.start_time = time.time()
         epoch = self.start_epoch  # на случай Ctrl+C до старта цикла
+        epoch_duration_window = deque(maxlen=20)
+        previous_epoch_started_at = None
+        eta_optimizer_name = None
         output_cfg = self.config.get("output", {})
         epoch_progress = build_epoch_progress(
             range(self.start_epoch + 1, epochs + 1),
@@ -1189,6 +1193,11 @@ class PINNSolver:
         try:
             for epoch in epoch_progress:
                 start_time = time.time()
+                if previous_epoch_started_at is not None:
+                    epoch_duration_window.append(
+                        start_time - previous_epoch_started_at
+                    )
+                previous_epoch_started_at = start_time
 
                 # Мониторинг памяти (каждые 10 эпох)
                 if epoch % 10 == 0:
@@ -1217,9 +1226,16 @@ class PINNSolver:
                 extra_diag = {
                     'fvm_loss': self.trainer._last_fvm_loss,
                     'fvm_raw_loss': self.trainer._last_fvm_raw_loss,
+                    'fvm_mse': self.trainer._last_fvm_raw_loss,
                     'fvm_weighted_loss': self.trainer._last_fvm_loss,
                     'fvm_rms': self.trainer._last_fvm_rms,
                     'fvm_evaluations': self.trainer._last_fvm_evaluations,
+                    'pressure_gauge_mse': (
+                        self.trainer._last_pressure_gauge_mse
+                    ),
+                    'pressure_gauge_loss': (
+                        self.trainer._last_pressure_gauge_loss
+                    ),
                 }
                 sample_batch = None
                 if self.sa_weights is not None:
@@ -1316,6 +1332,33 @@ class PINNSolver:
                 learning_rate = float(
                     self.optimizer.param_groups[0]["lr"]
                 )
+                optimizer_name = (
+                    "L-BFGS" if self.using_lbfgs else "Adam"
+                )
+                if optimizer_name != eta_optimizer_name:
+                    epoch_duration_window.clear()
+                    eta_optimizer_name = optimizer_name
+                eta_samples = list(epoch_duration_window)
+                if not eta_samples:
+                    eta_samples.append(epoch_time)
+                smoothed_epoch_seconds = (
+                    sum(eta_samples) / len(eta_samples)
+                )
+                eta_seconds = (
+                    max(epochs - epoch, 0) * smoothed_epoch_seconds
+                )
+                pde_rms = {
+                    name: float(np.sqrt(max(value, 0.0)))
+                    for name, value in pde_raw.items()
+                }
+                boundary_rms = {
+                    name: float(np.sqrt(max(value, 0.0)))
+                    for name, value in bc_comp.items()
+                }
+                pde_max_abs = {
+                    name: float(np.sqrt(max(value, 0.0)))
+                    for name, value in pde_max.items()
+                }
                 self.telemetry.append_epoch(
                     {
                         "epoch": epoch,
@@ -1325,12 +1368,37 @@ class PINNSolver:
                         "learning_rate": learning_rate,
                         "pde_multiplier": pde_mult,
                         "loss": loss,
+                        "pde_mse": pde_raw,
+                        "pde_rms": pde_rms,
+                        "pde_max_abs": pde_max_abs,
+                        # Compatibility aliases; values are MSE and squared max.
                         "pde": pde_raw,
                         "pde_max": pde_max,
+                        "boundary_mse": bc_comp,
+                        "boundary_rms": boundary_rms,
                         "boundary": bc_comp,
                         "integral_loss": integral_loss,
+                        "integral_mse": integral_loss,
+                        "integral_rms": float(
+                            np.sqrt(max(integral_loss, 0.0))
+                        ),
+                        "pressure_gauge_mse": (
+                            self.trainer._last_pressure_gauge_mse
+                        ),
+                        "pressure_gauge_rms": float(
+                            np.sqrt(
+                                max(
+                                    self.trainer._last_pressure_gauge_mse,
+                                    0.0,
+                                )
+                            )
+                        ),
+                        "pressure_gauge_loss": (
+                            self.trainer._last_pressure_gauge_loss
+                        ),
                         "fvm_loss": self.trainer._last_fvm_loss,
                         "fvm_raw_loss": self.trainer._last_fvm_raw_loss,
+                        "fvm_mse": self.trainer._last_fvm_raw_loss,
                         "fvm_weighted_loss": self.trainer._last_fvm_loss,
                         "fvm_rms": self.trainer._last_fvm_rms,
                         "fvm_evaluations": (
@@ -1341,6 +1409,7 @@ class PINNSolver:
                         "diagnostics": extra_diag,
                         "epoch_seconds": epoch_time,
                         "elapsed_seconds": total_time,
+                        "estimated_remaining_seconds": eta_seconds,
                     }
                 )
                 if hasattr(epoch_progress, "set_postfix"):
@@ -1357,15 +1426,53 @@ class PINNSolver:
                     fvm_loss=self.trainer._last_fvm_loss,
                     fvm_raw_loss=self.trainer._last_fvm_raw_loss,
                     fvm_rms=self.trainer._last_fvm_rms,
+                    pressure_gauge_mse=(
+                        self.trainer._last_pressure_gauge_mse
+                    ),
+                    pressure_gauge_loss=(
+                        self.trainer._last_pressure_gauge_loss
+                    ),
+                    optimizer_name=optimizer_name,
+                    learning_rate=learning_rate,
+                    grad_norm=grad_norm,
+                    pde_multiplier=pde_mult,
+                    eta_seconds=eta_seconds,
+                    avg_u_in=avg_u_in,
+                    avg_u_out=avg_u_out,
+                    mass_balance_error=mass_metrics[
+                        "mass_balance_error"
+                    ],
                 )
                 line2 = (
                     f"   avg u_inlet = {avg_u_in:.4f} (норм.), "
                     f"avg u_outlet = {avg_u_out:.4f} (норм.), "
                     f"mass err = {mass_metrics['mass_balance_error']:.3e}"
                 )
-                print(line2)
-                self.metrics.save_log(f"Epoch {epoch}: loss={loss:.2e}, " +
-                                      ", ".join([f"{k}={v:.2e}" for k, v in pde_raw.items()]))
+                mse_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in pde_raw.items()
+                )
+                rms_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in pde_rms.items()
+                )
+                bc_mse_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in bc_comp.items()
+                )
+                bc_rms_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in boundary_rms.items()
+                )
+                self.metrics.save_log(
+                    f"Epoch {epoch}: loss={loss:.2e}, "
+                    f"pde_mse: {mse_text}; pde_rms: {rms_text}; "
+                    f"bc_mse: {bc_mse_text}; bc_rms: {bc_rms_text}; "
+                    f"integral_mse={integral_loss:.2e}; "
+                    f"integral_rms={np.sqrt(max(integral_loss, 0.0)):.2e}; "
+                    f"fvm_mse={self.trainer._last_fvm_raw_loss:.2e}; "
+                    f"fvm_rms={self.trainer._last_fvm_rms:.2e}"
+                )
                 self.metrics.save_log(line2)
 
                 # Сохранение чекпоинта

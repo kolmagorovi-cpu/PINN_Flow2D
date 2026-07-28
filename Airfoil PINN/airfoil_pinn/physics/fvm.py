@@ -471,7 +471,7 @@ class FVMResiduals:
         reduction: str = "divergence_l2_volume",
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Reduce the discrete mass residual to a scalar objective.
+        """Reduce the discrete mass residual to a mean-square objective.
 
         ``divergence_l2_volume`` evaluates
         ``sum(V_i * R_i**2) / sum(V_i)``. ``flux_balance_l2`` evaluates
@@ -547,7 +547,7 @@ class FVMResiduals:
         reduction: str = "divergence_l2_volume",
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute the selected loss and physical RMS from one face pass."""
+        """Compute the selected mean-square loss and physical RMS diagnostic."""
         residual = self.compute_residual(
             u,
             freestream_velocity=freestream_velocity,

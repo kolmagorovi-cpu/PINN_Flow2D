@@ -622,18 +622,24 @@ class LossComputer:
         u_fvm: torch.Tensor,
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Return selected raw loss, configured contribution and divergence RMS."""
+        """Return the FVM mean-square objective and RMS diagnostic.
+
+        ``raw`` is retained as a compatibility alias for ``mse``.  Every
+        supported FVM reduction is quadratic; no square-rooted metric is ever
+        fed into ``total_loss``.
+        """
         if self.fvm is None:
             zero = torch.zeros((), device=self.device, dtype=self.dtype)
-            return {"raw": zero, "weighted": zero, "rms": zero}
-        raw, rms = self.fvm.loss_and_divergence_rms(
+            return {"mse": zero, "raw": zero, "weighted": zero, "rms": zero}
+        mse, rms = self.fvm.loss_and_divergence_rms(
             u_fvm,
             reduction=self.fvm_loss_reduction,
             freestream_velocity=freestream_velocity,
         )
         return {
-            "raw": raw,
-            "weighted": raw * self.fvm_weight,
+            "mse": mse,
+            "raw": mse,
+            "weighted": mse * self.fvm_weight,
             "rms": rms,
         }
 
