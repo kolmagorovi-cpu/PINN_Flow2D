@@ -1,0 +1,7 @@
+{
+    "name": "Глицерин (20°C)",
+    "density": 1260.0,
+    "kinematic_viscosity": 0.001185,
+    "dynamic_viscosity": 1.4931,
+    "description": "Чистый глицерин при 20°C"
+}

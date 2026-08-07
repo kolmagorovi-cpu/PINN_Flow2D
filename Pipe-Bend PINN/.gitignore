@@ -1,61 +1,59 @@
-# Python кэш
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 
-# Виртуальные окружения
+# Virtual environments
 venv/
 env/
 ENV/
-.venv
+.venv/
 
-# IDE
+# IDE and OS files
 .vs/
 .idea/
+.vscode/
+.claude/
 *.swp
 *.swo
 *~
 .DS_Store
 *.suo
+*.vsidx
+*.log
 
-# Логи и чекпоинты
-logs/
-Checkpoints/
-
-# Временные файлы
-*.tmp
-*.temp
-*.bak
-*.backup
-*.old
-
-# Архивы
+# Archives
 *.zip
 *.rar
 *.7z
 *.tar.gz
 
-# Сгенерированные графики
+# Generated numeric and mesh artifacts
+*.msh
+*.npy
+*.npz
 Figure_*.png
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Legacy root-level data folders. They should not reappear after refactoring.
+/Geometry/Data/
+/Geometry/*.png
+/Sampler/Data/
+/Initial/Data/
+/Initial/Plots/
+/Fluids/
+/Conditions/
+/Checkpoints/
+/Configs/
+/workspace/backups/
+/workspace/experiments/
+/workspace/geometry/domains/
+/workspace/geometry/metadata/
+/workspace/initial/
+/workspace/logs/
+/workspace/pictures/
+/workspace/sampling/
 
-# Прочее
-.vscode/
-*.log
+# Штатный конфиг проекта коммитим, несмотря на корневое правило config.yaml
+!workspace/configs/config.yaml
 
-# Данные (сгенерированные файлы)
-Fluids/
-Conditions/
-Configs/
-Geometry/Data/
-Geometry/*.png
-Sampler/Data/
-Initial/Data/
-Initial/Plots/
-Pictures/
-*.msh
-*.npz
-*.csv

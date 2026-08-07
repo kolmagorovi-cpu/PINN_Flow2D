@@ -1,0 +1,118 @@
+# Пример конфигурационного файла для Pipe-Bend PINN
+# (обновлённая версия: данные живут в workspace/)
+
+project_name: pipe_bend
+
+flow_type: planar
+
+architecture:
+  hidden_layers:
+    - 50
+    - 50
+    - 50
+    - 50
+  activation: tanh
+  output_dim: 3
+  output_bias: [0.1, 0.0, 0.0]
+  coordinate_scaling:
+    enabled: false
+    scale_factor: 1.0
+    input_min: -6.0
+    input_max: 6.0
+
+pde:
+  system: incompressible_navier_stokes
+  flow_type: planar
+
+boundary_conditions:
+  type: soft
+
+loss_weights:
+  pde_weights:
+    cont: 10.0
+    mom_x: 10.0
+    mom_y: 10.0
+  bc_weights:
+    inlet: 50.0
+    outlet: 50.0
+    wall: 50.0
+  adaptive_bc: false
+  use_sa_weights: false
+  sa_apply_to_bc: true
+  integral_condition: true
+  integral_weight: 1000000.0
+
+training:
+  epochs: 2000
+  batch_size: 1200
+  gradient_accumulation_steps: 50
+  two_stage: true
+  stage1_epochs: 0
+  stage2_pde_weight_start: 10.0
+  stage2_pde_weight_end: 100.0
+  stage2_ramp_epochs: 500
+  lr_schedule: constant
+  lr_cyclic_period: 100
+  lr_cyclic_amplitude: 0.5
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  reset_interval: 0
+  reset_noise: 0.01
+  grad_clip: null
+  rar_enable: true
+  rar_interval: 100
+  rar_num_points: 200
+  switch_to_lbfgs_epoch: 0
+  lbfgs_max_iter: 20
+  lbfgs_history_size: 100
+  early_stopping:
+    enabled: false
+    patience: 100
+    min_delta: 1e-6
+    restore_best: true
+
+optimizer_params:
+  lr: 0.001
+
+process:
+  load_model_path: null
+  device: auto
+  num_gpus: 1
+  dtype: float32
+  use_amp: true
+  seed: 42
+
+output:
+  console_only: false
+  graphical_window:
+    loss: true
+    pde: true
+    bc: false
+  plot_frequency: 1
+
+data:
+  points_file: workspace/initial/fields/initial.npy
+
+reference:
+  path: null
+
+diagnostics:
+  interval: 50
+  plot_residual_map: true
+  plot_profiles: true
+  profile_sections: [0.2, 0.5, 0.8]
+  plot_spectrum: true
+  spectrum_section_x: 0.5
+  plot_2d_spectrum: false
+  spectrum_2d_resolution: 256
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  save_rar_history: true
+
+enable_key_listener: true
+checkpoint_dir: workspace/experiments
+checkpoint:
+  interval: 100
+  name_pattern: '{project_name}_{timestamp}'
+  model_name_pattern: '{project_name}_{timestamp}'
