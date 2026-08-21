@@ -271,6 +271,11 @@ class Initializer:
                 decay = 1.0
             u_phys = u_base * decay  # параболический профиль * затухание по длине
             v_phys = np.full(N, v_in)
+
+            # ВЫХОД: pressure-outlet. Скорость НЕ задаётся (ни парабола, ни uniform),
+            # профиль на выходе развивается из PDE. Баланс массы обеспечивается
+            # integral_condition в LossComputer. В данных на выходе остаётся
+            # только p = outlet_pressure (p_norm = 0).
         else:
             u_phys = np.full(N, u0)
             v_phys = np.full(N, v_in)
@@ -290,6 +295,10 @@ class Initializer:
                 p_phys = self.conditions.inlet_pressure + slope * (x - x_min)
             else:
                 p_phys = np.full(N, self.conditions.inlet_pressure)
+        # На выходе давление строго равно outlet_pressure (избыточное p_norm = 0)
+        if 'boundary_type' in self.points.dtype.names:
+            outlet_mask = self.points['boundary_type'] == 'outlet'
+            p_phys[outlet_mask] = self.conditions.outlet_pressure
 
         # Нормализация (согласовано с Airfoil PINN: p_norm = Cp = (p - p_ref) / (0.5 * rho * U_inf^2))
         arr_norm['u_norm'] = u_phys / self.U_inf

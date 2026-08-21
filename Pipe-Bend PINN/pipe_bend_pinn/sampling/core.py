@@ -36,8 +36,10 @@ def load_domain(filename: str = "pipe_bend_domain.npy") -> np.ndarray:
 
 
 def generate_collocation(
-    step_size: float = 0.05,
-    num_boundary: int = 200,
+    step_size: float = 0.02,
+    num_boundary: int = 900,
+    n_inlet: int = 100,
+    n_outlet: int = 100,
     bend_radius: float = 1.0,
     pipe_width: float = 0.5,
     domain_filename: str = "pipe_bend_domain.npy",
@@ -45,6 +47,10 @@ def generate_collocation(
 ) -> dict:
     """
     Генерирует точки коллокации (interior + boundary) для области отвода.
+
+    Inlet/outlet грани семплируются явно (n_inlet / n_outlet точек),
+    остальной периметр — равномерно по длине (num_boundary точек, классифицируются).
+    Это даёт плотную дискретизацию входных/выходных сечений (важно для BC-потерь).
 
     Returns:
         Словарь со статистикой: num_points, num_interior, num_boundary, counts.
@@ -64,25 +70,39 @@ def generate_collocation(
     inside = path.contains_points(points)
     interior_points = points[inside]
 
-    # Граничные точки равномерно по периметру
-    line = LineString(domain)
-    total_length = line.length
     boundary_points = []
     boundary_types = []
-    tol = step_size
+    tol = max(step_size, 1e-6)
 
+    # --- Inlet: вертикальная грань x == x_min, y in [y_min, y_min+pipe_width]
+    y_in_lo = y_min
+    y_in_hi = y_min + pipe_width
+    for i in range(n_inlet):
+        yb = y_in_lo + (y_in_hi - y_in_lo) * (i / max(1, n_inlet - 1))
+        boundary_points.append((x_min, float(yb)))
+        boundary_types.append("inlet")
+
+    # --- Outlet: горизонтальная грань y == y_max, x in [x_max-pipe_width, x_max]
+    x_out_lo = x_max - pipe_width
+    x_out_hi = x_max
+    for i in range(n_outlet):
+        xb = x_out_lo + (x_out_hi - x_out_lo) * (i / max(1, n_outlet - 1))
+        boundary_points.append((float(xb), y_max))
+        boundary_types.append("outlet")
+
+    # --- Стены: равномерно по периметру, точки inlet/outlet отбрасываем
+    line = LineString(domain)
+    total_length = line.length
     for i in range(num_boundary):
         distance = i * total_length / num_boundary
         pt = line.interpolate(distance)
         xb, yb = pt.x, pt.y
-        if abs(xb - x_min) < tol and yb < -R_inner:
-            btype = "inlet"
-        elif abs(yb - y_max) < tol and xb > x_min + pipe_width:
-            btype = "outlet"
-        else:
-            btype = "wall"
+        if abs(xb - x_min) < tol and yb < y_in_hi + tol:
+            continue  # уже покрыто явными inlet-точками
+        if abs(yb - y_max) < tol and xb > x_out_lo - tol:
+            continue  # уже покрыто явными outlet-точками
         boundary_points.append((xb, yb))
-        boundary_types.append(btype)
+        boundary_types.append("wall")
 
     all_points_np = np.array(interior_points.tolist() + boundary_points)
     all_types = ["interior"] * len(interior_points) + boundary_types

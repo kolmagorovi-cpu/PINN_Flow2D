@@ -75,11 +75,12 @@ class LossComputer:
 
     def build_input_tensor(self, x: torch.Tensor, y: torch.Tensor,
                            sdf: torch.Tensor, bt: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Формирует входной тензор для модели."""
-        tensors = [x, y, sdf]
-        if bt is not None and bt.shape[1] > 0:
-            tensors.append(bt)
-        return torch.cat(tensors, dim=1)
+        """Формирует входной тензор для модели: только (x, y, sdf).
+
+        boundary_type bt НЕ подаётся на вход сети (чтобы модель не «знала»
+        заранее, где граница), а используется лишь для маскирования BC-потерь.
+        """
+        return torch.cat([x, y, sdf], dim=1)
 
     def compute_loss(self, batch: tuple, model: nn.Module,
                      pde_mult: float = 1.0, sa_weights: Optional[nn.Module] = None) -> dict:
@@ -151,10 +152,22 @@ class LossComputer:
         bc_comp = self._compute_bc_loss(u, v, p, bt, mask_u, mask_v, mask_p,
                                          u_bc, v_bc, p_bc)
 
-        # Взвешенная сумма PDE
-        loss_pde = (self.pde_weights.get('cont', 1.0) * pde_raw['cont'].mean() +
-                    self.pde_weights.get('mom_x', 1.0) * pde_raw['mom_x'].mean() +
-                    self.pde_weights.get('mom_y', 1.0) * pde_raw['mom_y'].mean())
+        # Взвешенная сумма PDE (SA-PINN: per-point веса масштабируют вклад точек)
+        w_cont = self.pde_weights.get('cont', 1.0)
+        w_mom_x = self.pde_weights.get('mom_x', 1.0)
+        w_mom_y = self.pde_weights.get('mom_y', 1.0)
+
+        if sa_weights is not None:
+            sa_out = sa_weights()                     # (N, 3) — per-point веса
+            idx_dev = idx.to(self.device)             # DataLoader отдаёт idx на CPU
+            wb = sa_out[idx_dev]                      # (B, 3) — веса для точек батча
+            loss_pde = (wb[:, 0:1] * w_cont * pde_raw['cont'] +
+                        wb[:, 1:2] * w_mom_x * pde_raw['mom_x'] +
+                        wb[:, 2:3] * w_mom_y * pde_raw['mom_y']).mean()
+        else:
+            loss_pde = (w_cont * pde_raw['cont'].mean() +
+                        w_mom_x * pde_raw['mom_x'].mean() +
+                        w_mom_y * pde_raw['mom_y'].mean())
 
         loss_bc = sum(bc_comp.values())
 
@@ -163,12 +176,6 @@ class LossComputer:
         if self.integral_condition and self.integral_weight > 0:
             integral_loss = self.compute_integral_loss(u, v, bt)
             loss_bc = loss_bc + self.integral_weight * integral_loss
-
-        # SA-weights регуляризация
-        if sa_weights is not None:
-            sa_out = sa_weights()
-            # SA-weights не добавляются напрямую в loss, они масштабируют вклады точек
-            # внутри PDE и BC. Регуляризация не требуется.
 
         loss = pde_mult * loss_pde + loss_bc
 
@@ -232,7 +239,9 @@ class LossComputer:
                 bc_loss[bt_name] = bc_weight * (loss_u + loss_v)
 
             elif bt_name == 'outlet':
-                # outlet: P = P_bc (избыточное давление = 0)
+                # outlet: pressure-outlet, ТОЛЬКО P = P_bc (избыточное = 0).
+                # Скорость на выходе свободна — профиль развивается из PDE.
+                # Баланс массы обеспечивается integral_condition.
                 loss_p_val = ((p_f[bt_mask] - p_bc_f[bt_mask]) ** 2).mean()
                 if not torch.isnan(loss_p_val) and not torch.isinf(loss_p_val):
                     bc_loss[bt_name] = bc_weight * loss_p_val
@@ -267,7 +276,7 @@ class LossComputer:
                     ((v_f[inlet_mask] - v_bc_f[inlet_mask])**2).mean()
                 )
 
-        # OUTLET: используем маску p_fixed
+        # OUTLET: pressure-outlet, только давление p_bc
         if 'outlet' in type_names:
             outlet_mask = mp_f
             if outlet_mask.any():
@@ -309,8 +318,12 @@ class LossComputer:
         """
         Вычисляет интегральное условие баланса масс.
 
-        ∫(u·n) dS = 0 на всех границах (для несжимаемой жидкости).
-        Упрощённая версия: баланс между inlet и outlet.
+        ∫(u·n) dS = 0 на всех границах (несжимаемая жидкость).
+        Нормали (наружу области):
+          - inlet (левая грань x=x_min): n = (-1, 0)  → u·n = -u
+          - outlet (верхняя грань y=y_max): n = (0, +1) → u·n = +v
+        Для канала постоянной ширины условие сводится к
+          mean(u_inlet) == mean(v_outlet).
         """
         if bt is None or bt.shape[1] == 0:
             return torch.tensor(0.0, device=self.device)
@@ -318,22 +331,23 @@ class LossComputer:
         type_names = self.data_handler.boundary_type_names
         integral = torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
-        # Сумма потоков на inlet
+        # Поток через inlet: n=(-1,0), вклад в ∫u·n = -u
         if 'inlet' in type_names:
             inlet_idx = type_names.index('inlet')
             inlet_mask = bt[:, inlet_idx] > 0.5
             if inlet_mask.any():
-                # u - нормальная компонента на inlet (ось x), v - тангенциальная
-                integral = integral + u[inlet_mask, 0].mean()
+                u_in = u[inlet_mask, 0]
+                if torch.isfinite(u_in).all():
+                    integral = integral - u_in.mean()
 
-        # Сумма потоков на outlet
+        # Поток через outlet: n=(0,+1), вклад в ∫u·n = +v
         if 'outlet' in type_names:
             outlet_idx = type_names.index('outlet')
             outlet_mask = bt[:, outlet_idx] > 0.5
             if outlet_mask.any():
-                # На выходе нормаль по y, но для pipe bend нужно учитывать геометрию
-                # Упрощённо: берём v компоненту
-                integral = integral - v[outlet_mask, 0].mean()
+                v_out = v[outlet_mask, 0]
+                if torch.isfinite(v_out).all():
+                    integral = integral + v_out.mean()
 
         return integral ** 2
 

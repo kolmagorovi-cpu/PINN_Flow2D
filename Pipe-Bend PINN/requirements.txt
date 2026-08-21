@@ -1,4 +1,7 @@
-torch>=2.0.0
+# PyTorch с поддержкой CUDA (для NVIDIA RTX 50xx и новее, sm_120):
+# pip install torch --index-url https://download.pytorch.org/whl/cu128
+# CPU-версия: pip install torch
+torch>=2.7.0
 numpy>=1.24.0
 matplotlib>=3.7.0
 scipy>=1.10.0

@@ -1,22 +1,30 @@
-# Пример конфигурационного файла для Pipe-Bend PINN
-# (обновлённая версия: данные живут в workspace/)
+# Конфигурация Pipe-Bend PINN (ламинарный Re=500, pressure-outlet, плотная сетка)
+# Сеть: Fourier features + 6x256 GeLU + residual. Обучение: two-stage + cosine LR (Adam).
 
-project_name: pipe_bend
+project_name: pipe_bend_laminar
 
 flow_type: planar
 
 architecture:
   hidden_layers:
-    - 50
-    - 50
-    - 50
-    - 50
-  activation: tanh
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+  activation: gelu
   output_dim: 3
-  output_bias: [0.1, 0.0, 0.0]
+  output_bias: [0.0, 0.0, 0.0]
+  residual: true
+  fourier_features:
+    enabled: true
+    n_frequencies: 32
+    sigma: 3.0
+    gamma: 1.0
   coordinate_scaling:
-    enabled: false
-    scale_factor: 1.0
+    enabled: true
+    scale_factor: 0.25
     input_min: -6.0
     input_max: 6.0
 
@@ -29,29 +37,31 @@ boundary_conditions:
 
 loss_weights:
   pde_weights:
-    cont: 10.0
-    mom_x: 10.0
-    mom_y: 10.0
+    cont: 50.0
+    mom_x: 1.0
+    mom_y: 1.0
   bc_weights:
     inlet: 50.0
     outlet: 50.0
     wall: 50.0
-  adaptive_bc: false
-  use_sa_weights: false
+  adaptive_bc: true
+  use_sa_weights: true
   sa_apply_to_bc: true
+  sa_lr: 0.01
   integral_condition: true
-  integral_weight: 1000000.0
+  integral_weight: 200.0
 
 training:
-  epochs: 2000
-  batch_size: 1200
-  gradient_accumulation_steps: 50
+  epochs: 20000
+  batch_size: 5000
+  gradient_accumulation_steps: 1
   two_stage: true
-  stage1_epochs: 0
-  stage2_pde_weight_start: 10.0
-  stage2_pde_weight_end: 100.0
-  stage2_ramp_epochs: 500
-  lr_schedule: constant
+  stage1_epochs: 2000
+  stage2_pde_weight_start: 0.1
+  stage2_pde_weight_end: 1.0
+  stage2_ramp_epochs: 12000
+  lr_schedule: cosine
+  lr_cosine_eta_min: 0.00001
   lr_cyclic_period: 100
   lr_cyclic_amplitude: 0.5
   lr_detector_factor: 2.0
@@ -59,9 +69,9 @@ training:
   lr_detector_recovery: 50
   reset_interval: 0
   reset_noise: 0.01
-  grad_clip: null
+  grad_clip: 1.0
   rar_enable: true
-  rar_interval: 100
+  rar_interval: 1000
   rar_num_points: 200
   switch_to_lbfgs_epoch: 0
   lbfgs_max_iter: 20
@@ -74,22 +84,23 @@ training:
 
 optimizer_params:
   lr: 0.001
+  lbfgs_lr: 1.0
 
 process:
   load_model_path: null
   device: auto
   num_gpus: 1
   dtype: float32
-  use_amp: true
+  use_amp: false
   seed: 42
 
 output:
-  console_only: false
+  console_only: true
   graphical_window:
     loss: true
     pde: true
     bc: false
-  plot_frequency: 1
+  plot_frequency: 100
 
 data:
   points_file: workspace/initial/fields/initial.npy
@@ -110,9 +121,9 @@ diagnostics:
   compute_ntk_condition: false
   save_rar_history: true
 
-enable_key_listener: true
+enable_key_listener: false
 checkpoint_dir: workspace/experiments
 checkpoint:
-  interval: 100
+  interval: 1000
   name_pattern: '{project_name}_{timestamp}'
   model_name_pattern: '{project_name}_{timestamp}'

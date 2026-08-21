@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.utils as nn_utils
 import logging
+import math
 import numpy as np
 from typing import Dict, Optional, Tuple
 from contextlib import nullcontext
@@ -99,6 +100,11 @@ class Trainer:
         n_batches = 0
         total_grad = 0.0
 
+        # Критично: шаг оптимизатора должен выполняться в т.ч. на последнем
+        # батче эпохи, если число батчей меньше gradient_accumulation_steps.
+        # Иначе optimizer.step() никогда не вызывается и веса не обновляются.
+        n_total_batches = max(1, math.ceil(self.data_handler.n_points / max(1, self.batch_size)))
+
         for batch_idx, batch in enumerate(self._get_batches()):
             # Прямой проход → словарь
             with self._autocast_context():
@@ -111,11 +117,16 @@ class Trainer:
                 loss = loss / self.gradient_accumulation_steps
 
             if self.scaler is not None:
-                self.scaler.scale(loss).backward(retain_graph=True)
+                self.scaler.scale(loss).backward(retain_graph=False)
             else:
-                loss.backward(retain_graph=True)
+                loss.backward(retain_graph=False)
 
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+            # Норма градиентов ДО step (иначе после zero_grad будет 0)
+            last_grad_norm = self._get_grad_norm()
+
+            is_last_batch = (batch_idx == n_total_batches - 1)
+            do_step = ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or is_last_batch
+            if do_step:
                 if self.grad_clip is not None:
                     if self.scaler is not None:
                         self.scaler.unscale_(self.optimizer)
@@ -145,7 +156,7 @@ class Trainer:
         avg_bc = {k: v / max(n_batches, 1) for k, v in total_bc.items()}
         avg_wall = total_wall_speed / max(n_batches, 1)
 
-        grad_norm = self._get_grad_norm()
+        grad_norm = last_grad_norm if n_batches > 0 else 0.0
 
         return avg_loss, avg_pde, avg_bc, total_integral, avg_wall, max_pde, 0.0, grad_norm
 
@@ -178,7 +189,16 @@ class Trainer:
             loss.backward()
             return loss
 
-        self.optimizer.step(closure)
+        # NaN-защита: если L-BFGS потерял устойчивость, не применяем шаг
+        try:
+            self.optimizer.step(closure)
+        except (RuntimeError, ValueError) as e:
+            logger.warning(f"L-BFGS step упал: {e}")
+            self.optimizer.zero_grad()
+        if any((p != p).any() for p in self.model.parameters()):
+            logger.warning("L-BFGS дал NaN — откатываемся, пропускаем шаг")
+            self.optimizer = None  # сигнал пересоздать Adam
+            self.model.zero_grad()
 
         # Получаем потери после шага
         batch = next(iter(self.data_handler.get_dataloader()))
@@ -196,38 +216,35 @@ class Trainer:
         Применяет Residual-based Adaptive Refinement.
 
         Использует PDE невязки (cont, mom_x, mom_y) как критерий,
-        а не скорость потока.
+        а не скорость потока. ВНИМАНИЕ: forward должен выполняться
+        ВНЕ torch.no_grad(), иначе производные не считаются и невязки = 0.
         """
         logger.info("Применение RAR...")
         self.model.eval()
         dataset = self.data_handler.dataset
 
-        with torch.no_grad():
-            x_t = dataset.x.to(self.device, dtype=self.dtype)
-            y_t = dataset.y.to(self.device, dtype=self.dtype)
-            sdf_t = dataset.sdf.to(self.device, dtype=self.dtype)
-            bt = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
+        # Клонируем, чтобы не менять requires_grad у тензоров датасета
+        x_t = dataset.x.to(self.device, dtype=self.dtype).clone().requires_grad_(True)
+        y_t = dataset.y.to(self.device, dtype=self.dtype).clone().requires_grad_(True)
+        sdf_t = dataset.sdf.to(self.device, dtype=self.dtype)
+        bt = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
 
-            input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt)
-            out = self.model(input_tensor)
-            u, v, p = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+        input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt)
+        out = self.model(input_tensor)
+        u, v, p = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
-            # Вычисляем PDE невязки
-            x_t.requires_grad_(True)
-            y_t.requires_grad_(True)
+        from pipe_bend_pinn.physics.pde import PDEResiduals
+        from pipe_bend_pinn.utils.helpers import safe_grad
 
-            from pipe_bend_pinn.physics.pde import PDEResiduals
-            from pipe_bend_pinn.utils.helpers import safe_grad
+        residuals = PDEResiduals.compute_residuals_2d(
+            u, v, p, x_t, y_t,
+            torch.tensor(1.0, device=self.device),
+            torch.tensor(1.0 / self.data_handler.Re, device=self.device),
+            safe_grad
+        )
 
-            residuals = PDEResiduals.compute_residuals_2d(
-                u, v, p, x_t, y_t,
-                torch.tensor(1.0, device=self.device),
-                torch.tensor(1.0 / self.data_handler.Re, device=self.device),
-                safe_grad
-            )
-
-            # Суммарная невязка как критерий RAR
-            total_res = (residuals['cont'] + residuals['mom_x'] + residuals['mom_y']).cpu().numpy().flatten()
+        # Суммарная невязка как критерий RAR
+        total_res = (residuals['cont'] + residuals['mom_x'] + residuals['mom_y']).detach().cpu().numpy().flatten()
 
         # Exponential smoothing
         self.point_residual = 0.9 * self.point_residual + 0.1 * total_res
@@ -253,6 +270,15 @@ class Trainer:
             new_pde_res = np.zeros(new_n)
             new_pde_res[:old_n] = self.point_pde_residual
             self.point_pde_residual = new_pde_res
+
+        # Расширяем SA-веса (если используются), чтобы совпадала размерность (N, 3)
+        if self.sa_weights is not None:
+            sa_log = self.sa_weights.log_weights
+            if new_n > sa_log.shape[0]:
+                new_sa = torch.full((new_n, sa_log.shape[1]), np.log(1.0),
+                                    device=sa_log.device, dtype=sa_log.dtype)
+                new_sa[:sa_log.shape[0]] = sa_log.data
+                self.sa_weights.log_weights = nn.Parameter(new_sa)
 
         self.rar_history.append({'rar_added': len(top_indices)})
         self.sa_weights_changed = True

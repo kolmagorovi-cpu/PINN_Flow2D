@@ -197,7 +197,9 @@ class DataHandler:
             if self.dataset.boundary_types is not None:
                 self.dataset.boundary_types = self.dataset.boundary_types.to(self.device)
 
-        self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
+        # ВНИМАНИЕ: set_inlet_values() НЕ вызываем — он перезаписывает
+        # параболический профиль Пуазейля на входе uniform-профилем (u=inlet_u_norm).
+        # Данные из initial.npy уже содержат корректный профиль в u_bc/v_bc.
         self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
 
     def load_metadata(self) -> None:

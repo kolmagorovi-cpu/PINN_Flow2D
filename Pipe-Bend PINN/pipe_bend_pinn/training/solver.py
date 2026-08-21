@@ -55,6 +55,9 @@ class PINNSolver:
         self.config = config
         self.config_name = config.get('project_name', 'unnamed')
         self.experiment_dir = experiment_dir
+        # Единый timestamp для ВСЕХ директорий эксперимента
+        # (иначе _get_logs_dir/_get_checkpoint_dir создают разные папки)
+        self.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
         seed = config.get('process', {}).get('seed', 42)
         set_seed(seed)
@@ -233,7 +236,9 @@ class PINNSolver:
             activation=arch.get('activation', 'tanh'),
             output_dim=arch['output_dim'],
             output_bias=arch['output_bias'],
-            coordinate_scaling=coord_scaling
+            coordinate_scaling=coord_scaling,
+            fourier_features=arch.get('fourier_features', None),
+            residual=arch.get('residual', False),
         )
 
     def _init_optimizer(self, optim_type='adam') -> optim.Optimizer:
@@ -260,6 +265,12 @@ class PINNSolver:
             max_lr = base_lr * (1 + self.config['training']['lr_cyclic_amplitude'])
             return CyclicLR(self.optimizer, base_lr, max_lr,
                             self.config['training']['lr_cyclic_period'])
+        elif lr_schedule == 'cosine':
+            epochs = int(self.config['training'].get('epochs', 20000))
+            eta_min = float(self.config['training'].get('lr_cosine_eta_min', 1e-5))
+            return optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=epochs, eta_min=eta_min
+            )
         elif lr_schedule == 'detector':
             return None
         else:
@@ -273,8 +284,7 @@ class PINNSolver:
             self.plots_dir = os.path.join(experiment_dir, "plots")
         else:
             base_dir = self.config.get('checkpoint_dir', EXPERIMENTS_DIR)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            run_dir = os.path.join(base_dir, f"{self.config_name}_{timestamp}")
+            run_dir = os.path.join(base_dir, f"{self.config_name}_{self.run_timestamp}")
             self.checkpoint_dir = os.path.join(run_dir, "checkpoints")
             self.logs_dir = os.path.join(run_dir, "logs")
             self.plots_dir = os.path.join(run_dir, "plots")
@@ -286,22 +296,19 @@ class PINNSolver:
         if self.experiment_dir:
             return os.path.join(self.experiment_dir, "checkpoints")
         base_dir = self.config.get('checkpoint_dir', EXPERIMENTS_DIR)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        return os.path.join(base_dir, f"{self.config_name}_{timestamp}", "checkpoints")
+        return os.path.join(base_dir, f"{self.config_name}_{self.run_timestamp}", "checkpoints")
 
     def _get_logs_dir(self) -> str:
         if self.experiment_dir:
             return os.path.join(self.experiment_dir, "logs")
         base_dir = self.config.get('checkpoint_dir', EXPERIMENTS_DIR)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        return os.path.join(base_dir, f"{self.config_name}_{timestamp}", "logs")
+        return os.path.join(base_dir, f"{self.config_name}_{self.run_timestamp}", "logs")
 
     def _get_plots_dir(self) -> str:
         if self.experiment_dir:
             return os.path.join(self.experiment_dir, "plots")
         base_dir = self.config.get('checkpoint_dir', EXPERIMENTS_DIR)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        return os.path.join(base_dir, f"{self.config_name}_{timestamp}", "plots")
+        return os.path.join(base_dir, f"{self.config_name}_{self.run_timestamp}", "plots")
 
     def _save_checkpoint(self, identifier: Union[int, str]) -> None:
         filename = f"pinn_{identifier}.pt"
@@ -333,16 +340,29 @@ class PINNSolver:
                 self.metrics.history = checkpoint['history']
             if 'epoch' in checkpoint and checkpoint['epoch'] is not None:
                 self.start_epoch = checkpoint['epoch']
+            if ('sa_weights_state_dict' in checkpoint and self.sa_weights is not None):
+                try:
+                    self.sa_weights.load_state_dict(checkpoint['sa_weights_state_dict'])
+                except Exception as e:
+                    logger.warning(f"Не удалось загрузить SA-веса (размер мог измениться после RAR): {e}")
             logger.info(f"Чекпоинт загружен, продолжение с эпохи {self.start_epoch}")
         except Exception as e:
             logger.error(f"Ошибка загрузки чекпоинта: {e}")
 
     def _switch_to_lbfgs(self) -> None:
-        """Переключение на L-BFGS оптимизатор."""
+        """Переключение на L-BFGS оптимизатор.
+
+        SA-веса замораживаются: их log-параметры разрослись за время Adam-фазы,
+        и line search (strong_wolfe) на них расходится (NaN). L-BFGS оптимизирует
+        только параметры сети; SA-веса фиксируются на достигнутом значении.
+        """
         logger.info("Переключение на L-BFGS оптимизатор...")
         self.using_lbfgs = True
         lbfgs_config = self.config['training']
-        lr = self.config.get('optimizer_params', {}).get('lr', 1.0)
+        lr = self.config.get('optimizer_params', {}).get('lbfgs_lr', 1.0)
+        if self.sa_weights is not None:
+            for p in self.sa_weights.parameters():
+                p.requires_grad_(False)
         self.optimizer = optim.LBFGS(
             self.model.parameters(),
             lr=lr,
@@ -352,7 +372,7 @@ class PINNSolver:
         )
         self.trainer.optimizer = self.optimizer
         self.trainer.using_lbfgs = True
-        logger.info(f"L-BFGS активирован")
+        logger.info(f"L-BFGS активирован (lr={lr}, SA-веса заморожены)")
 
     def _recreate_optimizer(self) -> None:
         """Пересоздаёт оптимизатор (после RAR или сброса)."""
@@ -442,7 +462,7 @@ class PINNSolver:
     def train(self, epochs: Optional[int] = None):
         if epochs is None:
             epochs = self.config['training']['epochs']
-        logger.info("🚀 Начало обучения...")
+        logger.info("=== Начало обучения... ===")
         self.start_time = time.time()
 
         try:
@@ -472,6 +492,16 @@ class PINNSolver:
                     loss, pde_raw, bc_comp, integral_loss, wall_speed, pde_max, pde_rate, grad_norm = \
                         self.trainer.train_epoch_adam(pde_mult)
 
+                # Откат с L-BFGS на Adam, если L-BFGS дал NaN
+                if self.trainer.optimizer is None:
+                    logger.warning("L-BFGS дал NaN — переключаюсь обратно на Adam")
+                    self.using_lbfgs = False
+                    self.trainer.using_lbfgs = False
+                    if self.sa_weights is not None:
+                        for p in self.sa_weights.parameters():
+                            p.requires_grad_(True)
+                    self._recreate_optimizer()
+
                 # Сбор метрик
                 avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(epoch)
                 extra_diag = {
@@ -484,6 +514,11 @@ class PINNSolver:
                     wall_speed, pde_max, pde_rate, grad_norm,
                     extra_diag
                 )
+                # Запись строки в CSV (иначе metrics.csv остаётся пустым)
+                try:
+                    self.metrics.add_row_to_csv(epoch, loss, pde_raw, bc_comp, wall_speed, pde_max)
+                except Exception as e:
+                    logger.warning(f"Не удалось записать CSV: {e}")
 
                 epoch_time = time.time() - start_time
                 total_time = time.time() - self.start_time
@@ -498,8 +533,9 @@ class PINNSolver:
                 if self.scheduler is not None and not self.using_lbfgs:
                     if isinstance(self.scheduler, CyclicLR):
                         self.scheduler.step()
-                    elif hasattr(self.scheduler, 'step'):
-                        self.scheduler.step(loss)
+                    else:
+                        # CosineAnnealingLR и др. не принимают loss
+                        self.scheduler.step()
 
                 # RAR (Residual-based Adaptive Refinement)
                 if (self.trainer.rar_enable and not self.using_lbfgs
