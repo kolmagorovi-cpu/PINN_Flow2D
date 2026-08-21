@@ -144,7 +144,7 @@ DEFAULT_SYMMETRY_TYPE: Final[str] = 'symmetry'
 DEFAULT_HIDDEN_LAYERS: Final[list[int]] = [50, 50, 50, 50]
 DEFAULT_ACTIVATION: Final[str] = 'tanh'
 DEFAULT_OUTPUT_DIM: Final[int] = 3  # (u, v, p)
-DEFAULT_INPUT_DIM: Final[int] = 5   # legacy fallback; actual input_dim is built from input_params
+DEFAULT_INPUT_DIM: Final[int] = 3   # x/c, y/c, SDF/c; optional Pi features are manifest-driven
 
 #: Смещение выхода по умолчанию (u, v, p)
 DEFAULT_OUTPUT_BIAS: Final[tuple[float, float, float]] = (0.1, 0.0, 0.0)

@@ -18,6 +18,7 @@ from typing import Dict, Any, Optional
 import yaml
 
 from airfoil_pinn.app.paths import PATHS, project_relative
+from airfoil_pinn.config.validation import validate_static_config
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,6 @@ class ConfigManager:
             'input_params': {
                 'coordinates': True,
                 'sdf': True,
-                'boundary_types': True,
                 'inlet_velocity': False,
                 'viscosity': False,
                 'density': False,
@@ -54,6 +54,8 @@ class ConfigManager:
             'architecture': {
                 'hidden_layers': [50, 50, 50, 50],
                 'activation': 'tanh',
+                'siren_first_omega_0': 30.0,
+                'siren_hidden_omega_0': 30.0,
                 'output_dim': 3,
                 'output_bias': [0.1, 0.0, 0.0],
                 # Масштабирование координат для функции активации
@@ -69,8 +71,37 @@ class ConfigManager:
                 'flow_type': '2d',
                 'pde_on_boundary': False,
             },
+            'sdf': {
+                'segment_chunk_size': 256,
+                'absolute_tie_tolerance': 1e-12,
+                'relative_tie_tolerance': 1e-10,
+                'float64_consistency_tolerance': 1e-12,
+            },
             'boundary_conditions': {
-                'type': 'soft',
+                'wall': {
+                    'kind': 'no_slip',
+                    'enforcement': 'soft',
+                    'distance_scale': 0.02,
+                },
+                'inlet': {'kind': 'freestream', 'enforcement': 'soft'},
+                'farfield': {'kind': 'freestream', 'enforcement': 'soft'},
+                'outlet': {
+                    'kind': 'pressure_outlet',
+                    'enforcement': 'soft',
+                },
+                'velocity_dirichlet': {
+                    'kind': 'freestream',
+                    'enforcement': 'soft',
+                },
+                'slip_wall': {
+                    'kind': 'slip_wall',
+                    'enforcement': 'soft',
+                },
+                'symmetry': {'kind': 'symmetry', 'enforcement': 'soft'},
+                'axis_symmetry': {
+                    'kind': 'axis_symmetry',
+                    'enforcement': 'soft',
+                },
             },
             'loss_weights': {
                 'pde_weights': {'cont': 1.0, 'mom_x': 1.0, 'mom_y': 1.0, 'mom_r': 1.0, 'mom_z': 1.0},
@@ -79,9 +110,7 @@ class ConfigManager:
                     'outlet': 1.0,
                     'outlet_grad': 1.0,
                     'farfield': 1.0,
-                    'slip': 1.0,
-                    'slip_tangent_grad': 1.0,
-                    'slip_velocity': 0.1,
+                    'slip_wall': 1.0,
                     'velocity_dirichlet': 1.0,
                     'wall': 1.0,
                     'symmetry': 1.0,
@@ -92,13 +121,15 @@ class ConfigManager:
                 'adaptive_bc': False,
                 'use_sa_weights': False,
                 'sa_apply_to_bc': False,
+                'pressure_gauge_weight': 1.0,
                 'integral_condition': False,
                 'integral_weight': 0.0,
                 'fvm': {
                     'enabled': False,
                     'weight': 1.0,
                     'batch_interval': 1,
-                    'reduction': 'volume_weighted',
+                    'reduction': 'divergence_l2_volume',
+                    'schedule': 'every_optimizer_step',
                 },
             },
             'training': {
@@ -173,6 +204,9 @@ class ConfigManager:
             },
             'output': {
                 'console_only': True,
+                'progress_bar': False,
+                'progress_bar_force': False,
+                'progress_mininterval': 0.5,
                 'graphical_window': {
                     'loss': True,
                     'pde': True,
@@ -182,6 +216,9 @@ class ConfigManager:
             },
             'checkpoint': {
                 'interval': 500,
+                'load_mode': 'resume',
+                'strict_contract': True,
+                'allow_legacy_without_contract': True,
                 'name_pattern': '{project_name}_{timestamp}',
                 'model_name_pattern': '{project_name}_{timestamp}',
                 'save_flow_images': True,
@@ -227,6 +264,10 @@ class ConfigManager:
                 'strict_autograd': True,
                 'save_rar_history': True,
                 'mass_metrics_interval': 1,
+                'section_flow': {
+                    'enabled': True,
+                    'sections': [0.2, 0.5, 0.8],
+                },
                 'boundary_layer': {
                     'enabled': False,
                     'interval': 50,
@@ -302,11 +343,17 @@ class ConfigManager:
 
         # Рекурсивно обновляем словарь
         self._deep_update(self.config, loaded)
+        self._remove_deprecated_boundary_input()
 
         # Преобразуем списки в кортежи там, где это необходимо (например, output_bias)
         if 'architecture' in self.config and 'output_bias' in self.config['architecture']:
             if isinstance(self.config['architecture']['output_bias'], list):
                 self.config['architecture']['output_bias'] = tuple(self.config['architecture']['output_bias'])
+        self.validate()
+
+    def validate(self) -> None:
+        """Raise a consolidated error for incompatible configuration values."""
+        validate_static_config(self.config)
 
     def save(self, name: Optional[str] = None) -> None:
         """
@@ -317,6 +364,8 @@ class ConfigManager:
         """
         if name:
             self.name = name
+        self._remove_deprecated_boundary_input()
+        self.validate()
         # Перед сохранением преобразуем кортежи в списки
         config_copy = self._prepare_for_save(self.config)
         path = os.path.join(self.CONFIG_DIR, self.name + '.yaml')
@@ -363,17 +412,27 @@ class ConfigManager:
         inp = self.config['input_params']
         print(f"  coordinates     : {inp.get('coordinates', True)}")
         print(f"  sdf             : {inp.get('sdf', True)}")
-        print(f"  boundary_types  : {inp.get('boundary_types', True)}")
         print(f"  inlet_velocity  : {inp.get('inlet_velocity', False)}")
         print(f"  viscosity       : {inp.get('viscosity', False)}")
         print(f"  density         : {inp.get('density', False)}")
         print(f"  fluid_file      : {inp.get('fluid_file', '-')}")
+        features = self.config.get('input_features')
+        if features:
+            print("  effective input_features:")
+            for name, value in features.items():
+                print(f"    {name:<20}: {value}")
         print()
 
         print("АРХИТЕКТУРА:")
         arch = self.config['architecture']
         print(f"  hidden_layers   : {arch['hidden_layers']}")
         print(f"  activation      : {arch.get('activation', 'tanh')}")
+        if arch.get('activation') == 'siren':
+            print(
+                "  SIREN omega_0    : "
+                f"first={arch.get('siren_first_omega_0', 30.0)}, "
+                f"hidden={arch.get('siren_hidden_omega_0', 30.0)}"
+            )
         print(f"  output_dim      : {arch['output_dim']}")
         print(f"  output_bias     : {arch['output_bias']}")
         print()
@@ -398,10 +457,20 @@ class ConfigManager:
         fvm_enabled = isinstance(fvm_cfg, dict) and bool(fvm_cfg.get('enabled', False))
         fvm_weight = fvm_cfg.get('weight', 1.0) if isinstance(fvm_cfg, dict) else float(fvm_cfg)
         fvm_bi = fvm_cfg.get('batch_interval', 1) if isinstance(fvm_cfg, dict) else 1
-        fvm_red = fvm_cfg.get('reduction', 'legacy') if isinstance(fvm_cfg, dict) else 'legacy'
+        fvm_red = (
+            fvm_cfg.get('reduction', 'divergence_l2_volume')
+            if isinstance(fvm_cfg, dict)
+            else 'legacy'
+        )
+        fvm_schedule = (
+            fvm_cfg.get('schedule', 'every_optimizer_step')
+            if isinstance(fvm_cfg, dict)
+            else 'every_optimizer_step'
+        )
         print(
             f"  fvm_mass_flow   : {fvm_enabled} "
-            f"(weight={fvm_weight}, batch_interval={fvm_bi}, reduction={fvm_red})"
+            f"(weight={fvm_weight}, schedule={fvm_schedule}, "
+            f"interval={fvm_bi}, reduction={fvm_red})"
         )
         print()
 
@@ -460,6 +529,7 @@ class ConfigManager:
         ck = self.config['checkpoint']
         print("СОХРАНЕНИЕ:")
         print(f"  interval       : {ck['interval']}")
+        print(f"  load_mode      : {ck.get('load_mode', 'resume')}")
         print(f"  name_pattern   : {ck['name_pattern']}")
         print(f"  model_name_pattern: {ck['model_name_pattern']}")
         print(f"  save_flow_images: {ck.get('save_flow_images', True)}")
@@ -515,6 +585,32 @@ class ConfigManager:
                 self._deep_update(target[key], value)
             else:
                 target[key] = value
+
+    def _remove_deprecated_boundary_input(self) -> None:
+        """Remove obsolete boundary one-hot feature flags from the config.
+
+        Boundary labels remain part of the data/loss contract, but are never
+        configurable neural-network inputs.  Loading old YAML files therefore
+        stays supported while subsequent saves use the canonical schema.
+        """
+        removed = False
+        input_params = self.config.get('input_params')
+        if isinstance(input_params, dict) and 'boundary_types' in input_params:
+            input_params.pop('boundary_types')
+            removed = True
+        input_features = self.config.get('input_features')
+        if (
+            isinstance(input_features, dict)
+            and 'boundary_types' in input_features
+        ):
+            input_features.pop('boundary_types')
+            removed = True
+        if removed:
+            logger.warning(
+                "Deprecated boundary_types input setting was removed. "
+                "Boundary labels remain available only to constraints, "
+                "losses and diagnostics."
+            )
 
     def reset_to_defaults(self) -> None:
         """Сбрасывает конфигурацию к значениям по умолчанию."""

@@ -734,7 +734,6 @@ class MainWindow(QMainWindow):
             "workspace/geometry/foils",
             "External file",
             "Manual input",
-            "workspace/geometry/geom_config.yaml",
             "Foil library",
             "Built-in closed NACA 0012",
             "Built-in NACA 2412",
@@ -1119,10 +1118,6 @@ class MainWindow(QMainWindow):
             elif mode == "Manual input":
                 self._open_manual_coordinates_dialog()
                 return
-            elif mode == "workspace/geometry/geom_config.yaml":
-                self.geometry_session.load_from_config()
-                self._apply_domain_params_to_controls()
-                self._apply_save_format_to_controls()
             elif mode == "Foil library":
                 geom_name = self.library_combo.currentData()
                 if not geom_name:
@@ -1664,9 +1659,18 @@ class MainWindow(QMainWindow):
         fvm_cfg = loss_cfg.setdefault("fvm", {})
         if isinstance(fvm_cfg, dict):
             fvm_cfg["enabled"] = ui_config["loss_weights"]["use_fvm"]
-            fvm_cfg["weight"] = 1.0 if ui_config["loss_weights"]["use_fvm"] else 0.0
+            fvm_cfg.setdefault("weight", 25.0)
+            fvm_cfg.setdefault("batch_interval", 1)
+            fvm_cfg.setdefault("reduction", "divergence_l2_volume")
+            fvm_cfg.setdefault("schedule", "every_optimizer_step")
         else:
-            loss_cfg["fvm"] = 1.0 if ui_config["loss_weights"]["use_fvm"] else 0.0
+            loss_cfg["fvm"] = {
+                "enabled": ui_config["loss_weights"]["use_fvm"],
+                "weight": 25.0,
+                "batch_interval": 1,
+                "reduction": "divergence_l2_volume",
+                "schedule": "every_optimizer_step",
+            }
 
         process = config.setdefault("process", {})
         if ui_config["training"]["device"] != "auto":

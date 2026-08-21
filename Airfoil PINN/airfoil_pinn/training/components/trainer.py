@@ -18,7 +18,9 @@
 """
 
 import logging
+import math
 import os
+import random
 from collections import deque
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -38,6 +40,10 @@ from airfoil_pinn.data.sdf_diagnostics import (
     format_sdf_summary,
 )
 from airfoil_pinn.training.components.rar import RARManager
+from airfoil_pinn.training.numerics import (
+    check_gradient_health,
+    ensure_finite_loss,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,12 +156,21 @@ class Trainer:
         # Флаг изменения SA-весов (для сигнала solver'у о необходимости пересоздания оптимизатора)
         self.sa_weights_changed = False
 
-        # FVM-потеря: раз в fvm_interval эпох; внутри эпохи — раз в fvm_batch_interval батчей
-        self.fvm_interval = config.get('fvm_interval', 1)
         self.fvm_batch_interval: int = getattr(loss_computer, 'fvm_batch_interval', 1)
+        self.fvm_schedule: str = getattr(
+            loss_computer,
+            'fvm_schedule',
+            'every_optimizer_step',
+        )
         self._fvm_epoch_counter = 0
+        self._fvm_optimizer_step_counter = 0
         self._last_fvm_loss = 0.0
+        self._last_fvm_raw_loss = 0.0
+        self._last_fvm_rms = 0.0
+        self._last_fvm_evaluations = 0
         self._last_integral_loss = 0.0
+        self._last_pressure_gauge_mse = 0.0
+        self._last_pressure_gauge_loss = 0.0
         self._rar_fvm_rebuild_counter = 0
         self._rar_new_points_since_fvm = 0
         self._rar_step_counter = 0
@@ -208,16 +223,32 @@ class Trainer:
         и возвращает словарь с результатами, включая отдельные тензоры потерь.
         """
         idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+        case_ids = getattr(batch, 'case_id', None)
+        normal_x = getattr(batch, 'normal_x', None)
+        normal_y = getattr(batch, 'normal_y', None)
 
         idx = idx.to(self.device)
+        if case_ids is not None:
+            case_ids = case_ids.to(self.device, dtype=torch.long)
         x = x.to(self.device, dtype=self.dtype).requires_grad_(True)
         y = y.to(self.device, dtype=self.dtype).requires_grad_(True)
         sdf = sdf.to(self.device, dtype=self.dtype)
+        if normal_x is not None:
+            normal_x = normal_x.to(self.device, dtype=self.dtype).view(-1, 1)
+        if normal_y is not None:
+            normal_y = normal_y.to(self.device, dtype=self.dtype).view(-1, 1)
 
         if bt.shape[1] > 0:
             bt = bt.to(self.device, dtype=self.dtype)
         else:
             bt = None
+
+        sdf, sdf_pde_mask = self.loss_computer.prepare_sdf_for_pde(
+            x,
+            y,
+            sdf,
+            bt,
+        )
 
         mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
         mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
@@ -227,34 +258,82 @@ class Trainer:
         p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
 
         # Формируем входной тензор для модели
-        input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        input_tensor = self.loss_computer.build_input_tensor(
+            x,
+            y,
+            sdf,
+            case_ids=case_ids,
+        )
 
         # Прямой проход модели
         out = self.model(input_tensor)
         u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
-        # Применение жёстких граничных условий (если необходимо)
+        # The distance-based wall transform is part of the differentiated
+        # solution used by both PDE and boundary losses.
+        u, v, p = self.loss_computer.transform_outputs(
+            u_raw,
+            v_raw,
+            p_raw,
+            x,
+            y,
+            sdf=sdf,
+            case_ids=case_ids,
+        )
+
+        # Legacy pointwise override for old direct callers only. Static
+        # configuration validation rejects global type=hard.
         if self.loss_computer.bc_type == 'hard':
             u, v, p = self.loss_computer.apply_hard_constraints(
-                u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                u, v, p, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
             )
-        else:
-            u, v, p = u_raw, v_raw, p_raw
-        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
+            u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                u,
+                v,
+                bt,
+                case_ids=case_ids,
+            )
 
         # Вычисление невязок PDE
-        res = self.loss_computer.compute_pde_residuals(u, v, p, x, y)
+        res = self.loss_computer.compute_pde_residuals(
+            u,
+            v,
+            p,
+            x,
+            y,
+            case_ids=case_ids,
+        )
         cont = res['cont']
         mom1 = res[self.loss_computer.pde_components[1]]
         mom2 = res[self.loss_computer.pde_components[2]]
-        pde_mask = self._pde_loss_mask(bt, cont)
+        interior_pde_mask = self._pde_loss_mask(bt, cont)
+        pde_mask = interior_pde_mask & sdf_pde_mask
+        pde_candidate_count = int(interior_pde_mask.sum().detach().cpu())
+        pde_point_count = int(pde_mask.sum().detach().cpu())
+        pde_counts = {
+            component: pde_point_count
+            for component in self.loss_computer.pde_components
+        }
+        pde_coverage = (
+            float(pde_point_count / pde_candidate_count)
+            if pde_candidate_count > 0
+            else 1.0
+        )
+        near_wall_pde_count = int(
+            (
+                pde_mask
+                & (sdf.detach() > 0.0)
+                & (sdf.detach() < 0.01)
+            ).sum().cpu()
+        )
         pde_score = cont + mom1 + mom2
         self._update_pde_point_residual(
             idx,
             torch.where(pde_mask, pde_score, torch.zeros_like(pde_score)),
         )
 
-        # Средние и максимальные значения для отчёта
+        # MSE и максимальные квадраты невязок для отчёта. Корни берутся только
+        # в диагностике, никогда в оптимизируемой функции потерь.
         pde_raw = {
             'cont': self._masked_mean(cont, pde_mask).item(),
             self.loss_computer.pde_components[1]: self._masked_mean(mom1, pde_mask).item(),
@@ -293,17 +372,51 @@ class Trainer:
             self.loss_computer.loss_weights[self.loss_computer.pde_components[2]] * loss_2
         )
 
-        # Граничные условия (только для soft)
-        if self.loss_computer.bc_type == 'soft':
-            bc_comp, extra_grad = self.loss_computer.compute_bc_loss(u, v, p, bt, x, y)
+        # Unsupported operators remain soft even when the wall is hard.
+        if self.loss_computer.bc_type != 'hard':
+            bc_comp, extra_grad = self.loss_computer.compute_bc_loss(
+                u,
+                v,
+                p,
+                bt,
+                x,
+                y,
+                case_ids=case_ids,
+                normal_x=normal_x,
+                normal_y=normal_y,
+            )
+            bc_counts = {}
+            for boundary_index, boundary_name in enumerate(
+                self.data_handler.boundary_type_names
+            ):
+                boundary_config = self.loss_computer.boundary_conditions.get(
+                    boundary_name,
+                    {"enforcement": "soft"},
+                )
+                if boundary_config.get("enforcement", "soft") == "hard":
+                    bc_counts[boundary_name] = 0
+                    continue
+                boundary_mask = (
+                    bt[:, boundary_index].view(-1, 1) > 0.5
+                    if bt is not None and boundary_index < bt.shape[1]
+                    else torch.zeros_like(cont, dtype=torch.bool)
+                )
+                bc_counts[boundary_name] = int(
+                    boundary_mask.sum().detach().cpu()
+                )
             # Если SA-веса применяются к BC, используем только их; иначе — фиксированные веса
             if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
                 bc_loss = self._compute_sa_bc_loss(
                     u=u,
                     v=v,
                     p=p,
+                    x=x,
+                    y=y,
                     boundary_types=bt,
                     w_bc=w_bc,
+                    case_ids=case_ids,
+                    normal_x=normal_x,
+                    normal_y=normal_y,
                 ) + extra_grad
             else:
                 bc_loss = sum(
@@ -312,8 +425,21 @@ class Trainer:
                 ) + extra_grad
         else:
             bc_comp = {}
+            bc_counts = {}
             # Создаём нулевой тензор, который требует градиент (чтобы избежать ошибок в диагностике)
             bc_loss = torch.zeros(1, device=self.device, dtype=self.dtype, requires_grad=True).squeeze()
+
+        pressure_gauge_raw = (
+            self.loss_computer.compute_pressure_gauge_loss(
+                p,
+                case_ids=case_ids,
+                mask=interior_pde_mask,
+            )
+        )
+        pressure_gauge_loss = (
+            self.loss_computer.pressure_gauge_weight
+            * pressure_gauge_raw
+        )
 
         # RAR использует локальный аналог Total Loss: взвешенная PDE-часть
         # плюс точечные BC-вклады. Глобальные integral/FVM не имеют координатной
@@ -332,6 +458,9 @@ class Trainer:
             pde_mult=pde_mult,
             w_pde=w_pde,
             w_bc=w_bc,
+            case_ids=case_ids,
+            normal_x=normal_x,
+            normal_y=normal_y,
         )
         self._update_rar_point_score(idx, rar_point_score)
 
@@ -341,6 +470,8 @@ class Trainer:
         integral_raw_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
         integral_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
         fvm_loss_val = 0.0
+        fvm_raw_val = 0.0
+        fvm_rms_val = 0.0
         fvm_t = torch.zeros(1, device=self.device, dtype=self.dtype).squeeze()
 
         needs_fvm_forward = (
@@ -350,52 +481,86 @@ class Trainer:
                 or (add_integral and self.loss_computer.integral_condition)
             )
         )
-        out_fvm = None
+        fvm_case_outputs = []
         x_fvm = None
         if needs_fvm_forward:
             if hasattr(self.data_handler, 'fvm_x'):
                 x_fvm, y_fvm, sdf_fvm, bt_fvm = self._get_fvm_tensors()
-                inp_fvm  = self.loss_computer.build_input_tensor(x_fvm, y_fvm, sdf_fvm, bt_fvm)
-                out_fvm  = self.model(inp_fvm)
-                u_fvm, v_fvm, p_fvm = out_fvm[:, 0:1], out_fvm[:, 1:2], out_fvm[:, 2:3]
-                if self.loss_computer.bc_type == 'hard' and bt_fvm is not None:
-                    u_fvm, v_fvm, p_fvm = self._apply_hard_constraints_from_boundary_types(
-                        u_fvm,
-                        v_fvm,
-                        p_fvm,
-                        bt_fvm,
-                    )
-                u_fvm, v_fvm = self.loss_computer.apply_velocity_dirichlet_constraint(
-                    u_fvm, v_fvm, bt_fvm
+                fvm_case_outputs = self._forward_fvm_cases(
+                    x_fvm,
+                    y_fvm,
+                    sdf_fvm,
+                    bt_fvm,
                 )
-                out_fvm = torch.cat([u_fvm, v_fvm, p_fvm], dim=1)
             else:
-                logger.warning("FVM/integral: fvm-тензоры не подготовлены, глобальный сеточный проход пропущен.")
+                if add_fvm and self.loss_computer.fvm_weight > 0.0:
+                    raise RuntimeError(
+                        "FVM is enabled, but its node tensors are unavailable"
+                    )
+                logger.warning(
+                    "Integral condition: FVM tensors are unavailable; "
+                    "using the boundary-point fallback."
+                )
 
         if add_integral and self.loss_computer.integral_condition:
-            if out_fvm is not None and self.loss_computer.fvm is not None:
-                integral_raw_t = self.loss_computer.compute_mesh_integral_loss(
-                    out_fvm[:, :2],
-                    self.loss_computer.fvm.bnd_node,
-                    self.loss_computer.fvm.bnd_S,
-                    self.loss_computer.fvm.bnd_type,
-                    node_x=x_fvm,
-                )
+            if fvm_case_outputs and self.loss_computer.fvm is not None:
+                case_integrals = [
+                    self.loss_computer.compute_mesh_integral_loss(
+                        output[:, :2],
+                        self.loss_computer.fvm.bnd_node,
+                        self.loss_computer.fvm.bnd_S,
+                        self.loss_computer.fvm.bnd_type,
+                        node_x=x_fvm,
+                    )
+                    for _, output, _ in fvm_case_outputs
+                ]
+                integral_raw_t = torch.stack(case_integrals).mean()
             else:
                 integral_raw_t = self._compute_global_integral_loss_from_dataset()
             integral_t = integral_raw_t * self.loss_computer.integral_weight * float(integral_scale)
 
-        if add_fvm and out_fvm is not None and self.loss_computer.fvm_weight > 0.0:
-            fvm_weighted_t = self.loss_computer.compute_fvm_loss(out_fvm[:, :2])
+        if (
+            add_fvm
+            and fvm_case_outputs
+            and self.loss_computer.fvm_weight > 0.0
+        ):
+            case_fvm_metrics = [
+                self.loss_computer.compute_fvm_metrics(
+                    output[:, :2],
+                    freestream_velocity=freestream_velocity,
+                )
+                for _, output, freestream_velocity in fvm_case_outputs
+            ]
+            fvm_raw_t = torch.stack(
+                [metrics["raw"] for metrics in case_fvm_metrics]
+            ).mean()
+            fvm_weighted_t = torch.stack(
+                [metrics["weighted"] for metrics in case_fvm_metrics]
+            ).mean()
+            fvm_rms_t = torch.sqrt(
+                torch.stack(
+                    [metrics["rms"].square() for metrics in case_fvm_metrics]
+                ).mean().clamp_min(0.0)
+            )
+            fvm_raw_val = fvm_raw_t.item()
             fvm_loss_val = fvm_weighted_t.item()
+            fvm_rms_val = fvm_rms_t.item()
             fvm_t = fvm_weighted_t * float(fvm_scale)
 
-        # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют
-        total_loss = pde_loss + bc_loss + integral_t + fvm_t
+        # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют.
+        # Pressure gauge removes the independent additive pressure nullspace
+        # for every flow case represented in this batch.
+        total_loss = (
+            pde_loss
+            + bc_loss
+            + pressure_gauge_loss
+            + integral_t
+            + fvm_t
+        )
 
         # Средняя скорость на стенке (для мониторинга)
         wall_speed = None
-        if self.loss_computer.bc_type == 'soft' and 'wall' in bc_comp and bc_comp['wall'].item() > 0 and bt is not None:
+        if 'wall' in bc_comp and bc_comp['wall'].item() > 0 and bt is not None:
             wall_idx = self.data_handler.boundary_type_names.index('wall')
             u_wall = u[bt[:, wall_idx] > 0.5]
             v_wall = v[bt[:, wall_idx] > 0.5]
@@ -405,11 +570,27 @@ class Trainer:
         return {
             'total': total_loss,
             'pde_raw': pde_raw,
+            'pde_mse': pde_raw,
             'pde_max': pde_max,
-            'bc_comp': {k: v.item() for k, v in bc_comp.items()} if self.loss_computer.bc_type == 'soft' else {},
-            'extra_grad': extra_grad.item() if self.loss_computer.bc_type == 'soft' else 0.0,
+            'pde_counts': pde_counts,
+            'bc_comp': {k: v.item() for k, v in bc_comp.items()},
+            'bc_mse': {k: v.item() for k, v in bc_comp.items()},
+            'bc_counts': bc_counts,
+            'extra_grad': extra_grad.item() if self.loss_computer.bc_type != 'hard' else 0.0,
             'integral_loss': integral_raw_t.item() if torch.is_tensor(integral_raw_t) else integral_raw_t,
             'fvm_loss': fvm_loss_val,
+            'fvm_raw_loss': fvm_raw_val,
+            'fvm_mse': fvm_raw_val,
+            'fvm_weighted_loss': fvm_loss_val,
+            'fvm_rms': fvm_rms_val,
+            'pressure_gauge_raw': pressure_gauge_raw.item(),
+            'pressure_gauge_loss': pressure_gauge_loss.item(),
+            'pde_coverage': {
+                'candidate_points': pde_candidate_count,
+                'active_points': pde_point_count,
+                'fraction': pde_coverage,
+                'near_wall_0_01_chord_points': near_wall_pde_count,
+            },
             'wall_speed': wall_speed,
             # Возвращаем отдельные тензоры потерь для градиентного анализа
             'loss_components': {
@@ -417,6 +598,7 @@ class Trainer:
                 'mom1': loss_1,
                 'mom2': loss_2,
                 'bc': bc_loss,          # теперь всегда тензор
+                'pressure_gauge': pressure_gauge_loss,
                 'integral': integral_t
             },
             'u': u.detach(),  # для профилей и спектров
@@ -441,8 +623,7 @@ class Trainer:
 
         mask = boundary_types[:, interior_idx].view(-1, 1) > 0.5
         if not bool(mask.any()):
-            logger.warning("PDE-loss mask пустая: fallback на весь batch.")
-            return torch.ones_like(reference, dtype=torch.bool)
+            logger.debug("PDE-loss mask is empty for this boundary-only batch.")
         return mask
 
     @staticmethod
@@ -451,7 +632,7 @@ class Trainer:
         if mask is None or mask.shape != values.shape:
             return values.mean()
         if not bool(mask.any()):
-            return values.mean()
+            return values.sum() * 0.0
         return values[mask].mean()
 
     @staticmethod
@@ -460,7 +641,7 @@ class Trainer:
         if mask is None or mask.shape != values.shape:
             return values.max()
         if not bool(mask.any()):
-            return values.max()
+            return values.sum() * 0.0
         return values[mask].max()
 
     def _compute_sa_bc_loss(
@@ -468,13 +649,22 @@ class Trainer:
         u: torch.Tensor,
         v: torch.Tensor,
         p: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
         w_bc: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+        normal_x: Optional[torch.Tensor] = None,
+        normal_y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Pointwise BC-loss с self-adaptive весами по активным boundary-точкам."""
         if boundary_types is None or boundary_types.shape[1] == 0:
             return torch.zeros((), device=self.device, dtype=self.dtype)
 
+        target_u, target_v = self.loss_computer.get_freestream_targets(
+            u,
+            case_ids,
+        )
         terms = []
         for i, name in enumerate(self.data_handler.boundary_type_names):
             if i >= boundary_types.shape[1] or i >= w_bc.shape[1]:
@@ -488,17 +678,30 @@ class Trainer:
 
             if name in ('inlet', 'farfield', 'velocity_dirichlet'):
                 point_loss = (
-                    (u - self.data_handler.inlet_u_norm) ** 2
-                    + (v - self.data_handler.inlet_v_norm) ** 2
+                    (u - target_u) ** 2
+                    + (v - target_v) ** 2
                 )
             elif name == 'outlet':
                 point_loss = p ** 2
             elif name == 'wall':
-                point_loss = u ** 2 + v ** 2
-            elif name == 'slip':
-                point_loss = (v - self.data_handler.inlet_v_norm) ** 2
-            elif name == 'symmetry':
-                point_loss = v ** 2
+                point_loss = self.loss_computer.compute_wall_point_loss(
+                    u,
+                    v,
+                    x,
+                    y,
+                    mask,
+                )
+            elif name in ('slip_wall', 'slip', 'symmetry'):
+                nx, ny = self.loss_computer._boundary_normals(
+                    normal_x,
+                    normal_y,
+                    mask,
+                    boundary_name=name,
+                )
+                point_loss = torch.zeros_like(u)
+                point_loss[mask] = (
+                    u[mask] * nx + v[mask] * ny
+                ).square()
             elif name == 'axis_symmetry':
                 point_loss = u ** 2
             else:
@@ -517,11 +720,16 @@ class Trainer:
         v_raw: torch.Tensor,
         p_raw: torch.Tensor,
         boundary_types: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Применяет hard constraints к произвольному набору точек по one-hot ГУ."""
         u = u_raw
         v = v_raw
         p = p_raw
+        target_u, target_v = self.loss_computer.get_freestream_targets(
+            u_raw,
+            case_ids,
+        )
 
         for idx, name in enumerate(self.data_handler.boundary_type_names):
             if idx >= boundary_types.shape[1]:
@@ -531,14 +739,16 @@ class Trainer:
                 continue
 
             if name in ('inlet', 'velocity_dirichlet'):
-                u = torch.where(mask, torch.ones_like(u) * self.data_handler.inlet_u_norm, u)
-                v = torch.where(mask, torch.ones_like(v) * self.data_handler.inlet_v_norm, v)
+                u = torch.where(mask, target_u, u)
+                v = torch.where(mask, target_v, v)
             elif name == 'outlet':
                 p = torch.where(mask, torch.zeros_like(p), p)
-            elif name == 'wall':
+            elif (
+                name == 'wall'
+                and self.loss_computer.pde_system
+                == 'incompressible_navier_stokes'
+            ):
                 u = torch.where(mask, torch.zeros_like(u), u)
-                v = torch.where(mask, torch.zeros_like(v), v)
-            elif name == 'symmetry':
                 v = torch.where(mask, torch.zeros_like(v), v)
             elif name == 'axis_symmetry':
                 u = torch.where(mask, torch.zeros_like(u), u)
@@ -560,6 +770,9 @@ class Trainer:
         pde_mult: float,
         w_pde: Optional[torch.Tensor],
         w_bc: Optional[torch.Tensor],
+        case_ids: Optional[torch.Tensor] = None,
+        normal_x: Optional[torch.Tensor] = None,
+        normal_y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Возвращает локальный score для RAR.
@@ -598,6 +811,9 @@ class Trainer:
                 y=y,
                 boundary_types=boundary_types,
                 w_bc=w_bc,
+                case_ids=case_ids,
+                normal_x=normal_x,
+                normal_y=normal_y,
             ).view(-1, 1)
 
         return torch.nan_to_num(score.flatten(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -611,11 +827,18 @@ class Trainer:
         y: torch.Tensor,
         boundary_types: torch.Tensor,
         w_bc: Optional[torch.Tensor],
+        case_ids: Optional[torch.Tensor] = None,
+        normal_x: Optional[torch.Tensor] = None,
+        normal_y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Точечный вклад BC-loss для RAR total_loss score."""
         score = torch.zeros_like(u).flatten()
         if boundary_types.shape[1] == 0:
             return score
+        target_u, target_v = self.loss_computer.get_freestream_targets(
+            u,
+            case_ids,
+        )
 
         for i, name in enumerate(self.data_handler.boundary_type_names):
             if i >= boundary_types.shape[1]:
@@ -628,68 +851,64 @@ class Trainer:
             extra_point_loss = torch.zeros_like(u)
             if name in ('inlet', 'farfield', 'velocity_dirichlet'):
                 point_loss = (
-                    (u - self.data_handler.inlet_u_norm) ** 2
-                    + (v - self.data_handler.inlet_v_norm) ** 2
+                    (u - target_u) ** 2
+                    + (v - target_v) ** 2
                 )
             elif name == 'outlet':
                 point_loss = p ** 2
             elif name == 'wall':
-                point_loss = u ** 2 + v ** 2
-            elif name == 'slip':
-                tol = getattr(self.loss_computer, 'tol', 1e-6)
-                x_min = getattr(self.loss_computer, 'x_min', 0.0)
-                x_max = getattr(self.loss_computer, 'x_max', 0.0)
-                y_min = getattr(self.loss_computer, 'y_min', 0.0)
-                y_max = getattr(self.loss_computer, 'y_max', 0.0)
-                left = mask & (x <= x_min + tol)
-                right = mask & (x >= x_max - tol)
-                bottom = mask & (y <= y_min + tol)
-                top = mask & (y >= y_max - tol)
-                vertical = left | right
-                horizontal = bottom | top
-                if bool(horizontal.any()) or bool(vertical.any()):
-                    point_loss = torch.where(
-                        horizontal,
-                        (v - self.data_handler.inlet_v_norm) ** 2,
-                        point_loss,
+                point_loss = self.loss_computer.compute_wall_point_loss(
+                    u,
+                    v,
+                    x,
+                    y,
+                    mask,
+                )
+            elif name in ('slip_wall', 'slip', 'symmetry'):
+                nx, ny = self.loss_computer._boundary_normals(
+                    normal_x,
+                    normal_y,
+                    mask,
+                    boundary_name=name,
+                )
+                point_loss[mask] = (
+                    u[mask] * nx + v[mask] * ny
+                ).square()
+                if name == 'symmetry':
+                    full_length = torch.sqrt(
+                        normal_x.square() + normal_y.square()
                     )
-                    point_loss = torch.where(
-                        vertical,
-                        (u - self.data_handler.inlet_u_norm) ** 2,
-                        point_loss,
+                    safe_length = torch.where(
+                        mask,
+                        full_length,
+                        torch.ones_like(full_length),
                     )
-                    slip_velocity = self.loss_computer.loss_weights.get('slip_velocity', 0.1)
-                    slip_tangent_grad = self.loss_computer.loss_weights.get('slip_tangent_grad', 1.0)
-                    if bool(horizontal.any()):
-                        du_dy = self._grad(u, y, create_graph=True, silent=True)
-                        extra_point_loss = torch.where(
-                            horizontal,
-                            extra_point_loss + slip_tangent_grad * du_dy ** 2
-                            + slip_velocity * (u - self.data_handler.inlet_u_norm) ** 2,
-                            extra_point_loss,
+                    nx_full = torch.where(
+                        mask,
+                        normal_x / safe_length,
+                        torch.zeros_like(u),
+                    )
+                    ny_full = torch.where(
+                        mask,
+                        normal_y / safe_length,
+                        torch.zeros_like(v),
+                    )
+                    tangential_velocity = -u * ny_full + v * nx_full
+                    dut_dn = self.loss_computer._normal_derivative(
+                        tangential_velocity,
+                        x,
+                        y,
+                        nx,
+                        ny,
+                        mask,
+                    )
+                    extra_point_loss[mask] = (
+                        self.loss_computer.loss_weights.get(
+                            'symmetry_grad',
+                            10.0,
                         )
-                    if bool(vertical.any()):
-                        dv_dx = self._grad(v, x, create_graph=True, silent=True)
-                        extra_point_loss = torch.where(
-                            vertical,
-                            extra_point_loss + slip_tangent_grad * dv_dx ** 2
-                            + slip_velocity * (v - self.data_handler.inlet_v_norm) ** 2,
-                            extra_point_loss,
-                        )
-                else:
-                    point_loss = (v - self.data_handler.inlet_v_norm) ** 2
-                    du_dy = self._grad(u, y, create_graph=True, silent=True)
-                    extra_point_loss = (
-                        self.loss_computer.loss_weights.get('slip_tangent_grad', 1.0) * du_dy ** 2
-                        + self.loss_computer.loss_weights.get('slip_velocity', 0.1)
-                        * (u - self.data_handler.inlet_u_norm) ** 2
+                        * dut_dn.square()
                     )
-            elif name == 'symmetry':
-                # create_graph=True keeps the training graph intact for the
-                # subsequent total_loss.backward().
-                du_dy = self._grad(u, y, create_graph=True, silent=True)
-                point_loss = v ** 2
-                extra_point_loss = self.loss_computer.loss_weights.get('symmetry_grad', 10.0) * du_dy ** 2
             elif name == 'axis_symmetry':
                 # create_graph=True keeps the training graph intact for the
                 # subsequent total_loss.backward().
@@ -779,6 +998,7 @@ class Trainer:
         self.model.eval()
 
         idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+        case_ids = getattr(batch, 'case_id', None)
         n = min(max_samples, x.shape[0])
         if n <= 1:
             if was_training:
@@ -788,7 +1008,6 @@ class Trainer:
         x = x[:n].to(self.device, dtype=self.dtype)
         y = y[:n].to(self.device, dtype=self.dtype)
         sdf = sdf[:n].to(self.device, dtype=self.dtype)
-        bt = bt[:n].to(self.device, dtype=self.dtype) if bt.shape[1] > 0 else None
         params = [p for p in self.model.parameters() if p.requires_grad]
         rows = []
 
@@ -797,7 +1016,11 @@ class Trainer:
                 x[i:i + 1],
                 y[i:i + 1],
                 sdf[i:i + 1],
-                bt[i:i + 1] if bt is not None else None
+                case_ids=(
+                    case_ids[i:i + 1].to(self.device, dtype=torch.long)
+                    if case_ids is not None
+                    else None
+                ),
             )
             out_i = self.model(input_i).sum()
             grads = torch.autograd.grad(out_i, params, retain_graph=False, allow_unused=True)
@@ -839,19 +1062,34 @@ class Trainer:
         with torch.no_grad():
             for batch in dataloader:
                 idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+                case_ids = getattr(batch, 'case_id', None)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
-                sdf = sdf.to(self.device, dtype=self.dtype)
+                sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
                 if bt.shape[1] > 0:
                     bt = bt.to(self.device, dtype=self.dtype)
                 else:
                     bt = None
 
-                input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                input_tensor = self.loss_computer.build_input_tensor(
+                    x,
+                    y,
+                    sdf,
+                    case_ids=case_ids,
+                )
                 out = self.model(input_tensor)
                 u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+                u, v, p = self.loss_computer.transform_outputs(
+                    u_raw,
+                    v_raw,
+                    p_raw,
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
 
-                # Применяем hard constraints, если нужно
+                # Legacy pointwise override.
                 if self.loss_computer.bc_type == 'hard':
                     mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
                     mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
@@ -860,11 +1098,14 @@ class Trainer:
                     v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     u, v, p = self.loss_computer.apply_hard_constraints(
-                        u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                        u, v, p, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
                     )
-                else:
-                    u, v, p = u_raw, v_raw, p_raw
-                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
+                    u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                        u,
+                        v,
+                        bt,
+                        case_ids=case_ids,
+                    )
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -976,11 +1217,23 @@ class Trainer:
         self.model.eval()
         x_pts = dataset.x[indices].to(self.device, dtype=self.dtype)
         y_pts = dataset.y[indices].to(self.device, dtype=self.dtype).requires_grad_(True)
-        sdf_pts = dataset.sdf[indices].to(self.device, dtype=self.dtype)
-        bt_pts = dataset.boundary_types[indices].to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
-        input_tensor = self.loss_computer.build_input_tensor(x_pts, y_pts, sdf_pts, bt_pts)
+        sdf_pts = self.loss_computer.evaluate_sdf_tensor(x_pts, y_pts)
+        input_tensor = self.loss_computer.build_input_tensor(
+            x_pts,
+            y_pts,
+            sdf_pts,
+            case_ids=dataset.case_id[indices],
+        )
         out = self.model(input_tensor)
-        u_vals = out[:, 0:1]
+        u_vals, _, _ = self.loss_computer.transform_outputs(
+            out[:, 0:1],
+            out[:, 1:2],
+            out[:, 2:3],
+            x_pts,
+            y_pts,
+            sdf=sdf_pts,
+            case_ids=dataset.case_id[indices],
+        )
         # Обнуляем накопленные градиенты перед вычислением du/dy
         self.model.zero_grad()
         if y_pts.grad is not None:
@@ -1004,8 +1257,14 @@ class Trainer:
             'rar_history': self.rar_history,
             'rar_used_sources': sorted(getattr(self, '_rar_used_sources', set())),
             'fvm_epoch_counter': self._fvm_epoch_counter,
+            'fvm_optimizer_step_counter': self._fvm_optimizer_step_counter,
             'last_fvm_loss': self._last_fvm_loss,
+            'last_fvm_raw_loss': self._last_fvm_raw_loss,
+            'last_fvm_rms': self._last_fvm_rms,
+            'last_fvm_evaluations': self._last_fvm_evaluations,
             'last_integral_loss': self._last_integral_loss,
+            'last_pressure_gauge_mse': self._last_pressure_gauge_mse,
+            'last_pressure_gauge_loss': self._last_pressure_gauge_loss,
             'rar_fvm_rebuild_counter': self._rar_fvm_rebuild_counter,
             'rar_new_points_since_fvm': self._rar_new_points_since_fvm,
             'rar_step_counter': self._rar_step_counter,
@@ -1043,8 +1302,35 @@ class Trainer:
         self.rar_history = list(state.get('rar_history', self.rar_history) or [])
         self._rar_used_sources = set(int(v) for v in state.get('rar_used_sources', []))
         self._fvm_epoch_counter = int(state.get('fvm_epoch_counter', self._fvm_epoch_counter))
+        self._fvm_optimizer_step_counter = int(
+            state.get(
+                'fvm_optimizer_step_counter',
+                self._fvm_optimizer_step_counter,
+            )
+        )
         self._last_fvm_loss = float(state.get('last_fvm_loss', self._last_fvm_loss))
+        self._last_fvm_raw_loss = float(
+            state.get('last_fvm_raw_loss', self._last_fvm_raw_loss)
+        )
+        self._last_fvm_rms = float(
+            state.get('last_fvm_rms', self._last_fvm_rms)
+        )
+        self._last_fvm_evaluations = int(
+            state.get('last_fvm_evaluations', self._last_fvm_evaluations)
+        )
         self._last_integral_loss = float(state.get('last_integral_loss', self._last_integral_loss))
+        self._last_pressure_gauge_mse = float(
+            state.get(
+                'last_pressure_gauge_mse',
+                self._last_pressure_gauge_mse,
+            )
+        )
+        self._last_pressure_gauge_loss = float(
+            state.get(
+                'last_pressure_gauge_loss',
+                self._last_pressure_gauge_loss,
+            )
+        )
         self._rar_fvm_rebuild_counter = int(state.get('rar_fvm_rebuild_counter', self._rar_fvm_rebuild_counter))
         self._rar_new_points_since_fvm = int(state.get('rar_new_points_since_fvm', self._rar_new_points_since_fvm))
         self._rar_step_counter = int(state.get('rar_step_counter', self._rar_step_counter))
@@ -1073,10 +1359,20 @@ class Trainer:
             return 0
 
         x_new, y_new, sdf_new = generated.x, generated.y, generated.sdf
-        added = self.data_handler.add_interior_points(x_new, y_new, sdf_new)
+        added = self.data_handler.add_interior_points(
+            x_new,
+            y_new,
+            sdf_new,
+            case_id=generated.case_id,
+        )
         if added == 0:
             logger.info("Adaptive RAR: DataHandler не добавил новых точек.")
             return 0
+
+        # DataHandler stores network coordinates in its dataset dtype.  Rebuild
+        # the derived SDF cache after that cast so every accepted RAR point is
+        # tied to its actual stored coordinates and active geometry.
+        self.loss_computer.synchronize_cached_training_sdf()
 
         new_residual = torch.zeros(added, device='cpu', dtype=self.dtype)
         self.point_residual = torch.cat([self.point_residual, new_residual], dim=0)
@@ -1154,7 +1450,13 @@ class Trainer:
                 return
             chord = float(getattr(self.data_handler, 'chord', 1.0))
             re = float(getattr(self.data_handler, 'Re', 0.0))
-            delta, _ = estimate_boundary_layer_delta(chord, re)
+            delta = getattr(self.data_handler, 'delta_bl_99_est', None)
+            if delta is None:
+                delta, _ = estimate_boundary_layer_delta(
+                    chord,
+                    re,
+                    model=str(getattr(self.data_handler, 'boundary_layer_model', 'laminar')),
+                )
             sdf_m = ds.sdf.cpu().numpy().reshape(-1)[mask].astype(np.float64) * chord
             summary = compute_sdf_summary(sdf_m, chord=chord, delta=delta)
             for line in format_sdf_summary(
@@ -1169,11 +1471,7 @@ class Trainer:
         """Расширяет SA-веса после добавления новых точек."""
         if self.sa_weights is None or n_new <= 0:
             return
-        old_weights = self.sa_weights.log_weights.detach().cpu()
-        init_raw = float(getattr(self.sa_weights, 'initial_raw_value', 0.0))
-        new_weights = torch.full((n_new, old_weights.shape[1]), init_raw, device='cpu')
-        combined_weights = torch.cat([old_weights, new_weights], dim=0)
-        self.sa_weights.log_weights = nn.Parameter(combined_weights.to(self.device))
+        self.sa_weights.extend(n_new)
         self.sa_weights_changed = True
         logger.warning("RAR: SA-веса расширены. Требуется пересоздание оптимизатора в solver.")
 
@@ -1246,7 +1544,6 @@ class Trainer:
         if dh.mesh_airfoil_coords is not None:
             foil_norm = np.asarray(dh.mesh_airfoil_coords, dtype=np.float64) / float(dh.chord)
 
-        wall_tree = self._build_wall_tree(coords, ds)
         accepted: List[np.ndarray] = []
         accepted_sdf: List[float] = []
         accepted_arr = np.empty((0, 2), dtype=np.float64)
@@ -1285,17 +1582,17 @@ class Trainer:
                 cand = cand[valid]
                 min_dist = min_dist[valid]
 
-            if wall_tree is not None:
-                sdf_vals, _ = wall_tree.query(cand, k=1, workers=-1)
-                min_sdf = self.rar_min_boundary_distance_factor * median_h
-                valid = sdf_vals >= min_sdf
-                if not np.any(valid):
-                    continue
-                cand = cand[valid]
-                min_dist = min_dist[valid]
-                sdf_vals = sdf_vals[valid]
-            else:
-                sdf_vals = np.zeros(len(cand), dtype=np.float64)
+            sdf_vals = self.loss_computer.evaluate_sdf_numpy(
+                cand,
+                point_chunk_size=4096,
+            )
+            min_sdf = self.rar_min_boundary_distance_factor * median_h
+            valid = sdf_vals >= min_sdf
+            if not np.any(valid):
+                continue
+            cand = cand[valid]
+            min_dist = min_dist[valid]
+            sdf_vals = sdf_vals[valid]
 
             batch_pts: List[np.ndarray] = []
             batch_sdf: List[float] = []
@@ -1335,16 +1632,6 @@ class Trainer:
             len(pts),
         )
         return pts[:, 0], pts[:, 1], sdf
-
-    @staticmethod
-    def _build_wall_tree(coords: np.ndarray, dataset) -> Optional[cKDTree]:
-        """KDTree по wall-точкам для быстрого SDF новых RAR-точек."""
-        if dataset.boundary_types is None or 'wall' not in dataset.type_to_idx:
-            return None
-        wall_mask = (dataset.boundary_types[:, dataset.type_to_idx['wall']] > 0.5).cpu().numpy()
-        if not np.any(wall_mask):
-            return None
-        return cKDTree(coords[wall_mask])
 
     @staticmethod
     def _valid_interior_mask(
@@ -1429,7 +1716,15 @@ class Trainer:
             self._save_rar_mesh_volume_plot(mesh)
             logger.info("Adaptive RAR: FVM-сетка перестроена.")
         except Exception as exc:
-            logger.warning("Adaptive RAR: не удалось перестроить FVM-сетку: %s", exc, exc_info=True)
+            if self.loss_computer.fvm_weight > 0.0:
+                raise RuntimeError(
+                    "Adaptive RAR produced an invalid FVM mesh"
+                ) from exc
+            logger.warning(
+                "Adaptive RAR: не удалось перестроить FVM-сетку: %s",
+                exc,
+                exc_info=True,
+            )
 
     def _save_rar_mesh_volume_plot(self, mesh) -> None:
         """Сохраняет карту объёмов контрольных объёмов после RAR rebuild."""
@@ -1475,6 +1770,75 @@ class Trainer:
         _, x_fvm, y_fvm, sdf_fvm, bt_fvm = self._fvm_tensor_cache
         return x_fvm, y_fvm, sdf_fvm, bt_fvm
 
+    def _forward_fvm_cases(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sdf: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+    ) -> List[Tuple[int, torch.Tensor, torch.Tensor]]:
+        """Evaluate one shared FVM mesh independently for every flow case.
+
+        Returns:
+            Tuples ``(case_id, [u, v, p], freestream_velocity)``.  Averaging
+            losses over these tuples gives every operating point equal weight
+            and prevents fluxes from unrelated cases from cancelling.
+        """
+        outputs = []
+        flow_cases = getattr(self.data_handler, "flow_cases", {0: None})
+        for case_id in sorted(flow_cases):
+            case_ids = torch.full(
+                (x.shape[0],),
+                int(case_id),
+                device=x.device,
+                dtype=torch.long,
+            )
+            inputs = self.loss_computer.build_input_tensor(
+                x,
+                y,
+                sdf,
+                case_ids=case_ids,
+            )
+            raw = self.model(inputs)
+            if hasattr(self.loss_computer, "transform_outputs"):
+                u, v, p = self.loss_computer.transform_outputs(
+                    raw[:, 0:1],
+                    raw[:, 1:2],
+                    raw[:, 2:3],
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
+            else:
+                u, v, p = (
+                    raw[:, 0:1],
+                    raw[:, 1:2],
+                    raw[:, 2:3],
+                )
+            if (
+                self.loss_computer.bc_type == "hard"
+                and boundary_types is not None
+            ):
+                u, v, p = self._apply_hard_constraints_from_boundary_types(
+                    u,
+                    v,
+                    p,
+                    boundary_types,
+                    case_ids=case_ids,
+                )
+            target_u, target_v = (
+                self.loss_computer.get_freestream_targets(
+                    x[:1],
+                    case_ids[:1],
+                )
+            )
+            freestream = torch.cat((target_u, target_v), dim=1).reshape(2)
+            outputs.append(
+                (int(case_id), torch.cat((u, v, p), dim=1), freestream)
+            )
+        return outputs
+
     def _compute_global_integral_loss_from_dataset(self) -> torch.Tensor:
         """Fallback integral loss по полной выборке inlet/outlet, если FVM-сетки нет."""
         if not self.loss_computer.integral_condition:
@@ -1499,18 +1863,32 @@ class Trainer:
 
         x = ds.x[mask].to(self.device, dtype=self.dtype)
         y = ds.y[mask].to(self.device, dtype=self.dtype)
-        sdf = ds.sdf[mask].to(self.device, dtype=self.dtype)
+        sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
         bt = ds.boundary_types[mask].to(self.device, dtype=self.dtype)
 
-        inp = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        inp = self.loss_computer.build_input_tensor(
+            x,
+            y,
+            sdf,
+            case_ids=ds.case_id[mask],
+        )
         out = self.model(inp)
         u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+        u, v, p = self.loss_computer.transform_outputs(
+            u_raw,
+            v_raw,
+            p_raw,
+            x,
+            y,
+            sdf=sdf,
+            case_ids=ds.case_id[mask],
+        )
 
         if self.loss_computer.bc_type == 'hard':
-            u, v, _ = self.loss_computer.apply_hard_constraints(
-                u_raw,
-                v_raw,
-                p_raw,
+            u, v, p = self.loss_computer.apply_hard_constraints(
+                u,
+                v,
+                p,
                 ds.mask_u_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
                 ds.mask_v_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
                 ds.mask_p_fixed[mask].to(self.device, dtype=torch.bool).view(-1, 1),
@@ -1518,11 +1896,31 @@ class Trainer:
                 ds.v_bc[mask].to(self.device, dtype=self.dtype).view(-1, 1),
                 ds.p_bc[mask].to(self.device, dtype=self.dtype).view(-1, 1),
             )
-        else:
-            u, v = u_raw, v_raw
-        u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
-
-        return self.loss_computer.compute_integral_loss(u, v, bt, x, y)
+            u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                u,
+                v,
+                bt,
+                case_ids=ds.case_id[mask],
+            )
+        selected_case_ids = ds.case_id[mask].to(
+            self.device,
+            dtype=torch.long,
+        )
+        case_losses = []
+        for case_id in torch.unique(selected_case_ids, sorted=True):
+            case_mask = selected_case_ids == case_id
+            case_losses.append(
+                self.loss_computer.compute_integral_loss(
+                    u[case_mask],
+                    v[case_mask],
+                    bt[case_mask],
+                    x[case_mask],
+                    y[case_mask],
+                )
+            )
+        if not case_losses:
+            return torch.zeros((), device=self.device, dtype=self.dtype)
+        return torch.stack(case_losses).mean()
 
     # ------------------------------------------------------------------
     # FVM-шаг (полный датасет, отдельный от батч-цикла)
@@ -1554,42 +1952,80 @@ class Trainer:
         # Это корректно даже если датасет и сетка имеют разный размер.
         x_all, y_all, sdf_all, bt_all = self._get_fvm_tensors()
 
-        input_all = self.loss_computer.build_input_tensor(x_all, y_all, sdf_all, bt_all)
-        out_all   = self.model(input_all)          # (N_mesh, output_dim)
-        u_fvm     = out_all[:, :2]                  # (N_mesh, 2) — u и v
+        case_outputs = self._forward_fvm_cases(
+            x_all,
+            y_all,
+            sdf_all,
+            bt_all,
+        )
+        fvm_loss = torch.stack(
+            [
+                self.loss_computer.compute_fvm_loss(
+                    output[:, :2],
+                    freestream_velocity=freestream,
+                )
+                for _, output, freestream in case_outputs
+            ]
+        ).mean()
 
-        fvm_loss = self.loss_computer.compute_fvm_loss(u_fvm)
-
+        ensure_finite_loss(
+            fvm_loss,
+            stage="standalone FVM forward",
+        )
         fvm_loss.backward()
+        check_gradient_health(
+            self.model.named_parameters(),
+            stage="standalone FVM backward",
+        )
         if self.grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             if self.sa_weights is not None:
                 torch.nn.utils.clip_grad_norm_(self.sa_weights.parameters(), self.grad_clip)
         self.optimizer.step()
+        if self.sa_weights is not None:
+            self.sa_weights.post_step_()
         self.optimizer.zero_grad()
 
         val = fvm_loss.item()
         logger.debug("FVM step: loss=%.4e", val)
         return val
 
-    def _scheduled_fvm_batches(self, n_batches: int, enabled: bool) -> set:
-        """
-        Возвращает индексы batch-ей, где запускается полный FVM-проход.
-
-        batch_interval задаётся пользователем в one-based терминах:
-        1 — каждый batch, 5 — batch 5, 10, 15, ...
-        Если interval больше числа batch-ей, FVM запускается один раз на
-        последнем batch-е эпохи.
-        Каждый запуск потом масштабируется так, чтобы суммарный FVM-вклад за
-        эпоху не становился больше заданного веса только из-за частоты запусков.
-        """
+    def _scheduled_fvm_batches(
+        self,
+        n_batches: int,
+        enabled: bool,
+    ) -> Dict[int, float]:
+        """Map optimizer-step batch indices to FVM frequency corrections."""
         if not enabled or n_batches <= 0:
-            return set()
+            return {}
+
+        accumulation_steps = max(1, int(getattr(self, "accum_steps", 1)))
+        optimizer_batches = [
+            index
+            for index in range(n_batches)
+            if (index + 1) % accumulation_steps == 0
+            or index == n_batches - 1
+        ]
         interval = max(1, int(self.fvm_batch_interval))
-        batches = set(range(interval - 1, n_batches, interval))
-        if not batches:
-            batches.add(n_batches - 1)
-        return batches
+        schedule = str(
+            getattr(self, "fvm_schedule", "every_optimizer_step")
+        ).lower().replace("-", "_")
+        selected: Dict[int, float] = {}
+        for batch_index in optimizer_batches:
+            if not hasattr(self, "_fvm_optimizer_step_counter"):
+                self._fvm_optimizer_step_counter = 0
+            self._fvm_optimizer_step_counter += 1
+            if schedule == "every_optimizer_step":
+                selected[batch_index] = 1.0
+            elif schedule == "every_k_optimizer_steps":
+                if self._fvm_optimizer_step_counter % interval == 0:
+                    selected[batch_index] = float(interval)
+            elif schedule == "stochastic_optimizer_step":
+                if random.random() < 1.0 / interval:
+                    selected[batch_index] = float(interval)
+            else:
+                raise ValueError(f"Unsupported FVM schedule: {self.fvm_schedule!r}")
+        return selected
 
     # ------------------------------------------------------------------
     # Шаг обучения (Adam)
@@ -1627,6 +2063,17 @@ class Trainer:
                 integral_scale=integral_scale,
             )
             total_loss = fwd['total'] / self.accum_steps
+        ensure_finite_loss(
+            total_loss,
+            stage="Adam forward",
+            components={
+                "pde": sum(fwd["pde_raw"].values()),
+                "bc": sum(fwd["bc_comp"].values()),
+                "pressure_gauge": fwd["pressure_gauge_loss"],
+                "integral": fwd["integral_loss"],
+                "fvm": fwd.get("fvm_loss", 0.0),
+            },
+        )
 
         # Обратное распространение
         if self.use_amp and self.scaler is not None:
@@ -1634,47 +2081,68 @@ class Trainer:
         else:
             total_loss.backward()
 
-        # Вычисляем норму градиентов (до клиппинга и шага)
         grad_norm = 0.0
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        if self.sa_weights is not None:
-            for p in self.sa_weights.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-        grad_norm = total_norm ** 0.5
 
         # Если пора делать шаг оптимизации
         if accum_step:
             if self.use_amp and self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-                if self.grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    if self.sa_weights is not None:
-                        torch.nn.utils.clip_grad_norm_(self.sa_weights.parameters(), self.grad_clip)
+            named_parameters = list(self.model.named_parameters())
+            if self.sa_weights is not None:
+                named_parameters.extend(
+                    (
+                        f"sa_weights.{name}",
+                        parameter,
+                    )
+                    for name, parameter in self.sa_weights.named_parameters()
+                )
+            gradient_health = check_gradient_health(
+                named_parameters,
+                stage="Adam backward",
+            )
+            grad_norm = gradient_health.l2_norm
+            if self.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.grad_clip,
+                )
+                if self.sa_weights is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.sa_weights.parameters(),
+                        self.grad_clip,
+                    )
+
+            if self.use_amp and self.scaler is not None:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                if self.sa_weights is not None:
+                    self.sa_weights.post_step_()
                 self.optimizer.zero_grad()
             else:
-                if self.grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    if self.sa_weights is not None:
-                        torch.nn.utils.clip_grad_norm_(self.sa_weights.parameters(), self.grad_clip)
                 self.optimizer.step()
+                if self.sa_weights is not None:
+                    self.sa_weights.post_step_()
                 self.optimizer.zero_grad()
 
         return {
             'total': fwd['total'].item(),
             'pde_raw': fwd['pde_raw'],
+            'pde_mse': fwd['pde_mse'],
             'pde_max': fwd['pde_max'],
+            'pde_counts': fwd['pde_counts'],
             'bc_comp': fwd['bc_comp'],
+            'bc_mse': fwd['bc_mse'],
+            'bc_counts': fwd['bc_counts'],
             'extra_grad': fwd['extra_grad'],
             'integral_loss': fwd['integral_loss'],
             'fvm_loss': fwd.get('fvm_loss', 0.0),
+            'fvm_raw_loss': fwd.get('fvm_raw_loss', 0.0),
+            'fvm_mse': fwd.get('fvm_mse', 0.0),
+            'fvm_weighted_loss': fwd.get('fvm_weighted_loss', 0.0),
+            'fvm_rms': fwd.get('fvm_rms', 0.0),
+            'pressure_gauge_loss': fwd['pressure_gauge_loss'],
+            'pressure_gauge_mse': fwd['pressure_gauge_raw'],
+            'pde_coverage': fwd['pde_coverage'],
             'wall_speed': fwd['wall_speed'],
             'grad_norm': grad_norm
         }
@@ -1714,31 +2182,40 @@ class Trainer:
         # Инициализация накопителей
         epoch_losses = {
             'total': 0.0,
-            'pde_raw': {c: 0.0 for c in self.loss_computer.pde_components},
+            'pde_squared_error_sum': {
+                c: 0.0 for c in self.loss_computer.pde_components
+            },
+            'pde_count': {c: 0 for c in self.loss_computer.pde_components},
             'pde_max': {c: 0.0 for c in self.loss_computer.pde_components},
-            'bc_comp': {b: 0.0 for b in self.data_handler.boundary_type_names} if self.loss_computer.bc_type == 'soft' else {},
+            'bc_squared_error_sum': {
+                b: 0.0 for b in self.data_handler.boundary_type_names
+            } if self.loss_computer.bc_type == 'soft' else {},
+            'bc_count': {
+                b: 0 for b in self.data_handler.boundary_type_names
+            } if self.loss_computer.bc_type == 'soft' else {},
             'extra_grad': 0.0,
             'integral_loss': 0.0,
+            'pressure_gauge_mse_sum': 0.0,
+            'pressure_gauge_loss_sum': 0.0,
             'wall_speed_sum': 0.0,
             'n_wall_batches': 0,
             'grad_norm_sum': 0.0,
             'grad_norm_count': 0,
             'fvm_loss_sum': 0.0,
+            'fvm_raw_loss_sum': 0.0,
+            'fvm_rms_squared_sum': 0.0,
             'fvm_loss_count': 0,
         }
         n_batches = 0
         n_total_batches = len(dataloader)
 
-        # FVM добавляется по пользовательскому batch_interval, но нормируется
-        # по числу запусков, чтобы эффективный вес за эпоху оставался тем же.
         self._fvm_epoch_counter += 1
         fvm_this_epoch = (
             self.loss_computer.fvm is not None
             and self.loss_computer.fvm_weight > 0.0
-            and self._fvm_epoch_counter % self.fvm_interval == 0
         )
         fvm_batches = self._scheduled_fvm_batches(n_total_batches, fvm_this_epoch)
-        fvm_scale = (float(self.accum_steps) / len(fvm_batches)) if fvm_batches else 1.0
+        self._last_fvm_evaluations = 0
 
         integral_this_epoch = (
             self.loss_computer.integral_condition
@@ -1752,6 +2229,11 @@ class Trainer:
             is_last_batch = (i == n_total_batches - 1)
             accum_step = ((i + 1) % self.accum_steps == 0) or is_last_batch
             add_fvm = i in fvm_batches
+            fvm_scale = (
+                float(self.accum_steps) * fvm_batches[i]
+                if add_fvm
+                else 1.0
+            )
             add_integral = i in integral_batches
             batch_losses = self.train_batch_adam(
                 batch,
@@ -1764,15 +2246,32 @@ class Trainer:
             )
 
             epoch_losses['total'] += batch_losses['total']
+            pde_counts = batch_losses.get('pde_counts', {})
             for k, v in batch_losses['pde_raw'].items():
-                epoch_losses['pde_raw'][k] += v
+                count = int(pde_counts.get(k, 1))
+                epoch_losses['pde_squared_error_sum'][k] += v * count
+                epoch_losses['pde_count'][k] += count
             for k, v in batch_losses['pde_max'].items():
-                epoch_losses['pde_max'][k] += v
+                epoch_losses['pde_max'][k] = max(
+                    epoch_losses['pde_max'][k],
+                    v,
+                )
             if self.loss_computer.bc_type == 'soft':
+                bc_counts = batch_losses.get('bc_counts', {})
                 for k, v in batch_losses['bc_comp'].items():
-                    epoch_losses['bc_comp'][k] += v
+                    count = int(bc_counts.get(k, 1))
+                    epoch_losses['bc_squared_error_sum'][k] += v * count
+                    epoch_losses['bc_count'][k] += count
                 epoch_losses['extra_grad'] += batch_losses['extra_grad']
             epoch_losses['integral_loss'] += batch_losses['integral_loss']
+            epoch_losses['pressure_gauge_mse_sum'] += batch_losses.get(
+                'pressure_gauge_mse',
+                0.0,
+            )
+            epoch_losses['pressure_gauge_loss_sum'] += batch_losses.get(
+                'pressure_gauge_loss',
+                0.0,
+            )
             if batch_losses['wall_speed'] is not None:
                 epoch_losses['wall_speed_sum'] += batch_losses['wall_speed']
                 epoch_losses['n_wall_batches'] += 1
@@ -1781,7 +2280,15 @@ class Trainer:
                 epoch_losses['grad_norm_count'] += 1
             if add_fvm:
                 epoch_losses['fvm_loss_sum'] += batch_losses.get('fvm_loss', 0.0)
+                epoch_losses['fvm_raw_loss_sum'] += batch_losses.get(
+                    'fvm_raw_loss',
+                    0.0,
+                )
+                epoch_losses['fvm_rms_squared_sum'] += (
+                    batch_losses.get('fvm_rms', 0.0) ** 2
+                )
                 epoch_losses['fvm_loss_count'] += 1
+                self._last_fvm_evaluations += 1
             if add_integral:
                 self._last_integral_loss = batch_losses.get('integral_loss', 0.0)
             n_batches += 1
@@ -1791,15 +2298,37 @@ class Trainer:
 
         # Усреднение
         avg_loss = epoch_losses['total'] / n_batches
-        avg_pde = {k: v / n_batches for k, v in epoch_losses['pde_raw'].items()}
-        avg_max = {k: v / n_batches for k, v in epoch_losses['pde_max'].items()}
+        avg_pde = {
+            key: (
+                epoch_losses['pde_squared_error_sum'][key]
+                / epoch_losses['pde_count'][key]
+                if epoch_losses['pde_count'][key] > 0
+                else 0.0
+            )
+            for key in self.loss_computer.pde_components
+        }
+        avg_max = dict(epoch_losses['pde_max'])
         if self.loss_computer.bc_type == 'soft':
-            avg_bc = {k: v / n_batches for k, v in epoch_losses['bc_comp'].items()}
+            avg_bc = {
+                key: (
+                    epoch_losses['bc_squared_error_sum'][key]
+                    / epoch_losses['bc_count'][key]
+                    if epoch_losses['bc_count'][key] > 0
+                    else 0.0
+                )
+                for key in self.data_handler.boundary_type_names
+            }
             avg_extra_grad = epoch_losses['extra_grad'] / n_batches
         else:
             avg_bc = {}
             avg_extra_grad = 0.0
         avg_integral = self._last_integral_loss if self.loss_computer.integral_condition else 0.0
+        self._last_pressure_gauge_mse = (
+            epoch_losses['pressure_gauge_mse_sum'] / n_batches
+        )
+        self._last_pressure_gauge_loss = (
+            epoch_losses['pressure_gauge_loss_sum'] / n_batches
+        )
         avg_wall_speed = (epoch_losses['wall_speed_sum'] / epoch_losses['n_wall_batches']
                           if epoch_losses['n_wall_batches'] > 0 else 0.0)
         avg_grad_norm = epoch_losses['grad_norm_sum'] / epoch_losses['grad_norm_count'] if epoch_losses['grad_norm_count'] > 0 else 0.0
@@ -1815,9 +2344,18 @@ class Trainer:
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
 
         if epoch_losses['fvm_loss_count'] > 0:
-            self._last_fvm_loss = epoch_losses['fvm_loss_sum'] / epoch_losses['fvm_loss_count']
+            count = epoch_losses['fvm_loss_count']
+            self._last_fvm_loss = epoch_losses['fvm_loss_sum'] / count
+            self._last_fvm_raw_loss = (
+                epoch_losses['fvm_raw_loss_sum'] / count
+            )
+            self._last_fvm_rms = math.sqrt(
+                max(epoch_losses['fvm_rms_squared_sum'] / count, 0.0)
+            )
         else:
             self._last_fvm_loss = 0.0
+            self._last_fvm_raw_loss = 0.0
+            self._last_fvm_rms = 0.0
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, avg_grad_norm
 
@@ -1846,34 +2384,46 @@ class Trainer:
 
         pde_raw_list = []
         pde_max_list = []
+        pde_count_list = []
         bc_comp_list = []
+        bc_count_list = []
         integral_loss_list = []
+        pressure_gauge_mse_list = []
+        pressure_gauge_loss_list = []
         fvm_loss_list = []
+        fvm_raw_loss_list = []
+        fvm_rms_list = []
         wall_speed_list = []
         n_batches = 0
+        fvm_evaluations = 0
 
         # FVM добавляется прямо в closure — единый backward с PDE/BC
         self._fvm_epoch_counter += 1
         fvm_this_epoch = (
             self.loss_computer.fvm is not None
             and self.loss_computer.fvm_weight > 0.0
-            and self._fvm_epoch_counter % self.fvm_interval == 0
         )
+        fvm_decision = self._scheduled_fvm_batches(1, fvm_this_epoch)
+        fvm_correction = fvm_decision.get(0)
 
         def closure():
             self.optimizer.zero_grad()
             total_loss = 0.0
-            nonlocal n_batches
+            nonlocal n_batches, fvm_evaluations
             pde_raw_list.clear()
             pde_max_list.clear()
+            pde_count_list.clear()
             bc_comp_list.clear()
+            bc_count_list.clear()
             integral_loss_list.clear()
+            pressure_gauge_mse_list.clear()
+            pressure_gauge_loss_list.clear()
             fvm_loss_list.clear()
+            fvm_raw_loss_list.clear()
+            fvm_rms_list.clear()
             wall_speed_list.clear()
             n_batches = 0
             batches_list = list(dataloader)
-            fvm_batches = self._scheduled_fvm_batches(len(batches_list), fvm_this_epoch)
-            fvm_scale = (1.0 / len(fvm_batches)) if fvm_batches else 1.0
             integral_batches = (
                 {len(batches_list) - 1}
                 if self.loss_computer.integral_condition
@@ -1883,13 +2433,20 @@ class Trainer:
             )
             self._last_integral_loss = 0.0
             for k, batch in enumerate(batches_list):
-                add_fvm_b = k in fvm_batches
+                add_fvm_b = (
+                    fvm_correction is not None
+                    and k == len(batches_list) - 1
+                )
                 add_integral_b = k in integral_batches
                 fwd = self.forward_pass(
                     batch,
                     pde_mult=1.0,
                     add_fvm=add_fvm_b,
-                    fvm_scale=fvm_scale,
+                    fvm_scale=(
+                        float(fvm_correction)
+                        if fvm_correction is not None
+                        else 1.0
+                    ),
                     add_integral=add_integral_b,
                     integral_scale=1.0,
                 )
@@ -1897,18 +2454,41 @@ class Trainer:
 
                 pde_raw_list.append(fwd['pde_raw'])
                 pde_max_list.append(fwd['pde_max'])
+                pde_count_list.append(fwd['pde_counts'])
                 if self.loss_computer.bc_type == 'soft':
                     bc_comp_list.append(fwd['bc_comp'])
+                    bc_count_list.append(fwd['bc_counts'])
                 if add_integral_b:
                     integral_loss_list.append(fwd['integral_loss'])
                     self._last_integral_loss = fwd['integral_loss']
+                pressure_gauge_mse_list.append(fwd['pressure_gauge_raw'])
+                pressure_gauge_loss_list.append(fwd['pressure_gauge_loss'])
                 if fwd['wall_speed'] is not None:
                     wall_speed_list.append(fwd['wall_speed'])
-                if add_fvm_b and fwd.get('fvm_loss', 0.0) > 0:
+                if add_fvm_b:
                     fvm_loss_list.append(fwd.get('fvm_loss', 0.0))
+                    fvm_raw_loss_list.append(
+                        fwd.get('fvm_raw_loss', 0.0)
+                    )
+                    fvm_rms_list.append(fwd.get('fvm_rms', 0.0))
+                    fvm_evaluations += 1
                 n_batches += 1
 
+            ensure_finite_loss(
+                total_loss,
+                stage="L-BFGS forward",
+                components={
+                    "pde_batches": len(pde_raw_list),
+                    "bc_batches": len(bc_comp_list),
+                    "integral_batches": len(integral_loss_list),
+                    "fvm_batches": len(fvm_loss_list),
+                },
+            )
             total_loss.backward()
+            check_gradient_health(
+                self.model.named_parameters(),
+                stage="L-BFGS backward",
+            )
             return total_loss
 
         loss = self.optimizer.step(closure)
@@ -1917,20 +2497,48 @@ class Trainer:
         avg_pde = {}
         avg_max = {}
         for key in self.loss_computer.pde_components:
-            vals_pde = [d[key] for d in pde_raw_list]
             vals_max = [d[key] for d in pde_max_list]
-            avg_pde[key] = np.mean(vals_pde) if vals_pde else 0.0
-            avg_max[key] = np.mean(vals_max) if vals_max else 0.0
+            squared_error_sum = sum(
+                mse[key] * int(counts.get(key, 1))
+                for mse, counts in zip(pde_raw_list, pde_count_list)
+            )
+            point_count = sum(
+                int(counts.get(key, 1))
+                for counts in pde_count_list
+            )
+            avg_pde[key] = (
+                squared_error_sum / point_count if point_count > 0 else 0.0
+            )
+            avg_max[key] = max(vals_max) if vals_max else 0.0
 
         if self.loss_computer.bc_type == 'soft':
             avg_bc = {}
             for key in self.data_handler.boundary_type_names:
-                vals = [d.get(key, 0.0) for d in bc_comp_list]
-                avg_bc[key] = np.mean(vals) if vals else 0.0
+                squared_error_sum = sum(
+                    mse.get(key, 0.0) * int(counts.get(key, 1))
+                    for mse, counts in zip(bc_comp_list, bc_count_list)
+                )
+                point_count = sum(
+                    int(counts.get(key, 1))
+                    for counts in bc_count_list
+                )
+                avg_bc[key] = (
+                    squared_error_sum / point_count if point_count > 0 else 0.0
+                )
         else:
             avg_bc = {}
 
         avg_integral = np.mean(integral_loss_list) if integral_loss_list else 0.0
+        self._last_pressure_gauge_mse = (
+            float(np.mean(pressure_gauge_mse_list))
+            if pressure_gauge_mse_list
+            else 0.0
+        )
+        self._last_pressure_gauge_loss = (
+            float(np.mean(pressure_gauge_loss_list))
+            if pressure_gauge_loss_list
+            else 0.0
+        )
         avg_wall_speed = np.mean(wall_speed_list) if wall_speed_list else 0.0
         avg_loss = loss.item() if torch.is_tensor(loss) else loss
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
@@ -1938,8 +2546,15 @@ class Trainer:
 
         if fvm_loss_list:
             self._last_fvm_loss = float(np.mean(fvm_loss_list))
+            self._last_fvm_raw_loss = float(np.mean(fvm_raw_loss_list))
+            self._last_fvm_rms = float(
+                np.sqrt(np.mean(np.square(fvm_rms_list)))
+            )
         else:
             self._last_fvm_loss = 0.0
+            self._last_fvm_raw_loss = 0.0
+            self._last_fvm_rms = 0.0
+        self._last_fvm_evaluations = fvm_evaluations
 
         return avg_loss, avg_pde, avg_bc, avg_extra_grad, avg_integral, avg_wall_speed, avg_max, pde_rate, 0.0
 

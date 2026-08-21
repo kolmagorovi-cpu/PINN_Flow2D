@@ -17,9 +17,11 @@
 """
 
 import os
+import platform
 import sys
 import time
 import logging
+from collections import deque
 from datetime import datetime
 from typing import Dict, Optional, Union
 
@@ -31,10 +33,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from airfoil_pinn.app.paths import PATHS, project_relative, resolve_project_path
+from airfoil_pinn.config.validation import (
+    validate_runtime_contract,
+    validate_static_config,
+)
 from airfoil_pinn.utils import check_memory_usage, set_seed
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.training.models import PINNIncompressible, SelfAdaptiveWeights
 from airfoil_pinn.training.checkpoint import CheckpointManager
+from airfoil_pinn.training.contract import (
+    build_training_contract,
+    validate_checkpoint_contract,
+)
 from airfoil_pinn.training.key_listener import KeyListener
 from airfoil_pinn.training.visualizer import Visualizer
 from airfoil_pinn.training.boundary_layer_diagnostics import run_boundary_layer_diagnostics
@@ -43,6 +53,12 @@ from airfoil_pinn.training.reference import (
     interpolate_reference,
     load_reference,
 )
+from airfoil_pinn.training.progress import build_epoch_progress
+from airfoil_pinn.training.reproducibility import (
+    capture_rng_state,
+    restore_rng_state,
+)
+from airfoil_pinn.training.telemetry import RunTelemetry
 
 # Компоненты тренировочного процесса.
 from airfoil_pinn.training.components.optimizers import LocalMinimaDetector, CyclicLR
@@ -69,6 +85,7 @@ class PINNSolver:
             experiment_dir: директория для сохранения результатов эксперимента
                            (если None, создаётся уникальная папка в workspace/experiments)
         """
+        validate_static_config(config)
         self.config = config
         self.config_name = config.get('project_name', 'unnamed')
         self.experiment_dir = str(resolve_project_path(experiment_dir)) if experiment_dir else None
@@ -105,6 +122,8 @@ class PINNSolver:
             pin_memory=pin_memory,
             persistent_workers=data_cfg.get('persistent_workers'),
             prefetch_factor=data_cfg.get('prefetch_factor'),
+            seed=seed,
+            pde_system=config['pde']['system'],
         )
 
         # Константы PDE (нормированные)
@@ -140,10 +159,26 @@ class PINNSolver:
             device=self.device,
             dtype=self.dtype
         )
-
+        validate_runtime_contract(
+            config,
+            self.data_handler,
+            self.loss_computer.feature_assembler,
+            sdf_geometry_fingerprint=(
+                self.loss_computer.sdf_geometry_fingerprint
+            ),
+        )
         # FVM-геометрия используется не только для FVM-loss, но и для
         # корректного интегрального баланса массы по граничным граням.
         self._setup_fvm_residuals()
+        self.training_contract = build_training_contract(
+            config,
+            self.data_handler,
+            self.loss_computer,
+        )
+        logger.info(
+            "Training contract: %s",
+            self.training_contract.fingerprint()[:12],
+        )
 
         # SA-веса (если используются)
         self.sa_weights = None
@@ -215,9 +250,11 @@ class PINNSolver:
             config_name=self.config_name,
             reference_data=self.reference_data
         )
+        self.telemetry = RunTelemetry(self._get_logs_dir())
 
         # Загрузка чекпоинта — после MetricsCollector, т.к. восстанавливает history
         self._load_checkpoint_if_needed()
+        self._write_run_manifest()
 
         # Визуализация
         out_cfg = config['output']
@@ -312,24 +349,91 @@ class PINNSolver:
     def _init_dtype(self, dtype_str: str) -> torch.dtype:
         return {'float32': torch.float32, 'float64': torch.float64, 'float16': torch.float16}[dtype_str]
 
+    def _write_run_manifest(self) -> None:
+        """Persist the effective graph, runtime and data-loader identity."""
+        base_model = self._unwrap_model_for_state(self.model)
+        parameter_count = sum(
+            parameter.numel()
+            for parameter in base_model.parameters()
+        )
+        trainable_count = sum(
+            parameter.numel()
+            for parameter in base_model.parameters()
+            if parameter.requires_grad
+        )
+        payload = {
+            "training_contract": self.training_contract.to_metadata(),
+            "runtime": {
+                "python": platform.python_version(),
+                "torch": torch.__version__,
+                "platform": platform.platform(),
+                "device": str(self.device),
+                "dtype": str(self.dtype),
+                "amp": self.use_amp,
+                "start_epoch": self.start_epoch,
+            },
+            "model": {
+                "class": base_model.__class__.__name__,
+                "parameters": parameter_count,
+                "trainable_parameters": trainable_count,
+            },
+            "data_loader": {
+                "points": self.data_handler.n_points,
+                "batch_size": self.data_handler.batch_size,
+                "batches": len(self.data_handler.get_dataloader()),
+                "num_workers": self.data_handler.num_workers,
+                "pin_memory": self.data_handler.pin_memory,
+                "persistent_workers": (
+                    self.data_handler.persistent_workers
+                    if self.data_handler.num_workers > 0
+                    else False
+                ),
+                "prefetch_factor": (
+                    self.data_handler.prefetch_factor
+                    if self.data_handler.num_workers > 0
+                    else None
+                ),
+                "seed": self.data_handler.seed,
+            },
+        }
+        self.telemetry.write_manifest(payload)
+        logger.info(
+            "Run manifest saved: %s; model parameters=%d, batches=%d",
+            self.telemetry.manifest_path,
+            parameter_count,
+            payload["data_loader"]["batches"],
+        )
+
     def _build_model(self) -> PINNIncompressible:
         arch = self.config['architecture']
         # Определяем фактическую размерность входа
         sample_batch = next(iter(self.data_handler.get_dataloader()))
-        idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = sample_batch
-        x = x.to(self.device)
-        y = y.to(self.device)
-        sdf = sdf.to(self.device)
-        if bt.shape[1] > 0:
-            bt = bt.to(self.device)
-        else:
-            bt = None
-        input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        _, x, y, sdf, *_ = sample_batch
+        case_ids = getattr(sample_batch, 'case_id', None)
+        x = x.to(self.device, dtype=self.dtype)
+        y = y.to(self.device, dtype=self.dtype)
+        sdf = sdf.to(self.device, dtype=self.dtype)
+        input_tensor = self.loss_computer.build_input_tensor(
+            x,
+            y,
+            sdf,
+            case_ids=case_ids,
+        )
         actual_input_dim = input_tensor.shape[1]
+        if actual_input_dim != self.loss_computer.feature_manifest.input_dim:
+            raise RuntimeError(
+                "Sample input width disagrees with the feature manifest: "
+                f"{actual_input_dim} != "
+                f"{self.loss_computer.feature_manifest.input_dim}"
+            )
 
         # Получаем параметры масштабирования координат
         coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0}).copy()
-        coord_scaling['coord_dim'] = 2 if self.config.get('input_params', {}).get('coordinates', True) else 0
+        coord_scaling['coord_dim'] = (
+            2
+            if self.loss_computer.feature_assembler.coordinates_enabled
+            else 0
+        )
 
         return PINNIncompressible(
             input_dim=actual_input_dim,
@@ -337,7 +441,15 @@ class PINNSolver:
             activation=arch.get('activation', 'tanh'),
             output_dim=arch['output_dim'],
             output_bias=arch['output_bias'],
-            coordinate_scaling=coord_scaling
+            coordinate_scaling=coord_scaling,
+            siren_first_omega_0=arch.get(
+                'siren_first_omega_0',
+                30.0,
+            ),
+            siren_hidden_omega_0=arch.get(
+                'siren_hidden_omega_0',
+                30.0,
+            ),
         )
 
     def _maybe_compile_model(self, model: nn.Module) -> nn.Module:
@@ -430,15 +542,27 @@ class PINNSolver:
         integral_enabled = bool(lw.get('integral_condition', False))
         need_fvm_geometry = fvm_enabled or integral_enabled or self.data_handler.mesh_data is not None
 
+        if (
+            fvm_enabled
+            and self.loss_computer.flow_type == "axisymmetric"
+        ):
+            raise ValueError(
+                "Axisymmetric FVM loss is not supported by the current "
+                "planar dual-cell operator. Disable loss_weights.fvm or use "
+                "the pointwise axisymmetric PDE/integral constraint; silently "
+                "using planar face fluxes would violate conservation."
+            )
+
         if not need_fvm_geometry:
             self.loss_computer.fvm = None
             return
 
         if self.data_handler.mesh_data is None:
             if fvm_enabled:
-                logger.warning(
-                    "FVM Mass flow включён (fvm.enabled=True), но mesh_file не задан — "
-                    "FVM-потеря не будет вычисляться"
+                raise RuntimeError(
+                    "FVM is enabled, but no valid mesh is loaded. Set "
+                    "data.mesh_file to a valid FVM mesh or disable "
+                    "loss_weights.fvm."
                 )
             if integral_enabled:
                 logger.warning(
@@ -452,6 +576,24 @@ class PINNSolver:
             from airfoil_pinn.physics.fvm import BC_CODES, FVMResiduals
             fvm = FVMResiduals.from_mesh_data(self.data_handler.mesh_data)
             fvm.to(self.device, dtype=self.dtype)
+            fvm.nondimensionalize_geometry(self.data_handler.chord)
+            tensor_lengths = {
+                "fvm_x": len(self.data_handler.fvm_x),
+                "fvm_y": len(self.data_handler.fvm_y),
+                "fvm_sdf": len(self.data_handler.fvm_sdf),
+            }
+            if self.data_handler.fvm_bt is not None:
+                tensor_lengths["fvm_bt"] = len(self.data_handler.fvm_bt)
+            mismatched = {
+                name: length
+                for name, length in tensor_lengths.items()
+                if length != fvm.N
+            }
+            if mismatched:
+                raise ValueError(
+                    "FVM node tensor count does not match the operator: "
+                    f"operator={fvm.N}, tensors={mismatched}"
+                )
             inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
             inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
             velocity_bc = torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
@@ -463,16 +605,34 @@ class PINNSolver:
             logger.info("FVMResiduals подключён: %d узлов", fvm.N)
         except Exception as e:
             self.loss_computer.fvm = None
+            if fvm_enabled:
+                raise RuntimeError(
+                    "FVM is enabled, but its geometry is invalid"
+                ) from e
             logger.warning("Не удалось инициализировать FVMResiduals: %s", e)
 
     def _init_optimizer(self, optim_type='adam') -> optim.Optimizer:
         opt_params = self.config.get('optimizer_params', {'lr': 1e-3})
         lr = opt_params.get('lr', 1e-3)
-        params = [{'params': self.model.parameters()}]
-        if self.sa_weights is not None:
-            params.append({'params': self.sa_weights.parameters(), 'lr': self.config.get('sa_lr', 0.001)})
+        weight_decay = float(opt_params.get('weight_decay', 0.0))
+        params = [
+            {
+                'params': self.model.parameters(),
+                'weight_decay': weight_decay,
+            }
+        ]
+        if self.sa_weights is not None and optim_type == 'adam':
+            for parameter in self.sa_weights.parameters():
+                parameter.requires_grad_(True)
+            params.append(
+                {
+                    'params': self.sa_weights.parameters(),
+                    'lr': self.config.get('sa_lr', 0.001),
+                    'weight_decay': 0.0,
+                }
+            )
         if optim_type == 'adam':
-            return optim.Adam(params, lr=lr, weight_decay=opt_params.get('weight_decay', 0))
+            return optim.Adam(params, lr=lr)
         else:  # LBFGS
             all_params = []
             for group in params:
@@ -518,26 +678,135 @@ class PINNSolver:
             return optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min',
                                                          factor=0.5, patience=50)
 
+    def _restore_checkpoint_data_state(self, state: Dict) -> None:
+        """Restore dataset/RAR/FVM state before validating its contract."""
+        self.data_handler.load_state(state)
+        self.loss_computer.synchronize_cached_training_sdf()
+        self.x_min = self.data_handler.dataset.x.min().item()
+        self.x_max = self.data_handler.dataset.x.max().item()
+        self.y_min = self.data_handler.dataset.y.min().item()
+        self.y_max = self.data_handler.dataset.y.max().item()
+        self.loss_computer.x_min = self.x_min
+        self.loss_computer.x_max = self.x_max
+        self.loss_computer.y_min = self.y_min
+        self.loss_computer.y_max = self.y_max
+        self._setup_fvm_residuals()
+        self.trainer._fvm_tensor_cache = None
+        self.training_contract = build_training_contract(
+            self.config,
+            self.data_handler,
+            self.loss_computer,
+        )
+
     def _load_checkpoint_if_needed(self):
         load_path = self.config['process'].get('load_model_path')
-        if not load_path or not os.path.exists(load_path):
+        if not load_path:
             return
+        load_path = str(resolve_project_path(load_path))
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(
+                f"Requested checkpoint does not exist: {load_path}"
+            )
         try:
             checkpoint = torch.load(load_path, map_location=self.device, weights_only=False)
+            checkpoint_cfg = self.config.get("checkpoint", {})
+            load_mode = str(
+                checkpoint_cfg.get("load_mode", "resume")
+            ).lower()
+            finetune = load_mode == "finetune"
+            data_state_restored = False
+            if not finetune and "data_handler_state" in checkpoint:
+                self._restore_checkpoint_data_state(
+                    checkpoint["data_handler_state"]
+                )
+                data_state_restored = True
+            contract_metadata = checkpoint.get("training_contract")
+            if contract_metadata is None:
+                current_boundary = self.training_contract.payload.get(
+                    "boundary_enforcement"
+                )
+                hard_wall = (
+                    isinstance(current_boundary, dict)
+                    and current_boundary.get("wall", {}).get("mode") == "hard"
+                )
+                if hard_wall and not finetune:
+                    raise RuntimeError(
+                        "A legacy checkpoint cannot be resumed with the new "
+                        "hard wall transform. Set checkpoint.load_mode=finetune "
+                        "to load model weights only."
+                    )
+                if not bool(
+                    checkpoint_cfg.get(
+                        "allow_legacy_without_contract",
+                        True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Legacy checkpoint has no training contract and "
+                        "checkpoint.allow_legacy_without_contract=False"
+                    )
+                logger.warning(
+                    "Legacy checkpoint has no training contract; only tensor "
+                    "shape compatibility can be checked."
+                )
+            else:
+                checkpoint_boundary = contract_metadata.get(
+                    "payload",
+                    {},
+                ).get("boundary_enforcement")
+                current_boundary = self.training_contract.payload.get(
+                    "boundary_enforcement"
+                )
+                if (
+                    checkpoint_boundary != current_boundary
+                    and not finetune
+                ):
+                    raise RuntimeError(
+                        "Boundary enforcement/transform differs from the "
+                        "checkpoint, so exact resume is invalid. Set "
+                        "checkpoint.load_mode=finetune to load model weights "
+                        "without optimizer, data, history, epoch or RNG state."
+                    )
+                try:
+                    validate_checkpoint_contract(
+                        contract_metadata,
+                        self.training_contract,
+                    )
+                except Exception:
+                    if (
+                        not finetune
+                        and bool(checkpoint_cfg.get("strict_contract", True))
+                    ):
+                        raise
+                    logger.warning(
+                        "Checkpoint contract mismatch accepted for %s mode.",
+                        load_mode,
+                    )
+            if finetune:
+                if 'model_state_dict' not in checkpoint:
+                    raise RuntimeError(
+                        "Finetune checkpoint contains no model_state_dict"
+                    )
+                state_dict = checkpoint['model_state_dict']
+                state_dict = self._strip_state_prefix(state_dict, 'module.')
+                state_dict = self._strip_state_prefix(
+                    state_dict,
+                    '_orig_mod.',
+                )
+                self._unwrap_model_for_state(self.model).load_state_dict(
+                    state_dict
+                )
+                self.start_epoch = 0
+                logger.warning(
+                    "Checkpoint loaded in finetune mode: only model weights "
+                    "were restored; optimizer, scheduler, data/RAR state, "
+                    "history, epoch and RNG state were intentionally ignored."
+                )
+                return
             # Сначала восстанавливаем данные/RAR-сетку, чтобы размеры SA-весов и
             # optimizer state соответствовали фактическому датасету.
-            if 'data_handler_state' in checkpoint:
-                self.data_handler.load_state(checkpoint['data_handler_state'])
-                self.x_min = self.data_handler.dataset.x.min().item()
-                self.x_max = self.data_handler.dataset.x.max().item()
-                self.y_min = self.data_handler.dataset.y.min().item()
-                self.y_max = self.data_handler.dataset.y.max().item()
-                self.loss_computer.x_min = self.x_min
-                self.loss_computer.x_max = self.x_max
-                self.loss_computer.y_min = self.y_min
-                self.loss_computer.y_max = self.y_max
-                self._setup_fvm_residuals()
-                self.trainer._fvm_tensor_cache = None
+            if data_state_restored:
+                pass
             elif self.trainer.rar_enable:
                 logger.warning(
                     "Чекпоинт не содержит data_handler_state. Если он был сохранён после RAR, "
@@ -578,9 +847,18 @@ class PINNSolver:
                 self.metrics.history = checkpoint['history']
             if 'epoch' in checkpoint and checkpoint['epoch'] is not None:
                 self.start_epoch = checkpoint['epoch']
+            restore_rng_state(checkpoint.get("rng_state"))
+            if "rng_state" not in checkpoint:
+                logger.warning(
+                    "Legacy checkpoint has no RNG state; graph compatibility "
+                    "is preserved, but stochastic continuation is not exact."
+                )
             logger.info(f"Чекпоинт загружен, продолжение с эпохи {self.start_epoch}")
         except Exception as e:
-            logger.error(f"Ошибка загрузки чекпоинта: {e}")
+            logger.error("Ошибка загрузки чекпоинта: %s", e, exc_info=True)
+            raise RuntimeError(
+                f"Checkpoint resume failed for {load_path}: {e}"
+            ) from e
 
     def _get_run_dir(self) -> str:
         """Возвращает корневую директорию текущего запуска (единый timestamp)."""
@@ -604,6 +882,11 @@ class PINNSolver:
 
     def _save_checkpoint(self, identifier: Union[int, str]) -> None:
         filename = f"pinn_{identifier}.pt"
+        self.training_contract = build_training_contract(
+            self.config,
+            self.data_handler,
+            self.loss_computer,
+        )
         self.checkpoint_manager.save(
             filename=filename,
             model=self.model,
@@ -615,9 +898,11 @@ class PINNSolver:
             epoch=identifier if isinstance(identifier, int) else None,
             config=self.config,
             extra_state={
+                'training_contract': self.training_contract.to_metadata(),
                 'data_handler_state': self.data_handler.get_state(),
                 'trainer_state': self.trainer.get_state(),
                 'using_lbfgs': self.using_lbfgs,
+                'rng_state': capture_rng_state(),
             }
         )
 
@@ -681,8 +966,6 @@ class PINNSolver:
             y_np = self.data_handler.dataset.y.cpu().numpy().flatten() * self.data_handler.chord
             residual_src = getattr(self.trainer, 'point_pde_residual', self.trainer.point_residual)
             residual = residual_src.numpy()
-            if getattr(self.data_handler, 'mesh_domain_coords', None) is None:
-                self.data_handler.load_mesh_geometry_from_geom_config()
             clip_polygon = getattr(self.data_handler, 'mesh_domain_coords', None)
             airfoil_polyline = getattr(self.data_handler, 'mesh_airfoil_coords', None)
             outline_polylines = [airfoil_polyline] if airfoil_polyline is not None else None
@@ -701,13 +984,14 @@ class PINNSolver:
                     outline_polylines=outline_polylines,
                 )
 
-        # 2. Профили скорости в нескольких сечениях с фильтрацией по y
+        # 2. Профили скорости на точных вертикальных сечениях x/c=const.
         if self.diagnostics_config.get('plot_profiles', True) and pred_norm is not None:
             u_pred_norm = pred_norm['u_norm']  # одномерный массив numpy
             profiles = {}
             for x_sec in self.profile_sections:
-                x_norm = x_sec  # profile_sections — уже нормированные доли хорды (0..1)
-                # Передаём предсказанные значения u_norm в interpolate_profile
+                # profile_sections задаются как x/c и могут лежать до/после
+                # профиля, например -1 и 5.
+                x_norm = x_sec
                 y_grid, u_interp_norm = self.data_handler.interpolate_profile(
                     x_norm,
                     u_vals=torch.from_numpy(u_pred_norm).to(dtype=self.dtype),
@@ -731,7 +1015,7 @@ class PINNSolver:
                 num_points=256,
                 y_max_ratio=self.profile_y_max_ratio
             )
-            if not np.all(np.isnan(u_interp_norm)):
+            if np.all(np.isfinite(u_interp_norm)):
                 self.visualizer.plot_1d_spectrum(
                     y_grid * self.data_handler.chord,
                     u_interp_norm * self.data_handler.U_inf,
@@ -740,7 +1024,11 @@ class PINNSolver:
                     x_section=x_sec * self.data_handler.chord
                 )
             else:
-                logger.warning(f"1D спектр пропущен: нет данных в сечении x={x_sec}.")
+                logger.warning(
+                    "1D спектр пропущен: сечение x=%s выходит за сетку "
+                    "или пересекает твёрдое тело; FFT через разрыв не определён.",
+                    x_sec,
+                )
 
         # 4. Двумерный спектр (если включено) – с фильтрацией граничных точек
         if self.plot_2d_spectrum and pred_norm is not None:
@@ -821,19 +1109,34 @@ class PINNSolver:
         with torch.no_grad():
             for batch in dataloader:
                 idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
+                case_ids = getattr(batch, 'case_id', None)
                 x = x.to(self.device, dtype=self.dtype)
                 y = y.to(self.device, dtype=self.dtype)
-                sdf = sdf.to(self.device, dtype=self.dtype)
+                sdf = self.loss_computer.evaluate_sdf_tensor(x, y)
                 if bt.shape[1] > 0:
                     bt = bt.to(self.device, dtype=self.dtype)
                 else:
                     bt = None
 
-                input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+                input_tensor = self.loss_computer.build_input_tensor(
+                    x,
+                    y,
+                    sdf,
+                    case_ids=case_ids,
+                )
                 out = self.model(input_tensor)
                 u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+                u, v, p = self.loss_computer.transform_outputs(
+                    u_raw,
+                    v_raw,
+                    p_raw,
+                    x,
+                    y,
+                    sdf=sdf,
+                    case_ids=case_ids,
+                )
 
-                # Применяем hard constraints, если нужно
+                # Legacy pointwise override.
                 if self.loss_computer.bc_type == 'hard':
                     mask_u = mask_u.to(self.device, dtype=torch.bool).view(-1, 1)
                     mask_v = mask_v.to(self.device, dtype=torch.bool).view(-1, 1)
@@ -842,11 +1145,14 @@ class PINNSolver:
                     v_bc = v_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     p_bc = p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                     u, v, p = self.loss_computer.apply_hard_constraints(
-                        u_raw, v_raw, p_raw, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
+                        u, v, p, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc
                     )
-                else:
-                    u, v, p = u_raw, v_raw, p_raw
-                u, v = self.loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
+                    u, v = self.loss_computer.apply_velocity_dirichlet_constraint(
+                        u,
+                        v,
+                        bt,
+                        case_ids=case_ids,
+                    )
 
                 all_u.append(u.cpu().numpy().flatten())
                 all_v.append(v.cpu().numpy().flatten())
@@ -876,10 +1182,27 @@ class PINNSolver:
 
         self.start_time = time.time()
         epoch = self.start_epoch  # на случай Ctrl+C до старта цикла
+        epoch_duration_window = deque(maxlen=20)
+        previous_epoch_started_at = None
+        eta_optimizer_name = None
+        output_cfg = self.config.get("output", {})
+        epoch_progress = build_epoch_progress(
+            range(self.start_epoch + 1, epochs + 1),
+            enabled=bool(output_cfg.get("progress_bar", True)),
+            force=bool(output_cfg.get("progress_bar_force", False)),
+            mininterval=float(
+                output_cfg.get("progress_mininterval", 0.5)
+            ),
+        )
 
         try:
-            for epoch in range(self.start_epoch + 1, epochs + 1):
+            for epoch in epoch_progress:
                 start_time = time.time()
+                if previous_epoch_started_at is not None:
+                    epoch_duration_window.append(
+                        start_time - previous_epoch_started_at
+                    )
+                previous_epoch_started_at = start_time
 
                 # Мониторинг памяти (каждые 10 эпох)
                 if epoch % 10 == 0:
@@ -905,7 +1228,20 @@ class PINNSolver:
                         self.trainer.train_epoch_adam(pde_mult)
 
                 # Сбор дополнительных метрик для диагностики (если нужно)
-                extra_diag = {'fvm_loss': self.trainer._last_fvm_loss}
+                extra_diag = {
+                    'fvm_loss': self.trainer._last_fvm_loss,
+                    'fvm_raw_loss': self.trainer._last_fvm_raw_loss,
+                    'fvm_mse': self.trainer._last_fvm_raw_loss,
+                    'fvm_weighted_loss': self.trainer._last_fvm_loss,
+                    'fvm_rms': self.trainer._last_fvm_rms,
+                    'fvm_evaluations': self.trainer._last_fvm_evaluations,
+                    'pressure_gauge_mse': (
+                        self.trainer._last_pressure_gauge_mse
+                    ),
+                    'pressure_gauge_loss': (
+                        self.trainer._last_pressure_gauge_loss
+                    ),
+                }
                 sample_batch = None
                 if self.sa_weights is not None:
                     with torch.no_grad():
@@ -998,20 +1334,156 @@ class PINNSolver:
                         self.scheduler.step()
                     # Другие типы планировщиков (например, StepLR) должны быть обработаны аналогично
 
+                learning_rate = float(
+                    self.optimizer.param_groups[0]["lr"]
+                )
+                optimizer_name = (
+                    "L-BFGS" if self.using_lbfgs else "Adam"
+                )
+                if optimizer_name != eta_optimizer_name:
+                    epoch_duration_window.clear()
+                    eta_optimizer_name = optimizer_name
+                eta_samples = list(epoch_duration_window)
+                if not eta_samples:
+                    eta_samples.append(epoch_time)
+                smoothed_epoch_seconds = (
+                    sum(eta_samples) / len(eta_samples)
+                )
+                eta_seconds = (
+                    max(epochs - epoch, 0) * smoothed_epoch_seconds
+                )
+                pde_rms = {
+                    name: float(np.sqrt(max(value, 0.0)))
+                    for name, value in pde_raw.items()
+                }
+                boundary_rms = {
+                    name: float(np.sqrt(max(value, 0.0)))
+                    for name, value in bc_comp.items()
+                }
+                pde_max_abs = {
+                    name: float(np.sqrt(max(value, 0.0)))
+                    for name, value in pde_max.items()
+                }
+                self.telemetry.append_epoch(
+                    {
+                        "epoch": epoch,
+                        "optimizer": (
+                            "lbfgs" if self.using_lbfgs else "adam"
+                        ),
+                        "learning_rate": learning_rate,
+                        "pde_multiplier": pde_mult,
+                        "loss": loss,
+                        "pde_mse": pde_raw,
+                        "pde_rms": pde_rms,
+                        "pde_max_abs": pde_max_abs,
+                        # Compatibility aliases; values are MSE and squared max.
+                        "pde": pde_raw,
+                        "pde_max": pde_max,
+                        "boundary_mse": bc_comp,
+                        "boundary_rms": boundary_rms,
+                        "boundary": bc_comp,
+                        "integral_loss": integral_loss,
+                        "integral_mse": integral_loss,
+                        "integral_rms": float(
+                            np.sqrt(max(integral_loss, 0.0))
+                        ),
+                        "pressure_gauge_mse": (
+                            self.trainer._last_pressure_gauge_mse
+                        ),
+                        "pressure_gauge_rms": float(
+                            np.sqrt(
+                                max(
+                                    self.trainer._last_pressure_gauge_mse,
+                                    0.0,
+                                )
+                            )
+                        ),
+                        "pressure_gauge_loss": (
+                            self.trainer._last_pressure_gauge_loss
+                        ),
+                        "fvm_loss": self.trainer._last_fvm_loss,
+                        "fvm_raw_loss": self.trainer._last_fvm_raw_loss,
+                        "fvm_mse": self.trainer._last_fvm_raw_loss,
+                        "fvm_weighted_loss": self.trainer._last_fvm_loss,
+                        "fvm_rms": self.trainer._last_fvm_rms,
+                        "fvm_evaluations": (
+                            self.trainer._last_fvm_evaluations
+                        ),
+                        "wall_speed": wall_speed,
+                        "gradient_l2_norm": grad_norm,
+                        "diagnostics": extra_diag,
+                        "epoch_seconds": epoch_time,
+                        "elapsed_seconds": total_time,
+                        "estimated_remaining_seconds": eta_seconds,
+                    }
+                )
+                if hasattr(epoch_progress, "set_postfix"):
+                    epoch_progress.set_postfix(
+                        loss=f"{loss:.3e}",
+                        grad=f"{grad_norm:.3e}",
+                        lr=f"{learning_rate:.2e}",
+                        refresh=False,
+                    )
+
                 # Вывод в консоль (avg_u_in/out уже вычислены выше)
                 self.metrics.print_epoch_table(
                     epoch, epochs, loss, pde_raw, bc_comp, integral_loss, pde_max, epoch_time, total_time,
-                    fvm_loss=self.trainer._last_fvm_loss
+                    fvm_loss=self.trainer._last_fvm_loss,
+                    fvm_raw_loss=self.trainer._last_fvm_raw_loss,
+                    fvm_rms=self.trainer._last_fvm_rms,
+                    pressure_gauge_mse=(
+                        self.trainer._last_pressure_gauge_mse
+                    ),
+                    pressure_gauge_loss=(
+                        self.trainer._last_pressure_gauge_loss
+                    ),
+                    optimizer_name=optimizer_name,
+                    learning_rate=learning_rate,
+                    grad_norm=grad_norm,
+                    pde_multiplier=pde_mult,
+                    eta_seconds=eta_seconds,
+                    avg_u_in=avg_u_in,
+                    avg_u_out=avg_u_out,
+                    mass_balance_error=mass_metrics[
+                        "mass_balance_error"
+                    ],
                 )
                 line2 = (
                     f"   avg u_inlet = {avg_u_in:.4f} (норм.), "
                     f"avg u_outlet = {avg_u_out:.4f} (норм.), "
                     f"mass err = {mass_metrics['mass_balance_error']:.3e}"
                 )
-                print(line2)
-                self.metrics.save_log(f"Epoch {epoch}: loss={loss:.2e}, " +
-                                      ", ".join([f"{k}={v:.2e}" for k, v in pde_raw.items()]))
+                section_line = self.metrics.format_section_flow_log(
+                    mass_metrics
+                )
+                mse_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in pde_raw.items()
+                )
+                rms_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in pde_rms.items()
+                )
+                bc_mse_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in bc_comp.items()
+                )
+                bc_rms_text = ", ".join(
+                    f"{name}={value:.2e}"
+                    for name, value in boundary_rms.items()
+                )
+                self.metrics.save_log(
+                    f"Epoch {epoch}: loss={loss:.2e}, "
+                    f"pde_mse: {mse_text}; pde_rms: {rms_text}; "
+                    f"bc_mse: {bc_mse_text}; bc_rms: {bc_rms_text}; "
+                    f"integral_mse={integral_loss:.2e}; "
+                    f"integral_rms={np.sqrt(max(integral_loss, 0.0)):.2e}; "
+                    f"fvm_mse={self.trainer._last_fvm_raw_loss:.2e}; "
+                    f"fvm_rms={self.trainer._last_fvm_rms:.2e}"
+                )
                 self.metrics.save_log(line2)
+                if section_line is not None:
+                    self.metrics.save_log(section_line)
 
                 # Сохранение чекпоинта
                 checkpoint_interval = self.config['checkpoint']['interval']
@@ -1044,6 +1516,8 @@ class PINNSolver:
             self._finalize()
             raise
         finally:
+            if hasattr(epoch_progress, "close"):
+                epoch_progress.close()
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
@@ -1111,6 +1585,13 @@ class PINNSolver:
 
     def _switch_to_lbfgs(self):
         logger.info(f"Переключение на L-BFGS после эпохи {self.adam_epochs}")
+        if self.sa_weights is not None:
+            for parameter in self.sa_weights.parameters():
+                parameter.requires_grad_(False)
+            logger.info(
+                "SA-PINN attention weights are frozen for L-BFGS; their "
+                "min-max ascent is performed only during the Adam stage."
+            )
         self.optimizer = self._init_optimizer(optim_type='lbfgs')
         self.scheduler = None
         self.using_lbfgs = True

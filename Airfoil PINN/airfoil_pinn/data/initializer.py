@@ -35,8 +35,6 @@ import matplotlib.pyplot as plt
 import logging
 from typing import Optional, List, Tuple, Dict, Any
 import glob
-import multiprocessing as mp
-from functools import partial
 
 try:
     from scipy.spatial import cKDTree
@@ -47,7 +45,6 @@ except ImportError:
 from airfoil_pinn.app.paths import (
     CONDITIONS_DIR,
     FLUIDS_DIR,
-    GEOM_CONFIG_PATH,
     GEOMETRY_DOMAINS_DIR,
     GEOMETRY_METADATA_DIR,
     INITIAL_FIELDS_DIR,
@@ -57,6 +54,8 @@ from airfoil_pinn.app.paths import (
     resolve_project_path,
 )
 from airfoil_pinn.core.type_hints import InitializerMetadataDict
+from airfoil_pinn.data.flow import FlowCase
+from airfoil_pinn.geometry.sdf import PolylineDistanceField
 
 # Импортируем наши модули и классы
 from airfoil_pinn.physics.fluids import FluidLibrary, Fluid
@@ -70,6 +69,13 @@ from airfoil_pinn.data.sdf_diagnostics import (
     compute_sdf_summary,
     estimate_boundary_layer_delta,
     format_sdf_summary,
+    resolve_boundary_layer_model,
+)
+from airfoil_pinn.data.normalization import (
+    ReferenceScales,
+    build_geometry_reference,
+    extract_geometry_reference,
+    load_companion_metadata,
 )
 
 # Инициализатор связывает артефакты geometry/sampling с обучающими полями.
@@ -102,11 +108,16 @@ __all__ = [
 # Структура данных для точки с нормализованными полями
 point_dtype = np.dtype([
     ('id', 'i4'),
+    ('case_id', 'i4'),
     ('x_norm', 'f8'),
     ('y_norm', 'f8'),
     ('sdf_norm', 'f8'),
     ('boundary_type', 'U20'),
     ('on_boundary', 'bool'),
+    ('on_airfoil', 'bool'),
+    ('segment_id', 'i4'),
+    ('normal_x', 'f8'),
+    ('normal_y', 'f8'),
     ('p_norm', 'f8'),
     ('u_norm', 'f8'),
     ('v_norm', 'f8')
@@ -219,6 +230,7 @@ class Initializer:
         self.mu: Optional[float] = None
         self.delta_bl_est: Optional[float] = None
         self.delta_bl_est_norm: Optional[float] = None
+        self.boundary_layer_model: str = "laminar"
 
         self.pressure_mode: Optional[str] = None
         self.velocity_initial_mode: Optional[str] = None
@@ -228,6 +240,12 @@ class Initializer:
 
         self.domain_coords: Optional[np.ndarray] = None
         self.foil_coords: Optional[np.ndarray] = None
+        self.sampler_points_file: Optional[str] = None
+        self.sampler_metadata: Optional[Dict[str, Any]] = None
+        self.geometry_reference: Optional[Dict[str, Any]] = None
+        self.chord_source: Optional[str] = None
+        self.sdf_geometry_fingerprint: Optional[str] = None
+        self.flow_case: Optional[FlowCase] = None
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
         """
@@ -259,7 +277,9 @@ class Initializer:
             print(f"Использую файл точек: {os.path.basename(filename)}")
         else:
             filename = str(resolve_project_path(filename))
-        data = np.load(filename, allow_pickle=True)
+        self.sampler_points_file = str(filename)
+        self.sampler_metadata = load_companion_metadata(self.sampler_points_file)
+        data = np.load(self.sampler_points_file, allow_pickle=True)
 
         if data.dtype.names is not None:
             self.points = data
@@ -324,64 +344,178 @@ class Initializer:
                 logger.debug("Не удалось загрузить координаты из %s: %s", path, exc)
         return None
 
-    @staticmethod
-    def _current_geom_name() -> Optional[str]:
-        cfg_path = GEOM_CONFIG_PATH
-        if not os.path.exists(cfg_path):
-            return None
+    def _sampler_metadata_matches_points(self) -> bool:
+        """Проверяет, что companion metadata относится к загруженному массиву."""
+        if not isinstance(self.sampler_metadata, dict):
+            return False
+        expected_count = self.sampler_metadata.get("num_points")
+        if expected_count is None or self.points is None:
+            return True
         try:
-            import yaml
-            with open(cfg_path, 'r', encoding='utf-8') as f:
-                cfg = yaml.safe_load(f) or {}
-            geom_name = cfg.get('geom_name')
-            return str(geom_name) if geom_name else None
-        except Exception as exc:
-            logger.debug("Не удалось прочитать geom_config.yaml: %s", exc)
+            matches = int(expected_count) == len(self.points)
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            logger.warning(
+                "Companion metadata содержит num_points=%r, а загружено %d точек; "
+                "геометрические ссылки из metadata игнорируются.",
+                expected_count,
+                len(self.points),
+            )
+        return matches
+
+    def _sampler_geom_name(self) -> Optional[str]:
+        """
+        Возвращает имя геометрии, записанное вместе с текущими collocation-точками.
+
+        Имя берётся только из companion metadata загруженного массива. Это
+        исключает смешивание точек одного расчёта с геометрией другого расчёта.
+        """
+        if not self._sampler_metadata_matches_points():
             return None
 
+        reference = extract_geometry_reference(self.sampler_metadata)
+        candidates = (
+            reference.get("geom_name") if reference is not None else None,
+            self.sampler_metadata.get("geom_name"),
+        )
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            geom_name = str(candidate).strip()
+            if not geom_name:
+                continue
+            if os.path.basename(geom_name) != geom_name:
+                logger.warning(
+                    "Некорректное geom_name в metadata collocation-точек: %r",
+                    geom_name,
+                )
+                return None
+            return geom_name
+        return None
+
     def _load_geometry_coords(self, suffix: str) -> Optional[np.ndarray]:
-        geom_name = self._current_geom_name()
+        """Загружает только артефакт геометрии, связанный с текущим sampler metadata."""
+        if suffix not in {"domain", "foil"}:
+            raise ValueError(f"Неизвестный тип геометрического артефакта: {suffix!r}")
+
+        geom_name = self._sampler_geom_name()
+        if not geom_name:
+            return None
+
         search_dirs = [self.geometry_dir]
         metadata_dir = GEOMETRY_METADATA_DIR
         if suffix == "foil":
             search_dirs.append(metadata_dir)
 
-        if geom_name:
-            for directory in search_dirs:
-                coords = self._load_coords(os.path.join(directory, f"{geom_name}_{suffix}"))
-                if coords is not None:
-                    return coords
-
-        pattern = os.path.join(self.geometry_dir, f"*_{suffix}.*")
-        files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-        for path in files:
-            base, _ = os.path.splitext(path)
-            coords = self._load_coords(base)
+        for directory in search_dirs:
+            coords = self._load_coords(os.path.join(directory, f"{geom_name}_{suffix}"))
             if coords is not None:
                 return coords
         return None
 
+    def _domain_coords_from_sampler_bounds(self) -> Optional[np.ndarray]:
+        """Восстанавливает прямоугольник домена из metadata текущих точек."""
+        if not self._sampler_metadata_matches_points():
+            return None
+        bounds = self.sampler_metadata.get("bounds")
+        if not isinstance(bounds, dict):
+            return None
+        try:
+            x_min = float(bounds["x_min"])
+            x_max = float(bounds["x_max"])
+            y_min = float(bounds["y_min"])
+            y_max = float(bounds["y_max"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        values = np.asarray([x_min, x_max, y_min, y_max], dtype=np.float64)
+        if not np.all(np.isfinite(values)) or x_max <= x_min or y_max <= y_min:
+            return None
+        return np.asarray(
+            [
+                [x_min, y_min],
+                [x_max, y_min],
+                [x_max, y_max],
+                [x_min, y_max],
+                [x_min, y_min],
+            ],
+            dtype=np.float64,
+        )
+
     def load_domain_coords(self) -> None:
         """Загружает контур расчётного домена для маски визуализации."""
         data = self._load_geometry_coords("domain")
+        source = "именного артефакта геометрии"
+        if data is None:
+            data = self._domain_coords_from_sampler_bounds()
+            source = "bounds текущих collocation metadata"
         if data is not None:
             if len(data) > 2 and not np.allclose(data[0], data[-1], atol=1e-12):
                 data = np.vstack([data, data[0]])
             self.domain_coords = data
-            logger.info("Загружены координаты домена для визуализации.")
+            logger.info("Координаты домена для визуализации получены из %s.", source)
 
     def load_foil_coords(self) -> None:
         """Загружает координаты профиля/пластины для визуализации."""
         data = self._load_geometry_coords("foil")
+        source = "именного артефакта геометрии"
+        if data is None and self.wall_points is not None and len(self.wall_points) >= 2:
+            data = np.asarray(self.wall_points, dtype=np.float64)
+            source = "WALL-точек текущего collocation-массива"
         if data is not None:
             self.foil_coords = data
-            logger.info("Загружены координаты профиля для визуализации.")
+            logger.info("Координаты профиля для визуализации получены из %s.", source)
 
     def _load_chord_from_metadata(self) -> float:
-        """Определяет хорду из метаданных геометрии или оценивает по разбросу x."""
+        """Определяет хорду из артефактов, связанных с загруженными точками."""
+        sampler_reference = extract_geometry_reference(self.sampler_metadata)
+        sampler_count = (
+            self.sampler_metadata.get("num_points")
+            if isinstance(self.sampler_metadata, dict)
+            else None
+        )
+        sampler_matches = (
+            sampler_count is None
+            or self.points is None
+            or int(sampler_count) == len(self.points)
+        )
+        if sampler_reference is not None and sampler_matches:
+            chord = float(sampler_reference["chord"])
+            self.geometry_reference = dict(sampler_reference)
+            self.chord_source = str(sampler_reference.get("source", "sampler geometry_reference"))
+            logger.info(
+                "Хорда загружена из metadata текущих collocation-точек: %.6g м (%s)",
+                chord,
+                self.chord_source,
+            )
+            return chord
+        if sampler_reference is not None and not sampler_matches:
+            logger.warning(
+                "Metadata сэмплера содержит %s точек, а загружено %s; "
+                "этот геометрический масштаб пропущен.",
+                sampler_count,
+                len(self.points) if self.points is not None else "нет",
+            )
+
+        # WALL-точки принадлежат тому же массиву, поэтому не могут незаметно
+        # подменить геометрический масштаб артефактом другого расчёта.
+        if self.wall_points is not None and len(self.wall_points) >= 2:
+            wall_reference = build_geometry_reference(self.wall_points)
+            if wall_reference is not None:
+                chord = float(wall_reference["chord"])
+                wall_reference["source"] = "loaded WALL-point extent"
+                self.geometry_reference = wall_reference
+                self.chord_source = str(wall_reference["source"])
+                logger.warning(
+                    "В metadata сэмплера нет хорды; используется диапазон WALL-точек: %.6g м. "
+                    "Для точного масштаба пересоздайте collocation metadata.",
+                    chord,
+                )
+                return chord
+
         metadata_dir = GEOMETRY_METADATA_DIR
         search_dirs = [metadata_dir, self.geometry_dir]
-        geom_name = self._current_geom_name()
+        geom_name = self._sampler_geom_name()
         meta_files: List[str] = []
 
         if geom_name:
@@ -390,20 +524,19 @@ class Initializer:
                 if os.path.exists(path):
                     meta_files.append(path)
 
-        if not meta_files:
-            seen = set()
-            for directory in search_dirs:
-                for path in glob.glob(os.path.join(directory, "*_metadata.npy")):
-                    if path not in seen:
-                        meta_files.append(path)
-                        seen.add(path)
-            meta_files.sort(key=os.path.getmtime, reverse=True)
-
         for meta_path in meta_files:
             try:
                 meta = np.load(meta_path, allow_pickle=True).item()
                 chord = meta.get('chord', None)
                 if chord is not None:
+                    self.chord_source = f"geometry metadata: {os.path.basename(meta_path)}"
+                    self.geometry_reference = {
+                        "geom_name": geom_name,
+                        "length_scale": "chord",
+                        "coordinate_units": "m",
+                        "chord": float(chord),
+                        "source": self.chord_source,
+                    }
                     logger.info(f"Хорда загружена из {os.path.basename(meta_path)}: {chord:.4f} м")
                     return float(chord)
                 else:
@@ -415,6 +548,10 @@ class Initializer:
         if foil is not None and len(foil) >= 2:
             chord = float(np.max(foil[:, 0]) - np.min(foil[:, 0]))
             if chord > 0.0:
+                self.geometry_reference = build_geometry_reference(foil, geom_name=geom_name)
+                self.chord_source = "active geometry coordinates"
+                if self.geometry_reference is not None:
+                    self.geometry_reference["source"] = self.chord_source
                 logger.warning(
                     "Хорда оценена по координатам профиля, metadata не использованы: "
                     f"{chord:.4f} м"
@@ -426,6 +563,13 @@ class Initializer:
             f"Файлы метаданных не найдены или не содержат хорду. "
             f"Используется приближение по разбросу x точек (включает домен, не только хорду): {x_range:.4f} м"
         )
+        self.chord_source = "collocation domain x extent"
+        self.geometry_reference = {
+            "length_scale": "domain_x_extent",
+            "coordinate_units": "m",
+            "chord": float(x_range),
+            "source": self.chord_source,
+        }
         return float(x_range)
 
     def select_fluid(self) -> str:
@@ -477,23 +621,69 @@ class Initializer:
                 print("Введите число.")
 
     def _compute_normalization_params(self) -> None:
-        """Вычисляет параметры нормализации на основе выбранных жидкости и условий."""
+        """Build and validate the physical CFD reference-scale contract.
+
+        A zero freestream velocity is rejected because Reynolds number,
+        velocity normalization and pressure-coefficient normalization would
+        otherwise be undefined.  Previous versions silently substituted
+        ``U_inf = 1``; that produced dimensionally inconsistent artifacts.
+        """
         if self.fluid is None or self.conditions is None:
             raise RuntimeError("Сначала выберите жидкость и условия.")
 
-        self.chord = self._load_chord_from_metadata()
+        chord = self._load_chord_from_metadata()
         u_in = self.conditions.u
         v_in = self.conditions.v
-        self.U_inf = np.sqrt(u_in**2 + v_in**2)
-        if self.U_inf == 0:
-            self.U_inf = 1.0
-            logger.warning("⚠️ СКОРОСТЬ НА ВХОДЕ РАВНА 0! Использую U_inf = 1 для нормализации. "
-                          "Это может привести к нефизичным результатам. Рекомендуется изменить граничные условия.")
-        self.p_ref = self.conditions.outlet_pressure
-        self.rho = self.fluid.density
-        self.mu = self.fluid.dynamic_viscosity
-        nu = self.fluid.kinematic_viscosity
-        self.Re = self.U_inf * self.chord / nu
+        velocity = float(np.hypot(u_in, v_in))
+        if not np.isfinite(velocity) or velocity <= 0.0:
+            raise ValueError(
+                "Модуль скорости набегающего потока должен быть конечным и "
+                "положительным. Невозможно определить Re, u*, v* и Cp при "
+                f"U_inf={velocity!r} м/с."
+            )
+
+        self.reference_scales = ReferenceScales(
+            chord=chord,
+            velocity=velocity,
+            density=self.fluid.density,
+            dynamic_viscosity=self.fluid.dynamic_viscosity,
+            static_pressure=self.conditions.outlet_pressure,
+        )
+        self.chord = self.reference_scales.chord
+        self.U_inf = self.reference_scales.velocity
+        self.p_ref = self.reference_scales.static_pressure
+        self.rho = self.reference_scales.density
+        self.mu = self.reference_scales.dynamic_viscosity
+        self.Re = self.reference_scales.reynolds
+        self.flow_case = FlowCase.from_freestream_components(
+            case_id=0,
+            reynolds=self.Re,
+            u_normalized=u_in / self.U_inf,
+            v_normalized=v_in / self.U_inf,
+            name=str(self.conditions_name or "case-0"),
+        )
+
+        normal_layer = (
+            self.sampler_metadata.get("normal_layer")
+            if isinstance(self.sampler_metadata, dict)
+            else None
+        )
+        sampled_model = normal_layer.get("cf_model") if isinstance(normal_layer, dict) else None
+        self.boundary_layer_model = resolve_boundary_layer_model(
+            self.Re,
+            str(sampled_model or self.boundary_layer_model),
+        )
+        sampled_re = normal_layer.get("re_chord") if isinstance(normal_layer, dict) else None
+        if sampled_re is not None and float(sampled_re) > 0.0:
+            relative_error = abs(float(sampled_re) - self.Re) / self.Re
+            if relative_error > 0.01:
+                logger.warning(
+                    "Normal-layer сетка построена для Re_c=%.6g, а выбранные условия дают "
+                    "Re_c=%.6g (расхождение %.1f%%). Нормировка использует физический Re_c условий.",
+                    float(sampled_re),
+                    self.Re,
+                    100.0 * relative_error,
+                )
 
         logger.info(f"Хорда: {self.chord:.4f} м")
         logger.info(f"U_inf = {self.U_inf:.4f} м/с")
@@ -517,15 +707,21 @@ class Initializer:
         self.delta_bl_est, self.delta_bl_est_norm = estimate_boundary_layer_delta(
             self.chord,
             self.Re,
+            model=self.boundary_layer_model,
         )
 
         print("\n" + "=" * 60)
         print("SDF-ДИАГНОСТИКА ПРИСТЕННОЙ СЕТКИ".center(60))
         print("=" * 60)
         if self.delta_bl_est is not None and self.delta_bl_est_norm is not None:
+            delta_formula = (
+                "0.37/Re^0.2"
+                if self.boundary_layer_model == "turbulent"
+                else "5/sqrt(Re)"
+            )
             print(
                 "Оценка толщины слоя: "
-                f"delta_99/c ~= 5/sqrt(Re) = {self.delta_bl_est_norm:.6g}, "
+                f"delta_99/c ~= {delta_formula} = {self.delta_bl_est_norm:.6g}, "
                 f"delta_99 = {self.delta_bl_est:.6g} м"
             )
         else:
@@ -581,7 +777,9 @@ class Initializer:
             velocity_perturbation_amplitude: если None, используется perturbation_amplitude
             pressure_perturbation_amplitude: относительная амплитуда шума для давления
                                              (доля от динамического напора 0.5*rho*U_inf^2)
-            num_processes: количество процессов для параллельного вычисления SDF
+            num_processes: Deprecated compatibility argument.  The exact
+                segment SDF uses vectorized PyTorch chunks instead of process
+                workers.
 
         Returns:
             Нормализованный массив точек.
@@ -594,6 +792,12 @@ class Initializer:
             raise RuntimeError("Сначала выберите граничные условия.")
         if self.wall_points is None:
             self.extract_wall_points()
+        if num_processes not in (None, 1):
+            logger.info(
+                "num_processes=%s ignored for exact segment SDF; "
+                "vectorized chunking is used.",
+                num_processes,
+            )
 
         self.pressure_mode = pressure_mode
         self.velocity_initial_mode = velocity_initial_mode
@@ -609,21 +813,38 @@ class Initializer:
         self.delta_bl_est, self.delta_bl_est_norm = estimate_boundary_layer_delta(
             self.chord,
             self.Re,
+            model=self.boundary_layer_model,
         )
 
         N = len(self.points)
         arr_norm = np.zeros(N, dtype=point_dtype)
+        arr_norm['segment_id'] = -1
+        arr_norm['normal_x'] = np.nan
+        arr_norm['normal_y'] = np.nan
 
         # Копируем существующие поля, если они есть
-        for name in ['id', 'boundary_type', 'on_boundary']:
+        for name in [
+            'id',
+            'boundary_type',
+            'on_boundary',
+            'on_airfoil',
+            'segment_id',
+            'normal_x',
+            'normal_y',
+        ]:
             if name in self.points.dtype.names:
                 arr_norm[name] = self.points[name]
 
         if 'id' not in self.points.dtype.names:
             arr_norm['id'] = np.arange(N)
+        arr_norm['case_id'] = 0
 
-        arr_norm['x_norm'] = self.points['x'] / self.chord
-        arr_norm['y_norm'] = self.points['y'] / self.chord
+        arr_norm['x_norm'] = self.reference_scales.length_to_dimensionless(
+            self.points['x']
+        )
+        arr_norm['y_norm'] = self.reference_scales.length_to_dimensionless(
+            self.points['y']
+        )
 
         # --- Генерация начального поля скорости ---
         x = self.points['x']
@@ -665,8 +886,13 @@ class Initializer:
 
         # Добавление шума к давлению
         if self.pressure_perturbation_amplitude > 0:
-            q_ref = 0.5 * self.rho * self.U_inf**2
-            p_phys += self.pressure_perturbation_amplitude * q_ref * (2 * np.random.random(N) - 1)
+            q_ref = self.reference_scales.dynamic_pressure
+            pressure_noise = 2 * np.random.random(N) - 1
+            p_phys += (
+                self.pressure_perturbation_amplitude
+                * q_ref
+                * pressure_noise
+            )
 
         # Применяем граничные условия к начальному полю скорости
         if 'boundary_type' in self.points.dtype.names:
@@ -674,60 +900,86 @@ class Initializer:
             u_phys[wall_mask] = 0.0
             v_phys[wall_mask] = 0.0
 
-            sym_mask = self.points['boundary_type'] == 'symmetry'
-            v_phys[sym_mask] = 0.0
+            boundary_names = np.char.lower(
+                self.points['boundary_type'].astype(str)
+            )
+            sym_mask = boundary_names == 'symmetry'
+            slip_mask = np.isin(boundary_names, ('slip_wall', 'slip'))
+            valid_normals = (
+                np.isfinite(arr_norm['normal_x'])
+                & np.isfinite(arr_norm['normal_y'])
+            )
+            projected_mask = (sym_mask | slip_mask) & valid_normals
+            normal_velocity = (
+                u_phys[projected_mask] * arr_norm['normal_x'][projected_mask]
+                + v_phys[projected_mask] * arr_norm['normal_y'][projected_mask]
+            )
+            u_phys[projected_mask] -= (
+                normal_velocity * arr_norm['normal_x'][projected_mask]
+            )
+            v_phys[projected_mask] -= (
+                normal_velocity * arr_norm['normal_y'][projected_mask]
+            )
 
             axis_mask = self.points['boundary_type'] == 'axis_symmetry'
             u_phys[axis_mask] = 0.0
 
         # Нормализация
-        arr_norm['u_norm'] = u_phys / self.U_inf
-        arr_norm['v_norm'] = v_phys / self.U_inf
-        arr_norm['p_norm'] = (p_phys - self.p_ref) / (0.5 * self.rho * self.U_inf**2)
+        arr_norm['u_norm'] = self.reference_scales.velocity_to_dimensionless(
+            u_phys
+        )
+        arr_norm['v_norm'] = self.reference_scales.velocity_to_dimensionless(
+            v_phys
+        )
+        arr_norm['p_norm'] = self.reference_scales.pressure_to_coefficient(
+            p_phys
+        )
 
-        # --- Вычисление SDF (с поддержкой многопроцессорности) ---
+        # --- Exact segment-based SDF cache ---
         if len(self.wall_points) == 0:
             logger.warning("Нет точек WALL, SDF будет нулевым.")
             sdf_phys = np.zeros(N)
         else:
-            logger.info("Вычисление SDF...")
-            xs = self.points['x'].copy()
-            ys = self.points['y'].copy()
+            logger.info(
+                "Вычисление точного SDF до сегментов профиля "
+                "(vectorized PyTorch CPU)."
+            )
+            wall_norm = np.asarray(
+                self.reference_scales.length_to_dimensionless(
+                    self.wall_points
+                ),
+                dtype=np.float64,
+            )
+            query_norm = np.column_stack(
+                (arr_norm['x_norm'], arr_norm['y_norm'])
+            )
+            closed = (
+                bool(self.sampler_metadata.get('foil_closed', True))
+                if isinstance(self.sampler_metadata, dict)
+                else len(wall_norm) >= 3
+            )
+            distance_field = PolylineDistanceField(
+                wall_norm,
+                closed=closed,
+                segment_chunk_size=256,
+            )
+            arr_norm['sdf_norm'] = distance_field.evaluate_numpy(
+                query_norm,
+                point_chunk_size=8192,
+            )
+            self.sdf_geometry_fingerprint = (
+                distance_field.geometry_fingerprint
+            )
+            logger.info(
+                "SDF-кэш рассчитан: segments=%d, geometry=%s",
+                distance_field.segment_count,
+                self.sdf_geometry_fingerprint[:12],
+            )
 
-            if num_processes is None:
-                num_processes = mp.cpu_count()
-            num_processes = max(1, min(int(num_processes), N, 16))
-
-            if num_processes > 1 and mp.cpu_count() > 1:
-                logger.info(f"Используется процессов: {num_processes}")
-                indices = np.arange(N)
-                chunks = [chunk for chunk in np.array_split(indices, num_processes) if len(chunk) > 0]
-                with mp.Pool(processes=num_processes) as pool:
-                    func = partial(_compute_sdf_chunk,
-                                   xs=xs, ys=ys,
-                                   wall_points=self.wall_points,
-                                   use_scipy=SCIPY_AVAILABLE)
-                    results = pool.map(func, chunks)
-
-                sdf_phys = np.zeros(N)
-                for chunk_idx, sdf_vals in zip(chunks, results):
-                    sdf_phys[chunk_idx] = sdf_vals
-            else:
-                # Однопоточный режим с использованием заранее построенного дерева
-                logger.info("Однопоточный режим.")
-                if SCIPY_AVAILABLE and self.wall_tree is not None:
-                    sdf_phys, _ = self.wall_tree.query(np.column_stack((xs, ys)), k=1)
-                    sdf_phys = np.asarray(sdf_phys, dtype=np.float64)
-                else:
-                    sdf_phys = _compute_sdf_chunk(
-                        np.arange(N),
-                        xs=xs,
-                        ys=ys,
-                        wall_points=self.wall_points,
-                        use_scipy=False,
-                    )
-
-        arr_norm['sdf_norm'] = sdf_phys / self.chord
+        if len(self.wall_points) == 0:
+            arr_norm['sdf_norm'] = (
+                self.reference_scales.length_to_dimensionless(sdf_phys)
+            )
 
         self.points_norm = arr_norm
         logger.info("Нормализованные поля инициализированы.")
@@ -750,8 +1002,12 @@ class Initializer:
         logger.info(f"Сохранено: {base}")
 
         # Вычисляем нормализованные значения скорости на входе
-        inlet_u_norm = self.conditions.u / self.U_inf if self.U_inf > 0 else 1.0
-        inlet_v_norm = self.conditions.v / self.U_inf if self.U_inf > 0 else 0.0
+        inlet_u_norm = self.reference_scales.velocity_to_dimensionless(
+            self.conditions.u
+        )
+        inlet_v_norm = self.reference_scales.velocity_to_dimensionless(
+            self.conditions.v
+        )
 
         meta = {
             'description': description,
@@ -760,6 +1016,8 @@ class Initializer:
             'temperature': self.temperature,
             'pressure_mode': self.pressure_mode,
             'velocity_initial_mode': self.velocity_initial_mode,
+            'field_role': 'initial_guess_only',
+            'supervised_reference': False,
             'velocity_perturbation_amplitude': self.velocity_perturbation_amplitude,
             'pressure_perturbation_amplitude': self.pressure_perturbation_amplitude,
             'num_points': len(self.points_norm),
@@ -769,10 +1027,27 @@ class Initializer:
             'rho': self.rho,
             'mu': self.mu,
             'Re': self.Re,
+            'reference_scales': self.reference_scales.to_metadata(),
+            'flow_cases': [self.flow_case.to_metadata()],
+            'sdf_geometry_fingerprint': self.sdf_geometry_fingerprint,
+            'sdf_method': 'exact_polyline_segments',
             'delta_bl_99_est': self.delta_bl_est,
             'delta_bl_99_est_norm': self.delta_bl_est_norm,
+            'delta_bl_model': self.boundary_layer_model,
             'normalized': True,
             'sdf_norm_factor': self.chord,
+            'geometry_reference': self.geometry_reference,
+            'normalization': {
+                'coordinate_length_scale': 'chord',
+                'coordinate_norm_factor': self.chord,
+                'sdf_norm_factor': self.chord,
+                'chord_source': self.chord_source,
+            },
+            'sampling_points_file': (
+                os.path.basename(self.sampler_points_file)
+                if self.sampler_points_file
+                else None
+            ),
             'inlet_u_norm': inlet_u_norm,
             'inlet_v_norm': inlet_v_norm,
         }

@@ -12,6 +12,9 @@ from typing import Optional, Dict, Any
 import torch
 import numpy as np
 
+from airfoil_pinn.training.contract import build_training_contract
+from airfoil_pinn.training.reproducibility import capture_rng_state
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["InteractiveHandler"]
@@ -129,21 +132,37 @@ class InteractiveHandler:
         dataset = self.data_handler.dataset
         x_norm = dataset.x.to(self.device, dtype=self.dtype)
         y_norm = dataset.y.to(self.device, dtype=self.dtype)
-        sdf_norm = dataset.sdf.to(self.device, dtype=self.dtype)
+        sdf_norm = self.loss_computer.evaluate_sdf_tensor(
+            x_norm,
+            y_norm,
+        )
         bt = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
 
         was_training = self.model.training
         self.model.eval()
         with torch.no_grad():
-            input_tensor = self.loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
+            input_tensor = self.loss_computer.build_input_tensor(
+                x_norm,
+                y_norm,
+                sdf_norm,
+            )
             out = self.model(input_tensor)
             u_raw, v_raw, p_raw = out[:, 0:1], out[:, 1:2], out[:, 2:3]
+            u, v, p = self.loss_computer.transform_outputs(
+                u_raw,
+                v_raw,
+                p_raw,
+                x_norm,
+                y_norm,
+                sdf=sdf_norm,
+                case_ids=getattr(dataset, 'case_id', None),
+            )
 
-            # Применяем hard constraints, если нужно (для отображения правильных значений на границах)
+            # Legacy pointwise override.
             if self.loss_computer.bc_type == 'hard':
                 # Маски и значения нужно получить из датасета
                 u, v, p = self.loss_computer.apply_hard_constraints(
-                    u_raw, v_raw, p_raw,
+                    u, v, p,
                     dataset.mask_u_fixed.to(self.device).view(-1, 1),
                     dataset.mask_v_fixed.to(self.device).view(-1, 1),
                     dataset.mask_p_fixed.to(self.device).view(-1, 1),
@@ -151,8 +170,6 @@ class InteractiveHandler:
                     dataset.v_bc.to(self.device, dtype=self.dtype).view(-1, 1),
                     dataset.p_bc.to(self.device, dtype=self.dtype).view(-1, 1)
                 )
-            else:
-                u, v, p = u_raw, v_raw, p_raw
         if was_training:
             self.model.train()
 
@@ -253,6 +270,11 @@ class InteractiveHandler:
         Сохраняет чекпоинт по запросу пользователя (Ctrl+S).
         """
         logger.info("💾 Сохранение чекпоинта по запросу...")
+        training_contract = build_training_contract(
+            self.config,
+            self.data_handler,
+            self.loss_computer,
+        )
         self.checkpoint_manager.save(
             filename=f"pinn_manual_epoch_{epoch}.pt",
             model=self.model,
@@ -262,7 +284,14 @@ class InteractiveHandler:
             history=self.metrics.history,
             sa_weights=self.sa_weights,
             epoch=epoch,
-            config=self.config
+            config=self.config,
+            extra_state={
+                "training_contract": training_contract.to_metadata(),
+                "data_handler_state": self.data_handler.get_state(),
+                "trainer_state": self.trainer.get_state(),
+                "using_lbfgs": self.trainer.using_lbfgs,
+                "rng_state": capture_rng_state(),
+            },
         )
 
     def _adjust_lr(self, factor: float) -> None:

@@ -19,6 +19,7 @@ Example:
 """
 
 import os
+import random
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -28,14 +29,27 @@ from typing import Any, Dict, List, Optional, Tuple
 from scipy.spatial import cKDTree
 
 from airfoil_pinn.app.paths import (
-    GEOM_CONFIG_PATH,
-    GEOMETRY_DOMAINS_DIR,
-    GEOMETRY_METADATA_DIR,
     PATHS,
     SAMPLING_COLLOCATION_DIR,
     resolve_project_path,
 )
 from airfoil_pinn.core.type_hints import PointDtypeDict
+from airfoil_pinn.data.batch import PINNBatch, collate_pinn_batches
+from airfoil_pinn.data.flow import (
+    FlowCase,
+    FlowCaseBatch,
+    flow_cases_from_metadata,
+)
+from airfoil_pinn.data.normalization import (
+    ReferenceScales,
+    extract_geometry_reference,
+    load_companion_metadata,
+)
+from airfoil_pinn.geometry.sdf import PolylineDistanceField
+from airfoil_pinn.data.sdf_diagnostics import (
+    estimate_boundary_layer_delta,
+    resolve_boundary_layer_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +63,18 @@ __all__ = [
     "MeshPointAdapter",
     "PINNDataset",
 ]
+
+
+def _seed_dataloader_worker(worker_id: int) -> None:
+    """Seed Python and NumPy from the worker seed assigned by PyTorch.
+
+    The function intentionally lives at module scope so it remains picklable
+    with the Windows ``spawn`` multiprocessing method.
+    """
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 @dataclass
@@ -142,18 +168,19 @@ class PINNDataset(Dataset):
     """
     Dataset для точек коллокации.
 
-    Возвращает кортеж: (idx, x, y, sdf, boundary_types,
-                        mask_u_fixed, mask_v_fixed, mask_p_fixed,
-                        u_bc, v_bc, p_bc)
+    Returns a :class:`PINNBatch` point sample.  Its iterator exposes the
+    historical tuple ``(idx, x, y, sdf, boundary_types, mask_u_fixed,
+    mask_v_fixed, mask_p_fixed, u_bc, v_bc, p_bc)`` while ``case_id`` remains
+    available as a named field.
     Все тензоры хранятся в float32.
 
     Attributes:
         x: X-координаты (нормированные)
         y: Y-координаты (нормированные)
         sdf: Расстояние до стенки (нормированное)
-        p_target: Целевое давление
-        u_target: Целевая скорость U
-        v_target: Целевая скорость V
+        p_initial_guess: Начальное поле давления, не supervised target
+        u_initial_guess: Начальное поле скорости U, не supervised target
+        v_initial_guess: Начальное поле скорости V, не supervised target
         boundary_types: One-hot кодирование типов границ
         mask_u_fixed: Маска фиксированных компонент U
         mask_v_fixed: Маска фиксированных компонент V
@@ -161,13 +188,20 @@ class PINNDataset(Dataset):
         u_bc: Значения BC для U
         v_bc: Значения BC для V
         p_bc: Значения BC для P
+        normal_x: X-компонента единичной нормали границы
+        normal_y: Y-компонента единичной нормали границы
     """
-    def __init__(self, points_file: str) -> None:
+    def __init__(
+        self,
+        points_file: str,
+        pde_system: str = 'incompressible_navier_stokes',
+    ) -> None:
         """
         Инициализирует датасет из файла.
 
         Args:
             points_file: Путь к файлу с точками коллокации
+            pde_system: Система PDE, определяющая компонентные hard BC.
 
         Raises:
             ValueError: Если файл имеет неверный формат
@@ -182,14 +216,30 @@ class PINNDataset(Dataset):
             if fld not in data.dtype.names:
                 raise ValueError(f"В файле отсутствует поле {fld}")
 
-        self.x = torch.tensor(np.ascontiguousarray(data['x_norm']), dtype=torch.float32).view(-1, 1)
-        self.y = torch.tensor(np.ascontiguousarray(data['y_norm']), dtype=torch.float32).view(-1, 1)
-        self.sdf = torch.tensor(np.ascontiguousarray(data['sdf_norm']), dtype=torch.float32).view(-1, 1)
+        def _field_copy(name: str) -> np.ndarray:
+            # A field view of a structured dtype can have a record-sized
+            # stride that torch.as_tensor rejects even when NumPy labels it
+            # C-contiguous (notably for a one-row file).
+            return np.array(data[name], copy=True, order='C')
 
-        # Целевые значения (для справки, не используются при hard)
-        self.p_target = torch.tensor(np.ascontiguousarray(data['p_norm']), dtype=torch.float32).view(-1, 1)
-        self.u_target = torch.tensor(np.ascontiguousarray(data['u_norm']), dtype=torch.float32).view(-1, 1)
-        self.v_target = torch.tensor(np.ascontiguousarray(data['v_norm']), dtype=torch.float32).view(-1, 1)
+        self.x = torch.tensor(_field_copy('x_norm'), dtype=torch.float32).view(-1, 1)
+        self.y = torch.tensor(_field_copy('y_norm'), dtype=torch.float32).view(-1, 1)
+        self.sdf = torch.tensor(_field_copy('sdf_norm'), dtype=torch.float32).view(-1, 1)
+
+        # These are initializer fields, not ground-truth solution labels.
+        # Explicit names prevent accidental inclusion in a supervised loss.
+        self.p_initial_guess = torch.tensor(
+            _field_copy('p_norm'),
+            dtype=torch.float32,
+        ).view(-1, 1)
+        self.u_initial_guess = torch.tensor(
+            _field_copy('u_norm'),
+            dtype=torch.float32,
+        ).view(-1, 1)
+        self.v_initial_guess = torch.tensor(
+            _field_copy('v_norm'),
+            dtype=torch.float32,
+        ).view(-1, 1)
 
         # Обработка типов границ (one-hot) – все имена в нижнем регистре
         self.boundary_types = None
@@ -208,22 +258,50 @@ class PINNDataset(Dataset):
         self.on_boundary = torch.zeros(len(self.x), dtype=torch.bool)
         self.on_airfoil = torch.zeros(len(self.x), dtype=torch.bool)
         self.segment_id = torch.full((len(self.x),), -1, dtype=torch.long)
+        self.normal_x = torch.full(
+            (len(self.x), 1),
+            float("nan"),
+            dtype=torch.float32,
+        )
+        self.normal_y = torch.full(
+            (len(self.x), 1),
+            float("nan"),
+            dtype=torch.float32,
+        )
+        self.case_id = torch.zeros(len(self.x), dtype=torch.long)
 
         if 'on_boundary' in data.dtype.names:
             self.on_boundary = torch.tensor(
-                np.ascontiguousarray(data['on_boundary']),
+                _field_copy('on_boundary'),
                 dtype=torch.bool
             )
         if 'on_airfoil' in data.dtype.names:
             self.on_airfoil = torch.tensor(
-                np.ascontiguousarray(data['on_airfoil']),
+                _field_copy('on_airfoil'),
                 dtype=torch.bool
             )
         if 'segment_id' in data.dtype.names:
             self.segment_id = torch.tensor(
-                np.ascontiguousarray(data['segment_id']),
+                _field_copy('segment_id'),
                 dtype=torch.long
             )
+        if 'normal_x' in data.dtype.names:
+            self.normal_x = torch.tensor(
+                _field_copy('normal_x'),
+                dtype=torch.float32,
+            ).view(-1, 1)
+        if 'normal_y' in data.dtype.names:
+            self.normal_y = torch.tensor(
+                _field_copy('normal_y'),
+                dtype=torch.float32,
+            ).view(-1, 1)
+        if 'case_id' in data.dtype.names:
+            self.case_id = torch.tensor(
+                _field_copy('case_id'),
+                dtype=torch.long,
+            )
+            if bool((self.case_id < 0).any()):
+                raise ValueError("case_id values must be non-negative")
 
         if 'boundary_type' in data.dtype.names:
             # Приводим все уникальные значения к нижнему регистру
@@ -254,14 +332,13 @@ class PINNDataset(Dataset):
                     self.mask_p_fixed[i] = True
                     # p = 0 (уже по умолчанию)
 
-                elif bt_str == 'wall':
+                elif (
+                    bt_str == 'wall'
+                    and pde_system == 'incompressible_navier_stokes'
+                ):
                     self.mask_u_fixed[i] = True
                     self.mask_v_fixed[i] = True
                     # u = 0, v = 0 (уже по умолчанию)
-
-                elif bt_str == 'symmetry':
-                    self.mask_v_fixed[i] = True
-                    # v = 0
 
                 elif bt_str == 'axis_symmetry':
                     self.mask_u_fixed[i] = True
@@ -283,6 +360,33 @@ class PINNDataset(Dataset):
                 "но u_bc/v_bc = 0 до вызова DataHandler.set_inlet_values(). "
                 "Убедитесь, что DataHandler вызывает set_inlet_values() после загрузки метаданных."
             )
+
+    @property
+    def p_target(self) -> torch.Tensor:
+        """Deprecated alias for the non-supervised pressure initial guess."""
+        return self.p_initial_guess
+
+    @p_target.setter
+    def p_target(self, value: torch.Tensor) -> None:
+        self.p_initial_guess = value
+
+    @property
+    def u_target(self) -> torch.Tensor:
+        """Deprecated alias for the non-supervised x-velocity initial guess."""
+        return self.u_initial_guess
+
+    @u_target.setter
+    def u_target(self, value: torch.Tensor) -> None:
+        self.u_initial_guess = value
+
+    @property
+    def v_target(self) -> torch.Tensor:
+        """Deprecated alias for the non-supervised y-velocity initial guess."""
+        return self.v_initial_guess
+
+    @v_target.setter
+    def v_target(self, value: torch.Tensor) -> None:
+        self.v_initial_guess = value
 
     def set_inlet_values(self, u_norm: float, v_norm: float) -> None:
         """
@@ -328,7 +432,7 @@ class PINNDataset(Dataset):
         """
         return self.n_points
 
-    def __getitem__(self, idx: int) -> Tuple:
+    def __getitem__(self, idx: int) -> PINNBatch:
         """
         Возвращает элемент датасета по индексу.
 
@@ -336,26 +440,29 @@ class PINNDataset(Dataset):
             idx: Индекс элемента
 
         Returns:
-            Кортеж с данными точки
+            Named point sample with legacy tuple iteration.
         """
-        # Базовые тензоры
-        result = (idx, self.x[idx], self.y[idx], self.sdf[idx])
-
-        # One-hot границ (если есть)
-        if self.boundary_types is not None:
-            result += (self.boundary_types[idx],)
-        else:
-            result += (torch.zeros(0),)
-
-        # Маски и значения
-        result += (self.mask_u_fixed[idx].view(1),
-                   self.mask_v_fixed[idx].view(1),
-                   self.mask_p_fixed[idx].view(1),
-                   self.u_bc[idx].view(1),
-                   self.v_bc[idx].view(1),
-                   self.p_bc[idx].view(1))
-
-        return result
+        boundary_types = (
+            self.boundary_types[idx]
+            if self.boundary_types is not None
+            else torch.zeros(0)
+        )
+        return PINNBatch(
+            index=torch.tensor(idx, dtype=torch.long),
+            x=self.x[idx],
+            y=self.y[idx],
+            sdf=self.sdf[idx],
+            boundary_types=boundary_types,
+            mask_u_fixed=self.mask_u_fixed[idx].view(1),
+            mask_v_fixed=self.mask_v_fixed[idx].view(1),
+            mask_p_fixed=self.mask_p_fixed[idx].view(1),
+            u_bc=self.u_bc[idx].view(1),
+            v_bc=self.v_bc[idx].view(1),
+            p_bc=self.p_bc[idx].view(1),
+            normal_x=self.normal_x[idx],
+            normal_y=self.normal_y[idx],
+            case_id=self.case_id[idx],
+        )
 
     def extend(self, indices: torch.Tensor) -> 'PINNDataset':
         """
@@ -374,7 +481,8 @@ class PINNDataset(Dataset):
                      'mask_u_fixed', 'mask_v_fixed', 'mask_p_fixed',
                      'u_bc', 'v_bc', 'p_bc', 'boundary_types',
                      'on_boundary', 'on_airfoil', 'segment_id',
-                     'mesh_x_phys', 'mesh_y_phys']:
+                     'normal_x', 'normal_y',
+                     'case_id', 'mesh_x_phys', 'mesh_y_phys']:
             old = getattr(self, attr, None)
             if old is not None:
                 new = torch.cat([old, old[indices]], dim=0)
@@ -418,6 +526,8 @@ class DataHandler:
         pin_memory: bool = False,
         persistent_workers: Optional[bool] = None,
         prefetch_factor: Optional[int] = None,
+        seed: int = 42,
+        pde_system: str = 'incompressible_navier_stokes',
     ) -> None:
         """
         Инициализирует обработчик данных.
@@ -432,6 +542,8 @@ class DataHandler:
             pin_memory: закреплять CPU-память для ускорения копирования на CUDA.
             persistent_workers: держать worker'ы между эпохами.
             prefetch_factor: число заранее подготовленных batch на worker.
+            seed: базовый seed перемешивания и worker-процессов.
+            pde_system: Система PDE для построения hard-BC масок.
         """
         self.points_file = str(resolve_project_path(points_file))
         self.batch_size = batch_size
@@ -448,18 +560,47 @@ class DataHandler:
             if prefetch_factor is not None
             else 2
         )
+        self.seed = int(seed)
+        self.pde_system = str(pde_system)
+        self._loader_generator = torch.Generator()
+        self._loader_generator.manual_seed(self.seed)
         self.mesh_data: Optional[MeshData] = None
         self.mesh_file = str(resolve_project_path(mesh_file)) if mesh_file is not None else None
         self.mesh_domain_coords: Optional[np.ndarray] = None
         self.mesh_airfoil_coords: Optional[np.ndarray] = None
+        self.sampler_metadata: Optional[Dict[str, Any]] = None
+        self.geometry_reference: Optional[Dict[str, Any]] = None
+        self.fvm_sdf_geometry_fingerprint: Optional[str] = None
+        self.cached_sdf_geometry_fingerprint: Optional[str] = None
+        self.cached_sdf_method: Optional[str] = None
+        self.cached_sdf_max_abs_error: Optional[float] = None
 
-        self.dataset = PINNDataset(self.points_file)
+        self.dataset = PINNDataset(
+            self.points_file,
+            pde_system=self.pde_system,
+        )
         self.load_metadata()
         self._load_sampler_point_metadata()
-        self.load_mesh_geometry_from_geom_config()
+        self._reconcile_geometry_normalization()
+        self._log_flow_cases()
         # После загрузки метаданных устанавливаем значения на inlet
         self.dataset.set_inlet_values(self.inlet_u_norm, self.inlet_v_norm)
         self.dataloader = self._make_dataloader(self.dataset, batch_size=batch_size, shuffle=shuffle)
+        logger.info(
+            "DataLoader: batch=%d, workers=%d, pin_memory=%s, "
+            "persistent=%s, prefetch=%s, seed=%d",
+            self.batch_size,
+            self.num_workers,
+            self.pin_memory,
+            self.persistent_workers if self.num_workers > 0 else False,
+            self.prefetch_factor if self.num_workers > 0 else None,
+            self.seed,
+        )
+        if os.name == "nt" and self.num_workers > 0:
+            logger.info(
+                "Windows multiprocessing uses spawn; launch training below "
+                "an `if __name__ == '__main__'` guard."
+            )
 
         if self.mesh_file is not None:
             self.load_mesh(self.mesh_file)
@@ -476,6 +617,9 @@ class DataHandler:
             'shuffle': shuffle,
             'num_workers': self.num_workers,
             'pin_memory': self.pin_memory,
+            'collate_fn': collate_pinn_batches,
+            'generator': self._loader_generator,
+            'worker_init_fn': _seed_dataloader_worker,
         }
         if self.num_workers > 0:
             kwargs['persistent_workers'] = self.persistent_workers
@@ -484,38 +628,199 @@ class DataHandler:
 
     def load_metadata(self) -> None:
         """
-        Загружает метаданные из файла _metadata.npy.
+        Load and validate the versioned CFD normalization contract.
 
         Raises:
             FileNotFoundError: Если файл метаданных не найден
+            ValueError: If physical reference scales are missing or invalid.
         """
         meta_path = self.points_file.replace('.npy', '_metadata.npy')
         if not os.path.exists(meta_path):
             raise FileNotFoundError(f"Файл метаданных {meta_path} не найден")
         meta = np.load(meta_path, allow_pickle=True).item()
+        self.initial_metadata = dict(meta)
+        self.field_role = str(
+            meta.get("field_role", "legacy_initial_guess")
+        ).lower()
+        if self.field_role not in {
+            "initial_guess_only",
+            "legacy_initial_guess",
+        }:
+            raise ValueError(
+                "Collocation artifact field_role must identify initializer "
+                f"fields, received {self.field_role!r}. Supervised reference "
+                "solutions require a separate validated data contract."
+            )
         self.fluid_name = meta.get('fluid_name')
         self.conditions_name = meta.get('conditions_name')
-        self.chord = meta.get('chord', 1.0)
-        self.U_inf = meta.get('U_inf', 1.0)
-        self.p_ref = meta.get('p_ref', 0.0)
-        self.rho = meta.get('rho', 1.0)
-        self.mu = meta.get('mu', 1.0)
-        self.Re = meta.get('Re', 1.0)
+        self.reference_scales = ReferenceScales.from_metadata(meta)
+        self.chord = self.reference_scales.chord
+        self.U_inf = self.reference_scales.velocity
+        self.p_ref = self.reference_scales.static_pressure
+        self.rho = self.reference_scales.density
+        self.mu = self.reference_scales.dynamic_viscosity
+        self.Re = self.reference_scales.reynolds
+
+        stored_re = meta.get('Re')
+        if stored_re is not None:
+            try:
+                stored_re_value = float(stored_re)
+            except (TypeError, ValueError):
+                stored_re_value = float('nan')
+            if (
+                np.isfinite(stored_re_value)
+                and stored_re_value > 0.0
+                and not np.isclose(stored_re_value, self.Re, rtol=1e-8, atol=0.0)
+            ):
+                logger.warning(
+                    "Stored Re_c=%.9g disagrees with reference scales "
+                    "(Re_c=%.9g); using the value recomputed from rho*U*c/mu.",
+                    stored_re_value,
+                    self.Re,
+                )
+        self.sdf_norm_factor = float(meta.get('sdf_norm_factor', self.chord))
+        cached_fingerprint = meta.get('sdf_geometry_fingerprint')
+        self.cached_sdf_geometry_fingerprint = (
+            str(cached_fingerprint)
+            if cached_fingerprint
+            else None
+        )
+        cached_method = meta.get('sdf_method')
+        self.cached_sdf_method = (
+            str(cached_method)
+            if cached_method
+            else None
+        )
+        self.delta_bl_99_est = meta.get('delta_bl_99_est')
+        self.delta_bl_99_est_norm = meta.get('delta_bl_99_est_norm')
+        self.boundary_layer_model = str(meta.get('delta_bl_model', 'laminar'))
+        self.geometry_reference = meta.get('geometry_reference')
         self.inlet_u_norm = meta.get('inlet_u_norm', 1.0)
         self.inlet_v_norm = meta.get('inlet_v_norm', 0.0)
+        self.has_explicit_flow_cases = meta.get('flow_cases') is not None
+        self.flow_cases = flow_cases_from_metadata(
+            meta,
+            fallback_reynolds=self.Re,
+            fallback_u_normalized=self.inlet_u_norm,
+            fallback_v_normalized=self.inlet_v_norm,
+        )
+        unknown_case_ids = (
+            set(int(value) for value in torch.unique(self.dataset.case_id))
+            - set(self.flow_cases)
+        )
+        if unknown_case_ids:
+            raise ValueError(
+                "Dataset references undefined flow case IDs: "
+                f"{sorted(unknown_case_ids)}"
+            )
         # Границы области (нормированные)
         self.x_min = self.dataset.x.min().item()
         self.x_max = self.dataset.x.max().item()
         self.y_min = self.dataset.y.min().item()
         self.y_max = self.dataset.y.max().item()
-        logger.info(f"Метаданные: chord={self.chord:.4f} м, U_inf={self.U_inf:.4f} м/с, Re={self.Re:.2e}")
+        logger.info(
+            "Метаданные: chord=%.4f м, U_inf=%.4f м/с, Re=%.2e, "
+            "normalization=%s:%d, fingerprint=%s",
+            self.chord,
+            self.U_inf,
+            self.Re,
+            self.reference_scales.to_metadata()['schema'],
+            self.reference_scales.to_metadata()['version'],
+            self.reference_scales.fingerprint()[:12],
+        )
         logger.info(f"Вход: u_norm={self.inlet_u_norm:.3f}, v_norm={self.inlet_v_norm:.3f}")
         self.dataset.mesh_x_phys = (self.dataset.x.double().flatten() * float(self.chord)).clone()
         self.dataset.mesh_y_phys = (self.dataset.y.double().flatten() * float(self.chord)).clone()
 
+    def _log_flow_cases(self) -> None:
+        """Log the final case table after legacy geometry reconciliation."""
+        logger.info(
+            "Flow cases: %s",
+            ", ".join(
+                f"id={case.case_id}:Re={case.reynolds:.6g},"
+                f"alpha={case.angle_degrees:.6g}deg"
+                for case in self.flow_cases.values()
+            ),
+        )
+
+    def get_flow_case_batch(
+        self,
+        case_ids: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> FlowCaseBatch:
+        """Materialize dimensionless case parameters for point associations."""
+        ids = case_ids.to(device=device, dtype=torch.long).reshape(-1, 1)
+        batch_size = ids.shape[0]
+        reynolds = torch.empty((batch_size, 1), device=device, dtype=dtype)
+        cos_alpha = torch.empty_like(reynolds)
+        sin_alpha = torch.empty_like(reynolds)
+
+        pressure_defined = all(
+            case.pressure_drop_coefficient is not None
+            for case in self.flow_cases.values()
+        )
+        pressure_drop = (
+            torch.empty_like(reynolds)
+            if pressure_defined
+            else None
+        )
+        geometry_widths = {
+            len(case.geometry_parameters) for case in self.flow_cases.values()
+        }
+        if len(geometry_widths) != 1:
+            raise ValueError(
+                "All flow cases must use the same geometry parameter width"
+            )
+        geometry_width = geometry_widths.pop()
+        geometry = (
+            torch.empty(
+                (batch_size, geometry_width),
+                device=device,
+                dtype=dtype,
+            )
+            if geometry_width > 0
+            else None
+        )
+
+        assigned = torch.zeros((batch_size, 1), device=device, dtype=torch.bool)
+        for case_id, case in self.flow_cases.items():
+            mask = ids == int(case_id)
+            if not bool(mask.any()):
+                continue
+            reynolds[mask] = case.reynolds
+            cos_alpha[mask] = case.cos_alpha
+            sin_alpha[mask] = case.sin_alpha
+            assigned |= mask
+            if pressure_drop is not None:
+                pressure_drop[mask] = float(
+                    case.pressure_drop_coefficient
+                )
+            if geometry is not None:
+                row_mask = mask.reshape(-1)
+                geometry[row_mask] = torch.as_tensor(
+                    case.geometry_parameters,
+                    device=device,
+                    dtype=dtype,
+                )
+
+        if not bool(assigned.all()):
+            missing = torch.unique(ids[~assigned]).detach().cpu().tolist()
+            raise ValueError(f"Undefined flow case IDs in batch: {missing}")
+        return FlowCaseBatch(
+            case_id=ids,
+            reynolds=reynolds,
+            cos_alpha=cos_alpha,
+            sin_alpha=sin_alpha,
+            pressure_drop_coefficient=pressure_drop,
+            geometry_parameters=geometry,
+        )
+
     def _load_sampler_point_metadata(self) -> None:
         """
-        Дополняет initial.npy геометрическими флагами из collocation_points.npy.
+        Дополняет initial.npy геометрическими флагами и нормалями из
+        collocation_points.npy.
 
         workspace/initial/fields/initial.npy хранит нормированные поля, но обычно не хранит
         on_airfoil/segment_id. Эти флаги нужны только для корректной перестройки
@@ -562,6 +867,15 @@ class DataHandler:
                 np.ascontiguousarray(arr['segment_id']),
                 dtype=torch.long
             )
+            if {'normal_x', 'normal_y'}.issubset(names):
+                self.dataset.normal_x = torch.tensor(
+                    np.array(arr['normal_x'], copy=True),
+                    dtype=torch.float32,
+                ).view(-1, 1)
+                self.dataset.normal_y = torch.tensor(
+                    np.array(arr['normal_y'], copy=True),
+                    dtype=torch.float32,
+                ).view(-1, 1)
             self.dataset.mesh_x_phys = torch.tensor(
                 np.ascontiguousarray(arr['x']),
                 dtype=torch.float64
@@ -570,6 +884,19 @@ class DataHandler:
                 np.ascontiguousarray(arr['y']),
                 dtype=torch.float64
             )
+            self.sampler_metadata = load_companion_metadata(path)
+
+            airfoil_mask = np.asarray(arr['on_airfoil'], dtype=bool)
+            if np.any(airfoil_mask):
+                foil = np.column_stack([arr['x'][airfoil_mask], arr['y'][airfoil_mask]])
+                foil_closed = bool(
+                    isinstance(self.sampler_metadata, dict)
+                    and self.sampler_metadata.get('foil_closed', False)
+                )
+                if foil_closed and not np.allclose(foil[0], foil[-1], atol=1e-12):
+                    foil = np.vstack([foil, foil[0]])
+                self.mesh_airfoil_coords = np.asarray(foil, dtype=np.float64)
+
             logger.info("Геометрические флаги точек загружены из %s", path)
             return
 
@@ -581,75 +908,122 @@ class DataHandler:
                 "(collocation_points.npy не найден или не совпал)."
             )
 
-    def load_mesh_geometry_from_geom_config(self, config_path: str = GEOM_CONFIG_PATH) -> bool:
-        """
-        Загружает контуры домена/профиля для последующих rebuild Mesh2D.
+    def _reconcile_geometry_normalization(self) -> None:
+        """Align legacy normalized fields with the sampled geometry reference."""
+        reference = extract_geometry_reference(self.sampler_metadata)
+        if reference is None:
+            return
 
-        Новые mesh2d.npz сохраняют эти контуры прямо в файле. Для старых сеток
-        остаётся fallback через geom_config.yaml и сохранённые контуры геометрии.
-        """
-        if self.mesh_domain_coords is not None:
-            return True
+        new_chord = float(reference['chord'])
+        old_chord = float(self.chord)
+        old_sdf_factor = float(self.sdf_norm_factor)
+        self.geometry_reference = dict(reference)
 
-        project_dir = PROJECT_ROOT
-        cfg_path = config_path
-        if not os.path.isabs(cfg_path):
-            cfg_path = os.path.join(project_dir, cfg_path)
-        if not os.path.exists(cfg_path):
-            return False
+        if not np.isclose(old_chord, new_chord, rtol=1e-10, atol=1e-12):
+            physical_x = getattr(self.dataset, 'mesh_x_phys', None)
+            physical_y = getattr(self.dataset, 'mesh_y_phys', None)
+            if physical_x is None or physical_y is None:
+                logger.warning(
+                    "Хорда initial metadata (%.6g м) отличается от sampler metadata (%.6g м), "
+                    "но физические координаты недоступны; runtime-нормировка не изменена.",
+                    old_chord,
+                    new_chord,
+                )
+                return
 
-        try:
-            import yaml
-            with open(cfg_path, 'r', encoding='utf-8') as f:
-                cfg = yaml.safe_load(f) or {}
-        except Exception as exc:
-            logger.debug("Не удалось прочитать geom_config.yaml: %s", exc)
-            return False
+            self.dataset.x = (
+                physical_x.reshape(-1, 1) / new_chord
+            ).to(dtype=self.dataset.x.dtype)
+            self.dataset.y = (
+                physical_y.reshape(-1, 1) / new_chord
+            ).to(dtype=self.dataset.y.dtype)
+            logger.warning(
+                "Исправлена устаревшая нормировка координат: chord %.6g -> %.6g м (%s).",
+                old_chord,
+                new_chord,
+                reference.get('source', 'sampler metadata'),
+            )
 
-        geom_name = cfg.get('geom_name')
-        if not geom_name:
-            return False
+        sdf_scale = old_sdf_factor / new_chord
+        if not np.isclose(sdf_scale, 1.0, rtol=1e-10, atol=1e-12):
+            self.dataset.sdf = self.dataset.sdf * float(sdf_scale)
+            logger.warning(
+                "Исправлена нормировка SDF: factor %.6g -> %.6g м.",
+                old_sdf_factor,
+                new_chord,
+            )
 
-        def _load_coords(path_base: str) -> Optional[np.ndarray]:
-            for ext in (".npy", ".txt", ".csv"):
-                path = path_base + ext
-                if not os.path.exists(path):
-                    continue
-                if ext == ".npy":
-                    return np.asarray(np.load(path), dtype=np.float64)
-                return np.asarray(np.loadtxt(path, delimiter=',' if ext == ".csv" else None), dtype=np.float64)
-            return None
-
-        search_pairs = [
-            (GEOMETRY_DOMAINS_DIR, GEOMETRY_METADATA_DIR),
-            (
-                os.path.join(project_dir, "Geometry", "Data"),
-                os.path.join(project_dir, "Geometry", "Metadata"),
-            ),
-        ]
-        domain = None
-        foil = None
-        for data_dir, meta_dir in search_pairs:
-            domain = _load_coords(os.path.join(data_dir, f"{geom_name}_domain"))
-            foil = _load_coords(os.path.join(meta_dir, f"{geom_name}_foil"))
-            if foil is None:
-                foil = _load_coords(os.path.join(data_dir, f"{geom_name}_foil"))
-            if domain is not None:
-                break
-
-        if domain is None or len(domain) < 2:
-            return False
-        if len(domain) > 2 and not np.allclose(domain[0], domain[-1], atol=1e-9):
-            domain = np.vstack([domain, domain[0]])
-
-        self.mesh_domain_coords = domain
-        self.mesh_airfoil_coords = foil if foil is not None and len(foil) >= 2 else None
-        logger.info(
-            "Геометрия для FVM rebuild загружена: domain=%d, foil=%s",
-            len(domain),
-            len(self.mesh_airfoil_coords) if self.mesh_airfoil_coords is not None else "нет",
+        self.chord = new_chord
+        self.sdf_norm_factor = new_chord
+        self.reference_scales = self.reference_scales.with_chord(new_chord)
+        self.Re = self.reference_scales.reynolds
+        if not self.has_explicit_flow_cases:
+            legacy_case = self.flow_cases[0]
+            self.flow_cases[0] = FlowCase(
+                case_id=0,
+                reynolds=self.Re,
+                angle_degrees=legacy_case.angle_degrees,
+                pressure_drop_coefficient=(
+                    legacy_case.pressure_drop_coefficient
+                ),
+                geometry_parameters=legacy_case.geometry_parameters,
+                name=legacy_case.name,
+            )
+        normal_layer = (
+            self.sampler_metadata.get('normal_layer')
+            if isinstance(self.sampler_metadata, dict)
+            else None
         )
-        return True
+        sampled_model = normal_layer.get('cf_model') if isinstance(normal_layer, dict) else None
+        self.boundary_layer_model = resolve_boundary_layer_model(
+            self.Re,
+            str(sampled_model or self.boundary_layer_model),
+        )
+        self.delta_bl_99_est, self.delta_bl_99_est_norm = estimate_boundary_layer_delta(
+            self.chord,
+            self.Re,
+            model=self.boundary_layer_model,
+        )
+        self.x_min = self.dataset.x.min().item()
+        self.x_max = self.dataset.x.max().item()
+        self.y_min = self.dataset.y.min().item()
+        self.y_max = self.dataset.y.max().item()
+
+        sampled_re = normal_layer.get('re_chord') if isinstance(normal_layer, dict) else None
+        if sampled_re is not None and float(sampled_re) > 0.0:
+            relative_error = abs(float(sampled_re) - self.Re) / self.Re
+            if relative_error > 0.01:
+                logger.warning(
+                    "Normal-layer точки построены для Re_c=%.6g, текущие физические условия "
+                    "дают Re_c=%.6g (расхождение %.1f%%).",
+                    float(sampled_re),
+                    self.Re,
+                    100.0 * relative_error,
+                )
+
+        sampled_delta = normal_layer.get('delta') if isinstance(normal_layer, dict) else None
+        if (
+            sampled_delta is not None
+            and float(sampled_delta) > 0.0
+            and self.delta_bl_99_est is not None
+        ):
+            delta_error = abs(float(sampled_delta) - self.delta_bl_99_est) / self.delta_bl_99_est
+            if delta_error > 0.01:
+                logger.warning(
+                    "Normal-layer сетка покрывает delta/c=%.6g, текущий reference delta/c=%.6g "
+                    "(расхождение %.1f%%). Для полного согласования сетку нужно пересоздать.",
+                    float(sampled_delta) / self.chord,
+                    self.delta_bl_99_est_norm,
+                    100.0 * delta_error,
+                )
+
+        logger.info(
+            "Единые reference scales: chord=%.6g м, Re_c=%.6g, delta_99/c=%.6g (%s)",
+            self.chord,
+            self.Re,
+            self.delta_bl_99_est_norm or float('nan'),
+            self.boundary_layer_model,
+        )
 
     def load_mesh(self, mesh_file: str) -> None:
         """
@@ -753,11 +1127,10 @@ class DataHandler:
     def build_mesh_from_current_points(self, verbose: bool = False):
         """Строит новую Mesh2D по текущим точкам датасета без графиков и записи на диск."""
         if self.mesh_domain_coords is None:
-            self.load_mesh_geometry_from_geom_config()
-        if self.mesh_domain_coords is None:
             raise RuntimeError(
-                "Нет domain_coords для перестройки FVM-сетки. "
-                "Пересоздайте mesh2d.npz через S2DR или проверьте geom_config.yaml."
+                "В загруженном mesh2d.npz отсутствует domain_coords. "
+                "Пересоздайте сетку через S2DR: актуальный mesh-артефакт должен "
+                "хранить контур расчётной области внутри самого файла."
             )
 
         from airfoil_pinn.sampling.mesh import Mesh2D
@@ -775,26 +1148,66 @@ class DataHandler:
         Подготавливает нормированные тензоры (x, y, sdf, boundary_types) для FVM-шага.
 
         Координаты берутся из узлов сетки (mesh_data.coords / chord).
-        SDF интерполируется из ближайших точек обучающего датасета.
+        SDF вычисляется каноническим PolylineDistanceField по тем же
+        нормированным сегментам, что используются training и inference.
         Типы границ строятся из mesh_data.node_bnd_type с тем же one-hot, что и датасет.
 
-        Результат: self.fvm_x, self.fvm_y, self.fvm_sdf, self.fvm_bt — готовы для
-        loss_computer.build_input_tensor() без участия обучающего датасета.
+        Результат: self.fvm_x, self.fvm_y и self.fvm_sdf готовы для входа
+        сети, а self.fvm_bt хранит служебную BC-разметку FVM-узлов.
         """
         coords = self.mesh_data.coords          # (N, 2) физические
         N = len(coords)
 
-        x_norm_np = (coords[:, 0] / self.chord).astype(np.float32)
-        y_norm_np = (coords[:, 1] / self.chord).astype(np.float32)
+        x_norm_float64 = np.asarray(
+            coords[:, 0] / self.chord,
+            dtype=np.float64,
+        )
+        y_norm_float64 = np.asarray(
+            coords[:, 1] / self.chord,
+            dtype=np.float64,
+        )
+        query_norm = np.column_stack(
+            [x_norm_float64, y_norm_float64]
+        )
+        if (
+            self.mesh_airfoil_coords is None
+            or len(self.mesh_airfoil_coords) < 2
+        ):
+            raise RuntimeError(
+                "FVM SDF requires an ordered airfoil polyline; "
+                "nearest-neighbour/vertex SDF fallback is forbidden."
+            )
 
-        # SDF по ближайшему соседу из обучающего датасета
-        x_data = self.dataset.x.numpy().flatten().astype(np.float32)
-        y_data = self.dataset.y.numpy().flatten().astype(np.float32)
-        sdf_data = self.dataset.sdf.numpy().flatten().astype(np.float32)
-
-        tree = cKDTree(np.column_stack([x_data, y_data]))
-        _, nn_idx = tree.query(np.column_stack([x_norm_np, y_norm_np]), workers=-1)
-        sdf_norm_np = sdf_data[nn_idx]
+        airfoil_norm = (
+            np.asarray(self.mesh_airfoil_coords, dtype=np.float64)
+            / self.chord
+        )
+        closed = (
+            bool(self.sampler_metadata.get('foil_closed', True))
+            if isinstance(self.sampler_metadata, dict)
+            else len(airfoil_norm) >= 3
+        )
+        distance_field = PolylineDistanceField(
+            airfoil_norm,
+            closed=closed,
+            segment_chunk_size=256,
+        )
+        sdf_norm_float64 = distance_field.evaluate_numpy(
+            query_norm,
+            point_chunk_size=2048,
+        )
+        self.fvm_sdf_float64 = torch.from_numpy(
+            np.ascontiguousarray(sdf_norm_float64)
+        ).view(-1, 1)
+        self.fvm_sdf_geometry_fingerprint = (
+            distance_field.geometry_fingerprint
+        )
+        logger.info(
+            "FVM SDF calculated from exact normalized segments: "
+            "segments=%d, geometry=%s",
+            distance_field.segment_count,
+            self.fvm_sdf_geometry_fingerprint[:12],
+        )
 
         # One-hot типов границ (по именам из датасета)
         bt_names = self.dataset.boundary_type_names
@@ -805,9 +1218,17 @@ class DataHandler:
             if t_lower in type_to_idx:
                 bt_one_hot[i, type_to_idx[t_lower]] = 1.0
 
-        self.fvm_x   = torch.tensor(x_norm_np,   dtype=torch.float32).view(-1, 1)
-        self.fvm_y   = torch.tensor(y_norm_np,   dtype=torch.float32).view(-1, 1)
-        self.fvm_sdf = torch.tensor(sdf_norm_np, dtype=torch.float32).view(-1, 1)
+        # Keep the canonical query coordinates and their SDF in float64.
+        # Consumers cast these tensors to the model dtype at the device
+        # boundary, so preserving them here avoids an irreversible coordinate
+        # round-trip before inference or FVM evaluation.
+        self.fvm_x = torch.from_numpy(
+            np.ascontiguousarray(x_norm_float64)
+        ).view(-1, 1)
+        self.fvm_y = torch.from_numpy(
+            np.ascontiguousarray(y_norm_float64)
+        ).view(-1, 1)
+        self.fvm_sdf = self.fvm_sdf_float64
         self.fvm_bt  = torch.tensor(bt_one_hot,  dtype=torch.float32) if bt_names else None
 
         if N != self.n_points:
@@ -907,6 +1328,7 @@ class DataHandler:
         x_norm: np.ndarray,
         y_norm: np.ndarray,
         sdf_norm: np.ndarray,
+        case_id: Any = 0,
     ) -> int:
         """
         Добавляет новые interior-точки с уникальными координатами.
@@ -922,6 +1344,20 @@ class DataHandler:
             return 0
         if not (len(y_norm) == n_new and len(sdf_norm) == n_new):
             raise ValueError("x_norm, y_norm и sdf_norm должны иметь одинаковую длину")
+        case_ids = np.asarray(case_id, dtype=np.int64)
+        if case_ids.ndim == 0:
+            case_ids = np.full(n_new, int(case_ids), dtype=np.int64)
+        else:
+            case_ids = case_ids.reshape(-1)
+        if len(case_ids) != n_new:
+            raise ValueError(
+                "case_id must be scalar or contain one value per RAR point"
+            )
+        undefined = sorted(set(case_ids.tolist()) - set(self.flow_cases))
+        if undefined:
+            raise ValueError(
+                f"Undefined flow case IDs for RAR: {undefined}"
+            )
 
         ds = self.dataset
         if ds.boundary_types is None or 'interior' not in ds.type_to_idx:
@@ -935,12 +1371,36 @@ class DataHandler:
             ds.x.cpu().numpy().reshape(-1),
             ds.y.cpu().numpy().reshape(-1),
         ])
-        _, nn_idx = cKDTree(old_xy).query(np.column_stack([x_norm, y_norm]), workers=-1)
+        new_xy = np.column_stack([x_norm, y_norm])
+        nn_idx = np.empty(n_new, dtype=np.int64)
+        old_case_ids = ds.case_id.cpu().numpy().reshape(-1)
+        for current_case in np.unique(case_ids):
+            new_mask = case_ids == current_case
+            old_indices = np.flatnonzero(old_case_ids == current_case)
+            if len(old_indices) == 0:
+                raise RuntimeError(
+                    "RAR cannot initialize reference fields because flow case "
+                    f"{int(current_case)} has no existing dataset points"
+                )
+            _, local_idx = cKDTree(old_xy[old_indices]).query(
+                new_xy[new_mask],
+                workers=-1,
+            )
+            nn_idx[new_mask] = old_indices[np.asarray(local_idx).reshape(-1)]
         nn_idx_t = torch.tensor(nn_idx, dtype=torch.long)
 
         ds.x = torch.cat([ds.x, torch.tensor(x_norm, dtype=torch.float32).view(-1, 1)], dim=0)
         ds.y = torch.cat([ds.y, torch.tensor(y_norm, dtype=torch.float32).view(-1, 1)], dim=0)
-        ds.sdf = torch.cat([ds.sdf, torch.tensor(sdf_norm, dtype=torch.float32).view(-1, 1)], dim=0)
+        ds.sdf = torch.cat(
+            [
+                ds.sdf,
+                torch.tensor(
+                    sdf_norm,
+                    dtype=torch.float64,
+                ).view(-1, 1),
+            ],
+            dim=0,
+        )
         ds.mesh_x_phys = torch.cat(
             [ds.mesh_x_phys, torch.tensor(x_norm * float(self.chord), dtype=torch.float64)],
             dim=0,
@@ -968,6 +1428,20 @@ class DataHandler:
         ds.on_boundary = torch.cat([ds.on_boundary, torch.zeros(n_new, dtype=torch.bool)], dim=0)
         ds.on_airfoil = torch.cat([ds.on_airfoil, torch.zeros(n_new, dtype=torch.bool)], dim=0)
         ds.segment_id = torch.cat([ds.segment_id, torch.full((n_new,), -1, dtype=torch.long)], dim=0)
+        missing_normals = torch.full(
+            (n_new, 1),
+            float("nan"),
+            dtype=torch.float32,
+        )
+        ds.normal_x = torch.cat([ds.normal_x, missing_normals.clone()], dim=0)
+        ds.normal_y = torch.cat([ds.normal_y, missing_normals], dim=0)
+        ds.case_id = torch.cat(
+            [
+                ds.case_id,
+                torch.as_tensor(case_ids, dtype=torch.long),
+            ],
+            dim=0,
+        )
         ds.source_indices = torch.cat(
             [ds.source_indices, torch.arange(old_n, old_n + n_new, dtype=torch.long)],
             dim=0,
@@ -985,7 +1459,9 @@ class DataHandler:
             'x', 'y', 'sdf', 'p_target', 'u_target', 'v_target',
             'boundary_types', 'mask_u_fixed', 'mask_v_fixed', 'mask_p_fixed',
             'u_bc', 'v_bc', 'p_bc', 'on_boundary', 'on_airfoil',
-            'segment_id', 'source_indices', 'mesh_x_phys', 'mesh_y_phys',
+            'segment_id', 'normal_x', 'normal_y', 'case_id',
+            'source_indices', 'mesh_x_phys',
+            'mesh_y_phys',
         ]
         dataset_state = {
             attr: getattr(ds, attr, None).detach().cpu().clone()
@@ -1020,6 +1496,13 @@ class DataHandler:
             'mesh_data': mesh_state,
             'mesh_domain_coords': self.mesh_domain_coords,
             'mesh_airfoil_coords': self.mesh_airfoil_coords,
+            'cached_sdf_geometry_fingerprint': (
+                self.cached_sdf_geometry_fingerprint
+            ),
+            'cached_sdf_method': self.cached_sdf_method,
+            'loader_generator_state': (
+                self._loader_generator.get_state().cpu()
+            ),
         }
 
     def load_state(self, state: Optional[Dict[str, Any]]) -> None:
@@ -1043,6 +1526,11 @@ class DataHandler:
 
         if getattr(ds, 'source_indices', None) is None:
             ds.source_indices = torch.arange(ds.n_points, dtype=torch.long)
+        if (
+            getattr(ds, 'case_id', None) is None
+            or len(ds.case_id) != ds.n_points
+        ):
+            ds.case_id = torch.zeros(ds.n_points, dtype=torch.long)
         if getattr(ds, 'mesh_x_phys', None) is None:
             ds.mesh_x_phys = (ds.x.double().flatten() * float(self.chord)).clone()
         if getattr(ds, 'mesh_y_phys', None) is None:
@@ -1050,6 +1538,19 @@ class DataHandler:
 
         self.mesh_domain_coords = state.get('mesh_domain_coords', self.mesh_domain_coords)
         self.mesh_airfoil_coords = state.get('mesh_airfoil_coords', self.mesh_airfoil_coords)
+        self.cached_sdf_geometry_fingerprint = state.get(
+            'cached_sdf_geometry_fingerprint',
+            self.cached_sdf_geometry_fingerprint,
+        )
+        self.cached_sdf_method = state.get(
+            'cached_sdf_method',
+            self.cached_sdf_method,
+        )
+        loader_generator_state = state.get('loader_generator_state')
+        if loader_generator_state is not None:
+            self._loader_generator.set_state(
+                loader_generator_state.cpu()
+            )
 
         mesh_state = state.get('mesh_data')
         if mesh_state is not None:
@@ -1057,7 +1558,14 @@ class DataHandler:
             self._prepare_fvm_tensors()
         else:
             self.mesh_data = None
-            for attr in ('fvm_x', 'fvm_y', 'fvm_sdf', 'fvm_bt'):
+            for attr in (
+                'fvm_x',
+                'fvm_y',
+                'fvm_sdf',
+                'fvm_sdf_float64',
+                'fvm_bt',
+                'fvm_sdf_geometry_fingerprint',
+            ):
                 if hasattr(self, attr):
                     delattr(self, attr)
 
@@ -1065,7 +1573,7 @@ class DataHandler:
         logger.info("DataHandler восстановлен из чекпоинта: %d точек", self.n_points)
 
     # ------------------------------------------------------------------
-    # Методы для диагностики (с фильтрацией по y)
+    # Методы для диагностики профилей и границ
     # ------------------------------------------------------------------
     def get_points_by_type(self, type_name: str) -> Dict[str, torch.Tensor]:
         """
@@ -1137,57 +1645,676 @@ class DataHandler:
         u_vals: Optional[torch.Tensor] = None,
         y_grid: Optional[torch.Tensor] = None,
         num_points: int = 100,
-        y_max_ratio: float = 0.95
+        y_max_ratio: float = 0.95,
+        case_id: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Интерполирует профиль u(y) в сечении x = x_target (нормированное).
+        Интерполирует профиль ``u(y)`` строго на линии ``x=x_target``.
+
+        Если загружена FVM-сетка, значения сначала однозначно сопоставляются
+        её узлам, после чего используется кусочно-линейная интерполяция по
+        исходным треугольникам. Поэтому профиль не смешивает точки из широкой
+        полосы по X, а область внутри профиля остаётся замаскированной.
 
         Args:
             x_target: Целевая X-координата (нормированная)
             u_vals: Значения скорости U (если None, используются начальные значения)
             y_grid: Сетка по Y для интерполяции
             num_points: Количество точек для равномерной сетки
-            y_max_ratio: Доля от y_max для ограничения по Y
+            y_max_ratio: Доля полной высоты области, симметрично относительно
+                её середины
+            case_id: Индекс режима для параметрического датасета
 
         Returns:
             Кортеж (y_coords, u_interp) – массивы numpy
         """
-        tol = 0.05 * (self.x_max - self.x_min)
-        # Выбираем точки, близкие к x_target
-        mask_x = torch.abs(self.dataset.x.flatten() - x_target) < tol
-        # Ограничение по y
-        y_limit = y_max_ratio * self.y_max
-        mask_y = self.dataset.y.flatten() < y_limit
-        mask = mask_x & mask_y
+        source = self.dataset.u_target if u_vals is None else u_vals
+        if self.mesh_data is not None:
+            node_values = self._dataset_values_on_mesh_nodes(
+                source,
+                case_id=case_id,
+            )
+            return self.interpolate_fvm_profile(
+                x_target,
+                node_values,
+                y_grid=y_grid,
+                num_points=num_points,
+                y_max_ratio=y_max_ratio,
+            )
 
-        if mask.sum() == 0:
-            logger.warning(f"Нет точек в сечении x={x_target} (tol={tol:.4f}), пропускаем интерполяцию.")
-            if y_grid is None:
-                y_grid = np.linspace(self.y_min, y_limit, num_points)
-            return y_grid, np.full_like(y_grid, np.nan)
+        logger.warning(
+            "Точная профильная интерполяция x=%.6g недоступна без "
+            "FVM-треугольников; используется узкий scattered fallback.",
+            x_target,
+        )
+        return self._interpolate_profile_without_mesh(
+            x_target,
+            source,
+            y_grid=y_grid,
+            num_points=num_points,
+            y_max_ratio=y_max_ratio,
+            case_id=case_id,
+        )
 
-        if mask.sum() < 3:
-            logger.warning(f"Мало точек в сечении x={x_target} после ограничения y<{y_limit:.3f}, интерполяция может быть неточной.")
+    def interpolate_fvm_profile(
+        self,
+        x_target: float,
+        node_values: Any,
+        y_grid: Optional[Any] = None,
+        num_points: int = 100,
+        y_max_ratio: float = 0.95,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample a nodal FVM field on the exact vertical line ``x=x_target``."""
+        if self.mesh_data is None:
+            raise RuntimeError(
+                "interpolate_fvm_profile requires a loaded FVM mesh"
+            )
+        if not 0.0 < float(y_max_ratio) <= 1.0:
+            raise ValueError("y_max_ratio must be in the interval (0, 1]")
+        if int(num_points) < 2:
+            raise ValueError("num_points must be at least 2")
 
-        y_vals = self.dataset.y[mask].cpu().numpy().flatten()
+        values = (
+            node_values.detach().cpu().numpy()
+            if torch.is_tensor(node_values)
+            else np.asarray(node_values)
+        )
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if values.size != self.mesh_data.n_nodes:
+            raise ValueError(
+                "node_values length does not match the FVM mesh: "
+                f"{values.size} != {self.mesh_data.n_nodes}"
+            )
 
-        if u_vals is not None:
-            # Используем переданные значения (предсказания)
-            u_vals_np = u_vals[mask].cpu().numpy().flatten()
-        else:
-            # Используем начальные значения (u_target) – для обратной совместимости
-            u_vals_np = self.dataset.u_target[mask].cpu().numpy().flatten()
-
-        # Сортируем по y
-        sort_idx = np.argsort(y_vals)
-        y_sorted = y_vals[sort_idx]
-        u_sorted = u_vals_np[sort_idx]
-
-        # Если нужна равномерная сетка
+        triangulation = self._get_profile_triangulation()
+        coords_norm = (
+            np.asarray(self.mesh_data.coords, dtype=np.float64)
+            / float(self.chord)
+        )
+        y_min = float(np.min(coords_norm[:, 1]))
+        y_max = float(np.max(coords_norm[:, 1]))
         if y_grid is None:
-            y_grid = np.linspace(self.y_min, y_limit, num_points)
-        u_interp = np.interp(y_grid, y_sorted, u_sorted, left=np.nan, right=np.nan)
-        # Заполняем NaN ближайшими значениями (экстраполяция)
-        if np.any(np.isnan(u_interp)):
-            u_interp = np.interp(y_grid, y_sorted, u_sorted, left=u_sorted[0], right=u_sorted[-1])
-        return y_grid, u_interp
+            centre = 0.5 * (y_min + y_max)
+            half_height = (
+                0.5 * float(y_max_ratio) * (y_max - y_min)
+            )
+            y_query = np.linspace(
+                centre - half_height,
+                centre + half_height,
+                int(num_points),
+                dtype=np.float64,
+            )
+        else:
+            y_query = (
+                y_grid.detach().cpu().numpy()
+                if torch.is_tensor(y_grid)
+                else np.asarray(y_grid)
+            )
+            y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+
+        x_query = np.full_like(y_query, float(x_target))
+        nodes, weights, valid = self._get_profile_stencil(
+            triangulation,
+            x_query,
+            y_query,
+        )
+        sampled = np.full(y_query.shape, np.nan, dtype=np.float64)
+        if bool(np.any(valid)):
+            sampled[valid] = np.sum(
+                values[nodes[valid]] * weights[valid],
+                axis=1,
+            )
+        return y_query, sampled
+
+    def integrate_fvm_vertical_flux(
+        self,
+        x_target: float,
+        node_values: Any,
+    ) -> float:
+        """Exactly integrate a piecewise-linear nodal field on ``x=x_target``.
+
+        The vertical line is split at every intersected triangle edge.  Each
+        fluid interval therefore lies in one triangle and the trapezoidal
+        integral is exact for the mesh's linear interpolant.  Intervals inside
+        an airfoil hole or outside the domain are omitted.
+        """
+        if self.mesh_data is None:
+            raise RuntimeError(
+                "integrate_fvm_vertical_flux requires a loaded FVM mesh"
+            )
+        values = (
+            node_values.detach().cpu().numpy()
+            if torch.is_tensor(node_values)
+            else np.asarray(node_values)
+        )
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if values.size != self.mesh_data.n_nodes:
+            raise ValueError(
+                "node_values length does not match the FVM mesh: "
+                f"{values.size} != {self.mesh_data.n_nodes}"
+            )
+
+        triangulation = self._get_profile_triangulation()
+        (
+            nodes,
+            lower_weights,
+            upper_weights,
+            interval_heights,
+        ) = self._get_vertical_integration_stencil(
+            triangulation,
+            float(x_target),
+        )
+        if interval_heights.size == 0:
+            return float("nan")
+        lower_values = np.sum(
+            values[nodes] * lower_weights,
+            axis=1,
+        )
+        upper_values = np.sum(
+            values[nodes] * upper_weights,
+            axis=1,
+        )
+        return float(
+            np.sum(
+                0.5
+                * (lower_values + upper_values)
+                * interval_heights
+            )
+        )
+
+    def _get_profile_triangulation(self):
+        """Return a cached Matplotlib triangulation in chord coordinates."""
+        if self.mesh_data is None:
+            raise RuntimeError("FVM mesh is not loaded")
+        cache_key = (
+            id(self.mesh_data.coords),
+            id(self.mesh_data.triangles),
+            float(self.chord),
+        )
+        cached = getattr(self, "_profile_triangulation_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        import matplotlib.tri as mtri
+
+        coords = (
+            np.asarray(self.mesh_data.coords, dtype=np.float64)
+            / float(self.chord)
+        )
+        triangulation = mtri.Triangulation(
+            coords[:, 0],
+            coords[:, 1],
+            np.asarray(self.mesh_data.triangles, dtype=np.int32),
+        )
+        # A rebuilt adaptive mesh invalidates every geometry-only profile
+        # stencil.  Resetting here also prevents stale cache growth across RAR
+        # remeshing events.
+        self._profile_stencil_cache = {}
+        self._vertical_integration_stencil_cache = {}
+        self._profile_mesh_index_cache = None
+        self._profile_triangulation_cache = (
+            cache_key,
+            triangulation,
+        )
+        return triangulation
+
+    def _get_profile_stencil(
+        self,
+        triangulation,
+        x_query: np.ndarray,
+        y_query: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build/cache triangle nodes and barycentric weights for a query line."""
+        x_query = np.asarray(x_query, dtype=np.float64).reshape(-1)
+        y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+        if x_query.shape != y_query.shape:
+            raise ValueError("x_query and y_query must have equal shapes")
+
+        stencil_key = (
+            id(triangulation),
+            x_query.tobytes(),
+            y_query.tobytes(),
+        )
+        cache = getattr(self, "_profile_stencil_cache", None)
+        if cache is None:
+            cache = {}
+            self._profile_stencil_cache = cache
+        cached = cache.get(stencil_key)
+        if cached is not None:
+            return cached
+
+        triangle_ids = np.asarray(
+            triangulation.get_trifinder()(x_query, y_query),
+            dtype=np.int64,
+        )
+        valid = triangle_ids >= 0
+        nodes = np.zeros((x_query.size, 3), dtype=np.int64)
+        weights = np.zeros((x_query.size, 3), dtype=np.float64)
+        if bool(np.any(valid)):
+            valid_nodes = np.asarray(
+                triangulation.triangles[triangle_ids[valid]],
+                dtype=np.int64,
+            )
+            nodes[valid] = valid_nodes
+            x_vertices = np.asarray(
+                triangulation.x[valid_nodes],
+                dtype=np.float64,
+            )
+            y_vertices = np.asarray(
+                triangulation.y[valid_nodes],
+                dtype=np.float64,
+            )
+            x_points = x_query[valid]
+            y_points = y_query[valid]
+            denominator = (
+                (y_vertices[:, 1] - y_vertices[:, 2])
+                * (x_vertices[:, 0] - x_vertices[:, 2])
+                + (x_vertices[:, 2] - x_vertices[:, 1])
+                * (y_vertices[:, 0] - y_vertices[:, 2])
+            )
+            nondegenerate = np.abs(denominator) > np.finfo(
+                np.float64
+            ).eps
+            if not bool(np.all(nondegenerate)):
+                valid_positions = np.flatnonzero(valid)
+                valid[valid_positions[~nondegenerate]] = False
+                valid_nodes = valid_nodes[nondegenerate]
+                x_vertices = x_vertices[nondegenerate]
+                y_vertices = y_vertices[nondegenerate]
+                x_points = x_points[nondegenerate]
+                y_points = y_points[nondegenerate]
+                denominator = denominator[nondegenerate]
+
+            w0 = (
+                (y_vertices[:, 1] - y_vertices[:, 2])
+                * (x_points - x_vertices[:, 2])
+                + (x_vertices[:, 2] - x_vertices[:, 1])
+                * (y_points - y_vertices[:, 2])
+            ) / denominator
+            w1 = (
+                (y_vertices[:, 2] - y_vertices[:, 0])
+                * (x_points - x_vertices[:, 2])
+                + (x_vertices[:, 0] - x_vertices[:, 2])
+                * (y_points - y_vertices[:, 2])
+            ) / denominator
+            valid_weights = np.column_stack(
+                (w0, w1, 1.0 - w0 - w1)
+            )
+            weights[valid] = valid_weights
+
+        result = (nodes, weights, valid)
+        cache[stencil_key] = result
+        return result
+
+    def _get_vertical_integration_stencil(
+        self,
+        triangulation,
+        x_target: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Cache exact linear-integration intervals for one vertical cut."""
+        cache_key = (id(triangulation), float(x_target))
+        cache = getattr(
+            self,
+            "_vertical_integration_stencil_cache",
+            None,
+        )
+        if cache is None:
+            cache = {}
+            self._vertical_integration_stencil_cache = cache
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        triangle_nodes = np.asarray(
+            triangulation.triangles,
+            dtype=np.int64,
+        )
+        edge_start = triangle_nodes[:, [0, 1, 2]].reshape(-1)
+        edge_end = triangle_nodes[:, [1, 2, 0]].reshape(-1)
+        x0 = np.asarray(
+            triangulation.x[edge_start],
+            dtype=np.float64,
+        )
+        y0 = np.asarray(
+            triangulation.y[edge_start],
+            dtype=np.float64,
+        )
+        x1 = np.asarray(
+            triangulation.x[edge_end],
+            dtype=np.float64,
+        )
+        y1 = np.asarray(
+            triangulation.y[edge_end],
+            dtype=np.float64,
+        )
+        coordinate_scale = max(
+            1.0,
+            float(
+                np.max(
+                    np.abs(
+                        np.concatenate(
+                            (
+                                np.asarray(
+                                    triangulation.x,
+                                    dtype=np.float64,
+                                ),
+                                np.asarray(
+                                    triangulation.y,
+                                    dtype=np.float64,
+                                ),
+                            )
+                        )
+                    )
+                )
+            ),
+        )
+        tolerance = 1e-12 * coordinate_scale
+        dx = x1 - x0
+        nonvertical = np.abs(dx) > tolerance
+        parameter = np.zeros_like(dx)
+        parameter[nonvertical] = (
+            (float(x_target) - x0[nonvertical])
+            / dx[nonvertical]
+        )
+        crosses = (
+            nonvertical
+            & (parameter >= -tolerance)
+            & (parameter <= 1.0 + tolerance)
+        )
+        intersections = [
+            y0[crosses]
+            + parameter[crosses] * (y1[crosses] - y0[crosses])
+        ]
+        coincident = (
+            ~nonvertical
+            & (np.abs(x0 - float(x_target)) <= tolerance)
+        )
+        if bool(np.any(coincident)):
+            intersections.extend(
+                (y0[coincident], y1[coincident])
+            )
+        y_intersections = np.concatenate(intersections)
+        y_intersections = y_intersections[
+            np.isfinite(y_intersections)
+        ]
+        y_intersections.sort()
+        if y_intersections.size < 2:
+            empty_nodes = np.empty((0, 3), dtype=np.int64)
+            empty_weights = np.empty((0, 3), dtype=np.float64)
+            result = (
+                empty_nodes,
+                empty_weights,
+                empty_weights.copy(),
+                np.empty(0, dtype=np.float64),
+            )
+            cache[cache_key] = result
+            return result
+
+        keep = np.concatenate(
+            (
+                np.array([True]),
+                np.diff(y_intersections) > tolerance,
+            )
+        )
+        breakpoints = y_intersections[keep]
+        lower = breakpoints[:-1]
+        upper = breakpoints[1:]
+        heights = upper - lower
+        nonempty = heights > tolerance
+        lower = lower[nonempty]
+        upper = upper[nonempty]
+        heights = heights[nonempty]
+        midpoint = 0.5 * (lower + upper)
+        triangle_ids = np.asarray(
+            triangulation.get_trifinder()(
+                np.full_like(midpoint, float(x_target)),
+                midpoint,
+            ),
+            dtype=np.int64,
+        )
+        fluid = triangle_ids >= 0
+        lower = lower[fluid]
+        upper = upper[fluid]
+        heights = heights[fluid]
+        nodes = np.asarray(
+            triangulation.triangles[triangle_ids[fluid]],
+            dtype=np.int64,
+        )
+        x_values = np.full(lower.shape, float(x_target))
+        lower_weights = self._barycentric_weights(
+            triangulation,
+            nodes,
+            x_values,
+            lower,
+        )
+        upper_weights = self._barycentric_weights(
+            triangulation,
+            nodes,
+            x_values,
+            upper,
+        )
+        result = (
+            nodes,
+            lower_weights,
+            upper_weights,
+            heights,
+        )
+        cache[cache_key] = result
+        return result
+
+    @staticmethod
+    def _barycentric_weights(
+        triangulation,
+        nodes: np.ndarray,
+        x_query: np.ndarray,
+        y_query: np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate barycentric weights in explicitly selected triangles."""
+        nodes = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+        x_query = np.asarray(x_query, dtype=np.float64).reshape(-1)
+        y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+        x_vertices = np.asarray(
+            triangulation.x[nodes],
+            dtype=np.float64,
+        )
+        y_vertices = np.asarray(
+            triangulation.y[nodes],
+            dtype=np.float64,
+        )
+        denominator = (
+            (y_vertices[:, 1] - y_vertices[:, 2])
+            * (x_vertices[:, 0] - x_vertices[:, 2])
+            + (x_vertices[:, 2] - x_vertices[:, 1])
+            * (y_vertices[:, 0] - y_vertices[:, 2])
+        )
+        if bool(
+            np.any(
+                np.abs(denominator)
+                <= np.finfo(np.float64).eps
+            )
+        ):
+            raise RuntimeError(
+                "Degenerate triangle in vertical integration stencil"
+            )
+        w0 = (
+            (y_vertices[:, 1] - y_vertices[:, 2])
+            * (x_query - x_vertices[:, 2])
+            + (x_vertices[:, 2] - x_vertices[:, 1])
+            * (y_query - y_vertices[:, 2])
+        ) / denominator
+        w1 = (
+            (y_vertices[:, 2] - y_vertices[:, 0])
+            * (x_query - x_vertices[:, 2])
+            + (x_vertices[:, 0] - x_vertices[:, 2])
+            * (y_query - y_vertices[:, 2])
+        ) / denominator
+        return np.column_stack((w0, w1, 1.0 - w0 - w1))
+
+    def _dataset_values_on_mesh_nodes(
+        self,
+        values: Any,
+        *,
+        case_id: int,
+    ) -> np.ndarray:
+        """Map dataset-ordered values to FVM-node order by physical position."""
+        if self.mesh_data is None:
+            raise RuntimeError("FVM mesh is not loaded")
+        values_np = (
+            values.detach().cpu().numpy()
+            if torch.is_tensor(values)
+            else np.asarray(values)
+        )
+        values_np = np.asarray(values_np, dtype=np.float64).reshape(-1)
+        if values_np.size != self.dataset.n_points:
+            raise ValueError(
+                "Profile values must follow dataset order: "
+                f"{values_np.size} != {self.dataset.n_points}"
+            )
+
+        case_ids = getattr(self.dataset, "case_id", None)
+        if case_ids is None:
+            selected = np.ones(self.dataset.n_points, dtype=bool)
+        else:
+            selected = (
+                case_ids.detach().cpu().numpy().reshape(-1)
+                == int(case_id)
+            )
+        if not bool(np.any(selected)):
+            raise ValueError(f"case_id={case_id} is absent from the dataset")
+
+        mesh_x = getattr(self.dataset, "mesh_x_phys", None)
+        mesh_y = getattr(self.dataset, "mesh_y_phys", None)
+        if mesh_x is None or mesh_y is None:
+            dataset_coords = np.column_stack(
+                (
+                    self.dataset.x.detach().cpu().numpy().reshape(-1),
+                    self.dataset.y.detach().cpu().numpy().reshape(-1),
+                )
+            ) * float(self.chord)
+        else:
+            dataset_coords = np.column_stack(
+                (
+                    mesh_x.detach().cpu().numpy().reshape(-1),
+                    mesh_y.detach().cpu().numpy().reshape(-1),
+                )
+            )
+        dataset_coords = np.asarray(
+            dataset_coords[selected],
+            dtype=np.float64,
+        )
+        selected_values = values_np[selected]
+
+        cache_key = (
+            id(self.mesh_data.coords),
+            id(self.dataset.x),
+            int(self.dataset.n_points),
+            int(case_id),
+        )
+        cached = getattr(self, "_profile_mesh_index_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            node_indices = cached[1]
+        else:
+            tree = cKDTree(dataset_coords)
+            distances, node_indices = tree.query(
+                np.asarray(self.mesh_data.coords, dtype=np.float64),
+                k=1,
+            )
+            coordinate_scale = max(
+                1.0,
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(
+                                self.mesh_data.coords,
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                ),
+            )
+            tolerance = 1e-10 * coordinate_scale
+            max_distance = float(np.max(distances))
+            if max_distance > tolerance:
+                raise RuntimeError(
+                    "Cannot map profile values to every FVM node: "
+                    f"max coordinate mismatch={max_distance:.3e}, "
+                    f"tolerance={tolerance:.3e}"
+                )
+            node_indices = np.asarray(node_indices, dtype=np.int64)
+            self._profile_mesh_index_cache = (
+                cache_key,
+                node_indices,
+            )
+        return selected_values[node_indices]
+
+    def _interpolate_profile_without_mesh(
+        self,
+        x_target: float,
+        values: Any,
+        *,
+        y_grid: Optional[Any],
+        num_points: int,
+        y_max_ratio: float,
+        case_id: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Compatibility fallback for legacy point clouds without triangles."""
+        if not 0.0 < float(y_max_ratio) <= 1.0:
+            raise ValueError("y_max_ratio must be in the interval (0, 1]")
+        x = self.dataset.x.detach().cpu().numpy().reshape(-1)
+        y = self.dataset.y.detach().cpu().numpy().reshape(-1)
+        values_np = (
+            values.detach().cpu().numpy()
+            if torch.is_tensor(values)
+            else np.asarray(values)
+        )
+        values_np = np.asarray(values_np, dtype=np.float64).reshape(-1)
+        case_ids = getattr(self.dataset, "case_id", None)
+        if case_ids is not None:
+            case_mask = (
+                case_ids.detach().cpu().numpy().reshape(-1)
+                == int(case_id)
+            )
+        else:
+            case_mask = np.ones_like(x, dtype=bool)
+
+        distance = np.abs(x - float(x_target))
+        available = distance[case_mask]
+        if available.size == 0:
+            raise ValueError(f"case_id={case_id} is absent from the dataset")
+        nearest = float(np.min(available))
+        x_span = max(float(np.max(x) - np.min(x)), 1.0)
+        tolerance = max(nearest + 1e-12, 2.5e-3 * x_span)
+        mask = case_mask & (distance <= tolerance)
+
+        y_min = float(np.min(y))
+        y_max = float(np.max(y))
+        centre = 0.5 * (y_min + y_max)
+        half_height = 0.5 * float(y_max_ratio) * (y_max - y_min)
+        if y_grid is None:
+            y_query = np.linspace(
+                centre - half_height,
+                centre + half_height,
+                int(num_points),
+                dtype=np.float64,
+            )
+        else:
+            y_query = (
+                y_grid.detach().cpu().numpy()
+                if torch.is_tensor(y_grid)
+                else np.asarray(y_grid)
+            )
+            y_query = np.asarray(y_query, dtype=np.float64).reshape(-1)
+        if int(np.count_nonzero(mask)) < 2:
+            return y_query, np.full_like(y_query, np.nan)
+
+        order = np.argsort(y[mask])
+        y_sorted = y[mask][order]
+        value_sorted = values_np[mask][order]
+        sampled = np.interp(
+            y_query,
+            y_sorted,
+            value_sorted,
+            left=np.nan,
+            right=np.nan,
+        )
+        return y_query, sampled

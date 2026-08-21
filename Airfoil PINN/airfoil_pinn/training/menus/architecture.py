@@ -36,13 +36,34 @@ def _configure_input_params(cfg: ConfigManager) -> None:
 
     inp['coordinates'] = yes_no("Использовать координаты x,y", inp.get('coordinates', True))
     inp['sdf'] = yes_no("Использовать SDF", inp.get('sdf', True))
-    inp['boundary_types'] = yes_no(
-        "Использовать one-hot тип границы как вход сети",
-        inp.get('boundary_types', True),
-    )
     inp['inlet_velocity'] = yes_no("Использовать компоненты скорости на входе", inp.get('inlet_velocity', False))
     inp['viscosity'] = yes_no("Использовать вязкость жидкости", inp.get('viscosity', False))
     inp['density'] = yes_no("Использовать плотность жидкости", inp.get('density', False))
+
+    # Coordinates and SDF are invariants of the differential PINN graph.
+    # Mirror legacy choices into the modern manifest-driven schema so editing
+    # a migrated configuration has an immediate effect.
+    inp['coordinates'] = True
+    inp['sdf'] = True
+    inp['density'] = False
+    features = cfg.config.setdefault('input_features', {})
+    features['coordinates'] = {'enabled': True}
+    features['sdf'] = {'enabled': True}
+    features.pop('boundary_types', None)
+    inp.pop('boundary_types', None)
+    reynolds = features.get('reynolds', {})
+    if not isinstance(reynolds, dict):
+        reynolds = {}
+    reynolds['enabled'] = bool(inp['viscosity'])
+    reynolds.setdefault('range', [1.0e3, 1.0e7])
+    features['reynolds'] = reynolds
+    features['angle_of_attack'] = {
+        'enabled': bool(inp['inlet_velocity']),
+    }
+    print(
+        "Coordinates and SDF remain mandatory. Legacy viscosity is encoded "
+        "as dimensionless Re_c; density is not an independent input."
+    )
 
     if inp['viscosity'] or inp['density']:
         fluids = [f.replace('.json', '') for f in os.listdir(ConfigManager.FLUIDS_DIR) if f.endswith('.json')]
@@ -77,7 +98,18 @@ def _configure_activation(cfg: ConfigManager) -> None:
     arch = cfg.config['architecture']
 
     print("Доступные функции активации:")
-    activations = ['tanh', 'relu', 'sigmoid', 'leaky_relu', 'elu', 'swish', 'siren']
+    if cfg.config.get('pde', {}).get('system') == 'incompressible_navier_stokes':
+        activations = ['tanh', 'sigmoid', 'swish', 'siren']
+    else:
+        activations = [
+            'tanh',
+            'relu',
+            'sigmoid',
+            'leaky_relu',
+            'elu',
+            'swish',
+            'siren',
+        ]
     for i, act in enumerate(activations, 1):
         print(f"{i}. {act}")
 
@@ -95,6 +127,19 @@ def _configure_activation(cfg: ConfigManager) -> None:
             arch['coordinate_scaling']['scale_factor'] = scale_factor
             arch['coordinate_scaling']['input_min'] = x_min
             arch['coordinate_scaling']['input_max'] = x_max
+            if selected_activation == 'siren':
+                first = input(
+                    "SIREN first omega_0 "
+                    f"[{arch.get('siren_first_omega_0', 30.0)}]: "
+                ).strip()
+                hidden = input(
+                    "SIREN hidden omega_0 "
+                    f"[{arch.get('siren_hidden_omega_0', 30.0)}]: "
+                ).strip()
+                if first:
+                    arch['siren_first_omega_0'] = float(first)
+                if hidden:
+                    arch['siren_hidden_omega_0'] = float(hidden)
         else:
             print("Неверный номер.")
     except ValueError:
@@ -151,16 +196,21 @@ def _configure_output_params(cfg: ConfigManager) -> None:
 
     print("Выходные параметры: 1 - только u,v,p (несжимаемая); 2 - добавить плотность (сжимаемая)")
     out_choice = input("Выберите (1/2): ").strip()
-    arch['output_dim'] = 4 if out_choice == '2' else 3
+    arch['output_dim'] = 3
+    if out_choice == '2':
+        print(
+            "Compressible output is unavailable: the current PDE contract "
+            "requires exactly u/U_inf, v/U_inf and Cp."
+        )
 
     bias_u = input(f"Начальное смещение для U (текущее: {arch['output_bias'][0]}): ").strip()
     bias_v = input(f"Начальное смещение для V (текущее: {arch['output_bias'][1]}): ").strip()
-    bias_p = input(f"Начальное смещение для P (текущее: {arch['output_bias'][2]}): ").strip()
+    print("Начальное смещение raw pressure фиксировано равным 0.")
 
     arch['output_bias'] = (
         float(bias_u) if bias_u else arch['output_bias'][0],
         float(bias_v) if bias_v else arch['output_bias'][1],
-        float(bias_p) if bias_p else arch['output_bias'][2],
+        0.0,
     )
 
 

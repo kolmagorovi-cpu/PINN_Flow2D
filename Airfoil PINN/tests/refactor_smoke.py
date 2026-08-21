@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from airfoil_pinn.app.paths import PATHS
+from airfoil_pinn.data.batch import PINNBatch
 from airfoil_pinn.data.handler import DataHandler
 from airfoil_pinn.data.initializer import SCIPY_AVAILABLE, _compute_sdf_chunk
 from airfoil_pinn.physics.fvm import FVMResiduals
@@ -30,24 +31,6 @@ def _load_config() -> dict:
     cfg["loss_weights"]["fvm"]["weight"] = 0.0
     cfg["diagnostics"]["mass_metrics_interval"] = 10**9
     return cfg
-
-
-def _input_dim(cfg: dict, handler: DataHandler) -> int:
-    dim = 0
-    inp = cfg["input_params"]
-    if inp.get("coordinates", True):
-        dim += 2
-    if inp.get("sdf", True):
-        dim += 1
-    if inp.get("boundary_types", True):
-        dim += len(handler.boundary_type_names)
-    if inp.get("inlet_velocity", False):
-        dim += 2
-    if inp.get("viscosity", False):
-        dim += 1
-    if inp.get("density", False):
-        dim += 1
-    return dim
 
 
 def _make_loss_computer_for_input_flag(boundary_types_enabled: bool) -> LossComputer:
@@ -96,17 +79,22 @@ def _make_loss_computer_for_input_flag(boundary_types_enabled: bool) -> LossComp
     )
 
 
-def test_boundary_types_optional_model_input() -> None:
+def test_boundary_types_never_enter_model_input() -> None:
     x = torch.zeros(4, 1)
     y = torch.zeros(4, 1)
     sdf = torch.zeros(4, 1)
-    boundary_types = torch.zeros(4, 3)
 
     enabled = _make_loss_computer_for_input_flag(True)
     disabled = _make_loss_computer_for_input_flag(False)
 
-    assert enabled.build_input_tensor(x, y, sdf, boundary_types).shape[1] == 6
-    assert disabled.build_input_tensor(x, y, sdf, boundary_types).shape[1] == 3
+    enabled_input = enabled.build_input_tensor(x, y, sdf)
+    disabled_input = disabled.build_input_tensor(x, y, sdf)
+    assert enabled_input.shape[1] == 3
+    assert disabled_input.shape[1] == 3
+    assert torch.equal(enabled_input, disabled_input)
+    assert enabled.feature_manifest.fingerprint() == (
+        disabled.feature_manifest.fingerprint()
+    )
 
 
 def test_fvm_checks(handler: DataHandler) -> None:
@@ -133,6 +121,13 @@ def test_fvm_checks(handler: DataHandler) -> None:
     old_divergence_volume_loss = torch.sum(volumes * residual ** 2) / torch.clamp(
         volumes.sum(),
         min=torch.finfo(residual.dtype).tiny,
+    )
+    divergence_volume_loss = torch.sum(
+        volumes * residual ** 2
+    ) / volumes.sum()
+    assert torch.allclose(
+        fvm.mass_loss(zeros, reduction="divergence_l2_volume"),
+        divergence_volume_loss,
     )
     assert torch.allclose(
         fvm.mass_loss(zeros, reduction="volume_weighted"),
@@ -164,13 +159,23 @@ def test_fvm_checks(handler: DataHandler) -> None:
 
 def test_fvm_schedule() -> None:
     trainer = Trainer.__new__(Trainer)
+    trainer.accum_steps = 1
+    trainer.fvm_schedule = "every_optimizer_step"
+    trainer._fvm_optimizer_step_counter = 0
     trainer.fvm_batch_interval = 1
-    assert trainer._scheduled_fvm_batches(4, True) == {0, 1, 2, 3}
-    trainer.fvm_batch_interval = 2
-    assert trainer._scheduled_fvm_batches(5, True) == {1, 3}
-    trainer.fvm_batch_interval = 10
-    assert trainer._scheduled_fvm_batches(5, True) == {4}
-    assert trainer._scheduled_fvm_batches(5, False) == set()
+    assert trainer._scheduled_fvm_batches(4, True) == {
+        0: 1.0,
+        1: 1.0,
+        2: 1.0,
+        3: 1.0,
+    }
+    trainer.accum_steps = 2
+    assert trainer._scheduled_fvm_batches(5, True) == {
+        1: 1.0,
+        3: 1.0,
+        4: 1.0,
+    }
+    assert trainer._scheduled_fvm_batches(5, False) == {}
 
 
 def test_sdf_chunk() -> None:
@@ -286,8 +291,58 @@ def test_one_train_batch(cfg: dict, handler: DataHandler) -> None:
         device=device,
         dtype=dtype,
     )
+    assert loss_computer.sdf_module is not None
+    assert (
+        loss_computer.sdf_geometry_fingerprint
+        == handler.fvm_sdf_geometry_fingerprint
+    )
+    fvm_points = np.column_stack(
+        (
+            handler.fvm_x.detach().cpu().double().numpy().reshape(-1),
+            handler.fvm_y.detach().cpu().double().numpy().reshape(-1),
+        )
+    )
+    fvm_canonical = loss_computer.evaluate_sdf_numpy(fvm_points)
+    fvm_max_error = float(
+        np.max(
+            np.abs(
+                handler.fvm_sdf_float64.detach()
+                .cpu()
+                .numpy()
+                .reshape(-1)
+                - fvm_canonical
+            )
+        )
+    )
+    assert fvm_max_error <= cfg.get("sdf", {}).get(
+        "float64_consistency_tolerance",
+        1e-12,
+    )
+
+    training_points = np.column_stack(
+        (
+            handler.dataset.x.detach().cpu().double().numpy().reshape(-1),
+            handler.dataset.y.detach().cpu().double().numpy().reshape(-1),
+        )
+    )
+    training_canonical = loss_computer.evaluate_sdf_numpy(training_points)
+    training_max_error = float(
+        np.max(
+            np.abs(
+                handler.dataset.sdf.detach()
+                .cpu()
+                .numpy()
+                .reshape(-1)
+                - training_canonical
+            )
+        )
+    )
+    assert training_max_error <= cfg.get("sdf", {}).get(
+        "float64_consistency_tolerance",
+        1e-12,
+    )
     model = PINNIncompressible(
-        input_dim=_input_dim(cfg, handler),
+        input_dim=loss_computer.feature_manifest.input_dim,
         layers=[16, 16],
         activation="tanh",
         output_dim=3,
@@ -306,9 +361,17 @@ def test_one_train_batch(cfg: dict, handler: DataHandler) -> None:
     )
 
     batch = next(iter(handler.get_dataloader()))
-    result = trainer.train_batch_adam(batch, accum_step=True)
+    assert isinstance(batch, PINNBatch)
+    assert torch.equal(batch.case_id, torch.zeros_like(batch.case_id))
+    assert np.isclose(handler.flow_cases[0].reynolds, handler.Re)
+    result = trainer.train_batch_adam(
+        batch,
+        accum_step=True,
+        add_fvm=loss_computer.fvm_weight > 0.0,
+    )
     assert result["total"] >= 0.0
     assert torch.isfinite(torch.tensor(result["total"]))
+    assert np.isfinite(result["fvm_loss"])
 
 
 def main() -> None:
@@ -326,7 +389,7 @@ def main() -> None:
     test_fvm_schedule()
     test_sdf_chunk()
     test_safe_grad_strict_mode()
-    test_boundary_types_optional_model_input()
+    test_boundary_types_never_enter_model_input()
     test_rar_score_respects_pde_mask()
     test_one_train_batch(cfg, handler)
     print("OK refactor smoke tests")

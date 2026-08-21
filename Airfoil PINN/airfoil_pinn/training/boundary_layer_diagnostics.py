@@ -577,12 +577,8 @@ def plot_wall_normal_deficit(path: str, profiles: Dict[str, np.ndarray], foil_no
 
 
 def _load_geometry(data_handler: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Return domain and airfoil geometry, loading metadata if the handler can."""
+    """Return geometry embedded in the active mesh artifact."""
 
-    if getattr(data_handler, "mesh_domain_coords", None) is None or getattr(data_handler, "mesh_airfoil_coords", None) is None:
-        loader = getattr(data_handler, "load_mesh_geometry_from_geom_config", None)
-        if callable(loader):
-            loader()
     domain = getattr(data_handler, "mesh_domain_coords", None)
     foil = getattr(data_handler, "mesh_airfoil_coords", None)
     if domain is None or foil is None:
@@ -650,16 +646,31 @@ def _predict_model_on_points(
                 stop = min(start + batch_size, len(x_norm_np))
                 x = torch.as_tensor(x_norm_np[start:stop], device=device, dtype=dtype).view(-1, 1)
                 y = torch.as_tensor(y_norm_np[start:stop], device=device, dtype=dtype).view(-1, 1)
-                sdf = torch.as_tensor(sdf_norm_np[start:stop], device=device, dtype=dtype).view(-1, 1)
+                sdf = loss_computer.evaluate_sdf_tensor(x, y)
                 bt = torch.as_tensor(boundary_types_np[start:stop], device=device, dtype=dtype)
                 if bt.shape[1] == 0:
                     bt = None
-                inp = loss_computer.build_input_tensor(x, y, sdf, bt)
+                inp = loss_computer.build_input_tensor(x, y, sdf)
                 out = model(inp)
                 u = out[:, 0:1]
                 v = out[:, 1:2]
                 p = out[:, 2:3]
-                if hasattr(loss_computer, "apply_velocity_dirichlet_constraint"):
+                if hasattr(loss_computer, "transform_outputs"):
+                    u, v, p = loss_computer.transform_outputs(
+                        u,
+                        v,
+                        p,
+                        x,
+                        y,
+                        sdf=sdf,
+                    )
+                if (
+                    getattr(loss_computer, "bc_type", "soft") == "hard"
+                    and hasattr(
+                        loss_computer,
+                        "apply_velocity_dirichlet_constraint",
+                    )
+                ):
                     u, v = loss_computer.apply_velocity_dirichlet_constraint(u, v, bt)
                 all_u.append(u.detach().cpu().numpy().reshape(-1))
                 all_v.append(v.detach().cpu().numpy().reshape(-1))

@@ -75,6 +75,10 @@ class CheckpointManager:
         base_model = self._unwrap_model(model)
         state_dict = base_model.state_dict()
         checkpoint = {
+            'checkpoint_schema': {
+                'name': 'airfoil-pinn.checkpoint',
+                'version': 2,
+            },
             'model_state_dict': state_dict,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
@@ -89,7 +93,14 @@ class CheckpointManager:
             checkpoint['sa_weights_state_dict'] = sa_weights.state_dict()
 
         path = os.path.join(self.checkpoint_dir, filename)
-        torch.save(checkpoint, path)
+        temporary_path = path + ".tmp"
+        try:
+            torch.save(checkpoint, temporary_path)
+            os.replace(temporary_path, path)
+        except Exception:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            raise
         logger.info(f"Чекпоинт сохранён: {path} (размер state_dict: {sum(p.numel() for p in state_dict.values())} параметров)")
 
     def load(self, path: str, map_location: torch.device) -> Dict:

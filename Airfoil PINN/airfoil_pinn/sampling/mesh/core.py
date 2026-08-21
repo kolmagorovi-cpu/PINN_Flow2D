@@ -1037,7 +1037,7 @@ class Mesh2D:
 
         _bc_colors = {
             "inlet": "blue", "outlet": "cyan", "wall": "red",
-            "farfield": "navy", "slip": "orange",
+            "farfield": "navy", "slip_wall": "orange", "slip": "orange",
             "velocity_dirichlet": "dodgerblue",
             "symmetry": "purple", "axis_symmetry": "magenta", "interior": "green",
         }
@@ -1224,6 +1224,7 @@ class Mesh2D:
             "outlet": 2,
             "inlet": 2,
             "farfield": 2,
+            "slip_wall": 2,
             "slip": 2,
             "velocity_dirichlet": 2,
             "symmetry": 2,

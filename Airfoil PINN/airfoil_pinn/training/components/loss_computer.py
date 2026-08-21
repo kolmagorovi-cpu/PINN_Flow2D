@@ -13,10 +13,18 @@
 учёта направления потока (нормали) и осесимметричной геометрии.
 """
 
-import torch
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
+import torch
+
+from airfoil_pinn.geometry.sdf import PolylineDistanceField
+from airfoil_pinn.training.boundary import (
+    BoundaryOutputTransform,
+    resolve_boundary_conditions,
+)
+from airfoil_pinn.training.input_features import InputFeatureAssembler
 from airfoil_pinn.utils import safe_grad
 from airfoil_pinn.physics.pde import PDEResiduals
 
@@ -51,8 +59,10 @@ class LossComputer:
         Args:
             config: полная конфигурация (словарь)
             data_handler: объект DataHandler с метаданными и информацией о границах
-            rho_norm: нормализованная плотность (тензор-скаляр)
-            mu_norm: нормализованная вязкость (тензор-скаляр)
+            rho_norm: устаревший аргумент совместимости; в безразмерной PDE
+                плотность не является независимым коэффициентом
+            mu_norm: устаревший аргумент совместимости; вязкий коэффициент
+                вычисляется как ``1 / Re`` для каждой точки
             x_min, x_max, y_min, y_max: границы области (нормированные)
             device: устройство для вычислений
             dtype: тип данных
@@ -68,7 +78,13 @@ class LossComputer:
         self.flow_type = config['pde']['flow_type']
         self.pde_system = config['pde'].get('system', 'incompressible_navier_stokes')
         self.pde_on_boundary = bool(config['pde'].get('pde_on_boundary', False))
-        self.bc_type = config['boundary_conditions']['type']  # 'soft' или 'hard'
+        boundary_section = config.get('boundary_conditions', {}) or {}
+        self.bc_type = boundary_section.get('type', 'soft')
+        self.boundary_conditions = resolve_boundary_conditions(config)
+        wall_config = self.boundary_conditions['wall']
+        self.wall_enforcement = str(
+            wall_config.get('enforcement', 'soft')
+        )
         self.pde_components = self._setup_pde_components()
         self.strict_autograd = bool(
             config.get('diagnostics', {}).get('strict_autograd', True)
@@ -77,8 +93,26 @@ class LossComputer:
         # Веса потерь
         lw = config['loss_weights']
         self.loss_weights = lw['pde_weights'].copy()
-        if self.bc_type == 'soft':
-            self.loss_weights.update(lw['bc_weights'])
+        self.pressure_gauge_weight = float(
+            lw.get('pressure_gauge_weight', 1.0)
+        )
+        if (
+            not np.isfinite(self.pressure_gauge_weight)
+            or self.pressure_gauge_weight <= 0.0
+        ):
+            raise ValueError(
+                "loss_weights.pressure_gauge_weight must be finite and "
+                "strictly positive"
+            )
+        # A hard wall does not disable unrelated soft boundary operators.
+        self.loss_weights.update(lw['bc_weights'])
+        if 'slip_wall' in self.loss_weights:
+            self.loss_weights.setdefault(
+                'slip',
+                self.loss_weights['slip_wall'],
+            )
+        elif 'slip' in self.loss_weights:
+            self.loss_weights['slip_wall'] = self.loss_weights['slip']
 
         # SA-веса (флаг)
         self.use_sa_weights = lw['use_sa_weights']
@@ -106,15 +140,19 @@ class LossComputer:
             else:
                 self.fvm_weight: float = float(fvm_cfg.get('weight', 0.0))
             self.fvm_batch_interval: int = max(1, int(fvm_cfg.get('batch_interval', 1)))
+            self.fvm_schedule: str = str(
+                fvm_cfg.get('schedule', 'every_optimizer_step')
+            ).strip().lower().replace('-', '_')
             self.fvm_loss_reduction: str = str(
                 fvm_cfg.get(
                     'reduction',
-                    fvm_cfg.get('loss_reduction', 'volume_weighted'),
+                    fvm_cfg.get('loss_reduction', 'divergence_l2_volume'),
                 )
             )
         else:
             self.fvm_weight: float = float(fvm_cfg)
             self.fvm_batch_interval: int = 1
+            self.fvm_schedule: str = 'every_optimizer_step'
             self.fvm_loss_reduction: str = 'legacy'
         # Заполняется из PINNSolver при наличии mesh_file в конфиге
         self.fvm: Optional["FVMResiduals"] = None
@@ -128,10 +166,416 @@ class LossComputer:
 
         # Входные параметры (для построения тензора)
         self.input_params = config['input_params']
+        self.feature_assembler = InputFeatureAssembler(config)
+        self.feature_manifest = self.feature_assembler.manifest
+        logger.info(
+            "Network input manifest: dim=%d, fingerprint=%s, features=%s",
+            self.feature_manifest.input_dim,
+            self.feature_manifest.fingerprint()[:12],
+            ", ".join(
+                feature.name for feature in self.feature_manifest.features
+            ),
+        )
+        self.sdf_module: Optional[PolylineDistanceField] = None
+        self.sdf_geometry_fingerprint: Optional[str] = None
+        self.sdf_absolute_tie_tolerance = 1e-12
+        self.sdf_relative_tie_tolerance = 1e-10
+        self.sdf_float64_consistency_tolerance = float(
+            (self.config.get('sdf', {}) or {}).get(
+                'float64_consistency_tolerance',
+                1e-12,
+            )
+        )
+        if (
+            not np.isfinite(self.sdf_float64_consistency_tolerance)
+            or self.sdf_float64_consistency_tolerance < 0.0
+        ):
+            raise ValueError(
+                "sdf.float64_consistency_tolerance must be finite and "
+                "non-negative"
+            )
+        self._initialize_differentiable_sdf()
+        self.synchronize_cached_training_sdf()
+        self.boundary_transform = BoundaryOutputTransform(
+            self.sdf_module,
+            wall_kind=str(wall_config.get('kind', 'no_slip')),
+            wall_enforcement=self.wall_enforcement,
+            distance_scale=float(wall_config.get('distance_scale', 0.02)),
+        ).to(device=self.device)
+        self.boundary_enforcement_contract = {
+            name: {
+                "kind": str(values.get("kind", name)),
+                "mode": str(values.get("enforcement", "soft")),
+            }
+            for name, values in self.boundary_conditions.items()
+        }
+        self.boundary_enforcement_contract["wall"] = (
+            self.boundary_transform.contract()["wall"]
+        )
 
         # Для axisymmetric требуется eps и множитель 2π
         self.eps_axi = 1e-12
         self.two_pi = 2.0 * torch.pi
+
+    def get_flow_case_batch(
+        self,
+        reference: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+    ):
+        """Return the flow parameters associated with every point.
+
+        The same helper is used by network input assembly, PDE coefficients
+        and boundary targets.  This prevents a case identifier from selecting
+        one operating point at the input while the loss silently uses another.
+        """
+        if case_ids is None:
+            case_ids = torch.zeros(
+                reference.shape[0],
+                device=reference.device,
+                dtype=torch.long,
+            )
+        if case_ids.numel() != reference.shape[0]:
+            raise ValueError(
+                "case_ids must contain exactly one identifier per point"
+            )
+        if not hasattr(self.data_handler, "get_flow_case_batch"):
+            raise RuntimeError(
+                "Parameterized physics requires "
+                "DataHandler.get_flow_case_batch"
+            )
+        return self.data_handler.get_flow_case_batch(
+            case_ids,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    def get_freestream_targets(
+        self,
+        reference: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return dimensionless ``(u_inf, v_inf)`` for every point."""
+        flow = self.get_flow_case_batch(reference, case_ids)
+        return flow.cos_alpha, flow.sin_alpha
+
+    def _initialize_differentiable_sdf(self) -> None:
+        """Build the normalized segment SDF used by PDE autograd.
+
+        Minimal unit-test handlers may not contain a geometry.  In that case
+        input assembly with an explicitly supplied cached SDF remains
+        available, but a training call requesting differentiable SDF fails
+        with a descriptive error in :meth:`prepare_sdf_for_pde`.
+        """
+        if not self.feature_assembler.sdf_enabled:
+            return
+
+        polyline = getattr(self.data_handler, 'mesh_airfoil_coords', None)
+        chord = float(getattr(self.data_handler, 'chord', 0.0))
+        if polyline is None or len(polyline) < 2 or chord <= 0.0:
+            logger.debug(
+                "Differentiable SDF is not initialized: an ordered airfoil "
+                "polyline and a positive chord are required."
+            )
+            return
+
+        sdf_cfg = self.config.get('sdf', {}) or {}
+        chunk_size = int(sdf_cfg.get('segment_chunk_size', 256))
+        self.sdf_absolute_tie_tolerance = float(
+            sdf_cfg.get('absolute_tie_tolerance', 1e-12)
+        )
+        self.sdf_relative_tie_tolerance = float(
+            sdf_cfg.get('relative_tie_tolerance', 1e-10)
+        )
+        if (
+            self.sdf_absolute_tie_tolerance < 0.0
+            or self.sdf_relative_tie_tolerance < 0.0
+        ):
+            raise ValueError("SDF tie tolerances must be non-negative")
+
+        normalized = np.asarray(polyline, dtype=np.float64) / chord
+        sampler_metadata = getattr(self.data_handler, 'sampler_metadata', None)
+        closed = (
+            bool(sampler_metadata.get('foil_closed', True))
+            if isinstance(sampler_metadata, dict)
+            else len(normalized) >= 3
+        )
+        self.sdf_module = PolylineDistanceField(
+            normalized,
+            closed=closed,
+            segment_chunk_size=chunk_size,
+        ).to(device=self.device)
+        self.sdf_geometry_fingerprint = (
+            self.sdf_module.geometry_fingerprint
+        )
+        logger.info(
+            "Differentiable SDF initialized: segments=%d, closed=%s, "
+            "chunk=%d, geometry=%s",
+            self.sdf_module.segment_count,
+            closed,
+            chunk_size,
+            self.sdf_geometry_fingerprint[:12],
+        )
+
+    def evaluate_sdf_numpy(
+        self,
+        points: np.ndarray,
+        *,
+        point_chunk_size: int = 8192,
+    ) -> np.ndarray:
+        """Evaluate the canonical float64 SDF used by every non-AD path."""
+        if self.sdf_module is None:
+            raise RuntimeError(
+                "Canonical SDF geometry is unavailable. Regenerate geometry "
+                "and collocation artifacts."
+            )
+        return self.sdf_module.evaluate_numpy(
+            np.asarray(points, dtype=np.float64),
+            point_chunk_size=point_chunk_size,
+        )
+
+    @torch.no_grad()
+    def evaluate_sdf_tensor(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        point_chunk_size: int = 8192,
+    ) -> torch.Tensor:
+        """Recompute inference/evaluation SDF by the canonical CPU engine."""
+        if x.shape != y.shape:
+            raise ValueError("x and y must have identical shapes")
+        if x.ndim != 2 or x.shape[1] != 1:
+            raise ValueError("x and y must have shape (N, 1)")
+        points = torch.cat((x, y), dim=1).detach().cpu().double().numpy()
+        values = self.evaluate_sdf_numpy(
+            points,
+            point_chunk_size=point_chunk_size,
+        )
+        return torch.as_tensor(
+            values,
+            device=x.device,
+            dtype=x.dtype,
+        ).view_as(x)
+
+    def synchronize_cached_training_sdf(self) -> None:
+        """Validate cached SDF provenance and replace it canonically in memory.
+
+        The serialized cache is trusted only when its geometry fingerprint and
+        method match the active segment geometry.  Irrespective of its storage
+        dtype, the runtime cache is rebuilt with ``evaluate_numpy`` so training,
+        RAR, FVM and inference share exactly one value engine.
+        """
+        if self.sdf_module is None:
+            return
+        dataset = getattr(self.data_handler, 'dataset', None)
+        if dataset is None:
+            return
+        x = getattr(dataset, 'x', None)
+        y = getattr(dataset, 'y', None)
+        cached = getattr(dataset, 'sdf', None)
+        if x is None or y is None or cached is None:
+            return
+
+        points = torch.cat((x, y), dim=1).detach().cpu().double().numpy()
+        canonical = self.evaluate_sdf_numpy(points)
+        cached_values = (
+            cached.detach().cpu().double().numpy().reshape(-1)
+        )
+        if cached_values.shape != canonical.shape:
+            max_error = float("inf")
+        elif not np.isfinite(cached_values).all():
+            max_error = float("inf")
+        else:
+            max_error = float(
+                np.max(np.abs(cached_values - canonical), initial=0.0)
+            )
+
+        cached_fingerprint = getattr(
+            self.data_handler,
+            'cached_sdf_geometry_fingerprint',
+            None,
+        )
+        cached_method = getattr(
+            self.data_handler,
+            'cached_sdf_method',
+            None,
+        )
+        provenance_matches = (
+            cached_fingerprint == self.sdf_geometry_fingerprint
+            and cached_method == 'exact_polyline_segments'
+        )
+        if not provenance_matches:
+            logger.warning(
+                "Cached SDF provenance mismatch; rebuilding canonically: "
+                "cached_geometry=%s, active_geometry=%s, method=%s",
+                (
+                    cached_fingerprint[:12]
+                    if cached_fingerprint
+                    else None
+                ),
+                self.sdf_geometry_fingerprint[:12],
+                cached_method,
+            )
+        elif max_error > self.sdf_float64_consistency_tolerance:
+            logger.info(
+                "Cached SDF values differ from canonical float64 evaluation "
+                "by %.3e; runtime cache is refreshed.",
+                max_error,
+            )
+
+        dataset.sdf = torch.from_numpy(
+            np.ascontiguousarray(canonical, dtype=np.float64)
+        ).view(-1, 1)
+        self.data_handler.cached_sdf_geometry_fingerprint = (
+            self.sdf_geometry_fingerprint
+        )
+        self.data_handler.cached_sdf_method = 'exact_polyline_segments'
+        self.data_handler.cached_sdf_max_abs_error = max_error
+        metadata = getattr(self.data_handler, 'initial_metadata', None)
+        if isinstance(metadata, dict):
+            metadata['sdf_geometry_fingerprint'] = (
+                self.sdf_geometry_fingerprint
+            )
+            metadata['sdf_method'] = 'exact_polyline_segments'
+
+    def prepare_sdf_for_pde(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        cached_sdf: torch.Tensor,
+        boundary_types: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compose SDF with coordinates and return its valid PDE mask.
+
+        The exact minimum over segments is not differentiable where two
+        segments are equally close.  Such tie points and wall points keep their
+        cached value and are marked invalid for second-order PDE residuals.
+        Interior points receive the online distance, preserving all chain-rule
+        terms from the network's SDF input to ``x`` and ``y``.
+        """
+        if not self.feature_assembler.sdf_enabled:
+            return cached_sdf, torch.ones_like(x, dtype=torch.bool)
+        if self.sdf_module is None:
+            raise RuntimeError(
+                "SDF is enabled but no ordered airfoil polyline is available. "
+                "Regenerate geometry/sampling artifacts before training."
+            )
+        if x.shape != y.shape or x.shape != cached_sdf.shape:
+            raise ValueError("x, y and cached_sdf must have identical shapes")
+
+        candidate_mask = torch.ones_like(x, dtype=torch.bool)
+        if boundary_types is not None and boundary_types.shape[1] > 0:
+            type_to_idx = getattr(
+                self.data_handler.dataset,
+                'type_to_idx',
+                {},
+            )
+            if not self.pde_on_boundary and 'interior' in type_to_idx:
+                interior_idx = type_to_idx['interior']
+                candidate_mask = (
+                    boundary_types[:, interior_idx].view(-1, 1) > 0.5
+                )
+            wall_idx = type_to_idx.get('wall')
+            if wall_idx is not None and wall_idx < boundary_types.shape[1]:
+                wall_mask = boundary_types[:, wall_idx].view(-1, 1) > 0.5
+                candidate_mask = candidate_mask & ~wall_mask
+
+        candidate_indices = torch.nonzero(
+            candidate_mask.reshape(-1),
+            as_tuple=False,
+        ).reshape(-1)
+        result = cached_sdf.clone()
+        valid_mask = torch.zeros_like(x, dtype=torch.bool)
+        if candidate_indices.numel() == 0:
+            return result, valid_mask
+
+        points = torch.cat((x, y), dim=1)
+        candidate_points = points[candidate_indices]
+        (
+            nearest,
+            second,
+            nearest_projection,
+            second_projection,
+            nearest_gradient,
+            second_gradient,
+        ) = self.sdf_module.nearest_two_geometry(candidate_points)
+        ties = self.sdf_module.tie_mask(
+            nearest,
+            second,
+            absolute_tolerance=self.sdf_absolute_tie_tolerance,
+            relative_tolerance=self.sdf_relative_tie_tolerance,
+            nearest_projection=nearest_projection,
+            second_projection=second_projection,
+            nearest_gradient=nearest_gradient,
+            second_gradient=second_gradient,
+        ).detach().reshape(-1)
+        finite = torch.isfinite(nearest.detach()).reshape(-1)
+        safe_local = ~ties & finite
+        safe_indices = candidate_indices[safe_local]
+
+        if safe_indices.numel() > 0:
+            flat_result = result.reshape(-1)
+            flat_result[safe_indices] = nearest.reshape(-1)[safe_local]
+            result = flat_result.reshape_as(cached_sdf)
+            flat_valid = valid_mask.reshape(-1)
+            flat_valid[safe_indices] = True
+            valid_mask = flat_valid.reshape_as(x)
+
+        return result, valid_mask
+
+    def compute_pressure_gauge_loss(
+        self,
+        pressure: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Anchor the additive pressure constant independently for each case.
+
+        Incompressible PDE residuals contain only pressure gradients.  Without
+        this term, adding an arbitrary constant to one case leaves the PDE loss
+        unchanged.  The gauge chooses zero mean dimensionless pressure
+        coefficient for every ``case_id`` represented in the batch.
+        """
+        if pressure.ndim != 2 or pressure.shape[1] != 1:
+            raise ValueError("pressure must have shape (N, 1)")
+        if case_ids is None:
+            ids = torch.zeros(
+                pressure.shape[0],
+                device=pressure.device,
+                dtype=torch.long,
+            )
+        else:
+            if case_ids.numel() != pressure.shape[0]:
+                raise ValueError(
+                    "case_ids must contain exactly one identifier per pressure"
+                )
+            ids = case_ids.to(
+                device=pressure.device,
+                dtype=torch.long,
+            ).reshape(-1)
+
+        if mask is None:
+            selected = torch.ones(
+                pressure.shape[0],
+                device=pressure.device,
+                dtype=torch.bool,
+            )
+        else:
+            if mask.shape != pressure.shape:
+                raise ValueError("pressure gauge mask must match pressure shape")
+            selected = mask.to(
+                device=pressure.device,
+                dtype=torch.bool,
+            ).reshape(-1)
+
+        terms = []
+        flat_pressure = pressure.reshape(-1)
+        for case_id in torch.unique(ids[selected], sorted=True):
+            case_mask = selected & (ids == case_id)
+            terms.append(flat_pressure[case_mask].mean().square())
+        if not terms:
+            return pressure.sum() * 0.0
+        return torch.stack(terms).mean()
 
     def _grad(
         self,
@@ -152,24 +596,52 @@ class LossComputer:
     # ------------------------------------------------------------------
     # FVM-потеря (закон сохранения массы)
     # ------------------------------------------------------------------
-    def compute_fvm_loss(self, u_fvm: torch.Tensor) -> torch.Tensor:
+    def compute_fvm_loss(
+        self,
+        u_fvm: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Вычисляет взвешенную FVM-потерю закона сохранения массы.
 
         Args:
             u_fvm: тензор (N, 2) — нормированная скорость [u, v] во всех
                    N узлах сетки (порядок совпадает с точками коллокации)
+            freestream_velocity: case-local ``(cos(alpha), sin(alpha))``
 
         Returns:
-            Скалярный тензор fvm_weight * mean(R_i²),
-            или ноль если fvm не подключён / вес равен нулю.
+            Configured FVM contribution ``fvm_weight * raw_fvm_loss``.
         """
-        if self.fvm is None or self.fvm_weight == 0.0:
-            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        return self.fvm_weight * self.fvm.mass_loss(
+        return self.compute_fvm_metrics(
+            u_fvm,
+            freestream_velocity=freestream_velocity,
+        )["weighted"]
+
+    def compute_fvm_metrics(
+        self,
+        u_fvm: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return the FVM mean-square objective and RMS diagnostic.
+
+        ``raw`` is retained as a compatibility alias for ``mse``.  Every
+        supported FVM reduction is quadratic; no square-rooted metric is ever
+        fed into ``total_loss``.
+        """
+        if self.fvm is None:
+            zero = torch.zeros((), device=self.device, dtype=self.dtype)
+            return {"mse": zero, "raw": zero, "weighted": zero, "rms": zero}
+        mse, rms = self.fvm.loss_and_divergence_rms(
             u_fvm,
             reduction=self.fvm_loss_reduction,
+            freestream_velocity=freestream_velocity,
         )
+        return {
+            "mse": mse,
+            "raw": mse,
+            "weighted": mse * self.fvm_weight,
+            "rms": rms,
+        }
 
     def _setup_pde_components(self) -> List[str]:
         """Возвращает список названий компонент PDE в зависимости от типа течения."""
@@ -187,7 +659,8 @@ class LossComputer:
         v: torch.Tensor,
         p: torch.Tensor,
         x: torch.Tensor,
-        y: torch.Tensor
+        y: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Вычисляет невязки PDE (квадраты) для заданных полей.
@@ -195,6 +668,7 @@ class LossComputer:
         Args:
             u, v, p: поля скорости и давления (тензоры с requires_grad)
             x, y: координаты (тензоры с requires_grad)
+            case_ids: идентификатор режима для каждой точки
 
         Returns:
             словарь с ключами, соответствующими self.pde_components,
@@ -203,20 +677,34 @@ class LossComputer:
         if self.pde_system == 'euler':
             if self.flow_type == 'axisymmetric':
                 return PDEResiduals.compute_residuals_euler_axisymmetric(
-                    u, v, p, x, y, self.rho_norm, self._grad, self.eps_axi
+                    u, v, p, x, y, self._grad, self.eps_axi
                 )
             return PDEResiduals.compute_residuals_euler_2d(
-                u, v, p, x, y, self.rho_norm, self._grad
+                u, v, p, x, y, self._grad
             )
 
+        flow = self.get_flow_case_batch(x, case_ids)
+        inverse_reynolds = flow.reynolds.reciprocal()
         if self.flow_type == 'axisymmetric':
             return PDEResiduals.compute_residuals_axisymmetric(
-                u, v, p, x, y, self.rho_norm, self.mu_norm, self._grad, self.eps_axi
+                u,
+                v,
+                p,
+                x,
+                y,
+                inverse_reynolds,
+                self._grad,
+                self.eps_axi,
             )
-        else:
-            return PDEResiduals.compute_residuals_2d(
-                u, v, p, x, y, self.rho_norm, self.mu_norm, self._grad
-            )
+        return PDEResiduals.compute_residuals_2d(
+            u,
+            v,
+            p,
+            x,
+            y,
+            inverse_reynolds,
+            self._grad,
+        )
 
     # ------------------------------------------------------------------
     # Граничные условия (только для soft)
@@ -226,23 +714,61 @@ class LossComputer:
         u: torch.Tensor,
         v: torch.Tensor,
         mask: torch.Tensor,
+        target_u: torch.Tensor,
+        target_v: torch.Tensor,
     ) -> torch.Tensor:
         return (
-            torch.mean((u[mask] - self.data_handler.inlet_u_norm) ** 2)
-            + torch.mean((v[mask] - self.data_handler.inlet_v_norm) ** 2)
+            torch.mean((u[mask] - target_u[mask]) ** 2)
+            + torch.mean((v[mask] - target_v[mask]) ** 2)
         )
 
-    def _boundary_side_masks(
+    def _boundary_normals(
         self,
+        normal_x: Optional[torch.Tensor],
+        normal_y: Optional[torch.Tensor],
         mask: torch.Tensor,
+        *,
+        boundary_name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Validate and normalize stored normals on one boundary mask."""
+        if normal_x is None or normal_y is None:
+            raise RuntimeError(
+                f"Boundary {boundary_name!r} requires stored normal_x and "
+                "normal_y values. Regenerate collocation data with boundary "
+                "normals."
+            )
+        if normal_x.shape != mask.shape or normal_y.shape != mask.shape:
+            raise ValueError(
+                "normal_x, normal_y and boundary mask must have identical "
+                "shapes"
+            )
+
+        nx = normal_x[mask]
+        ny = normal_y[mask]
+        length = torch.sqrt(nx.square() + ny.square())
+        valid = torch.isfinite(nx) & torch.isfinite(ny) & (length > 0.0)
+        if not bool(valid.all()):
+            invalid_count = int((~valid).sum().item())
+            raise RuntimeError(
+                f"Boundary {boundary_name!r} contains {invalid_count} point(s) "
+                "without a finite non-zero normal. Regenerate collocation "
+                "data with boundary normals."
+            )
+        return nx / length, ny / length
+
+    def _normal_derivative(
+        self,
+        field: torch.Tensor,
         x: torch.Tensor,
         y: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        left = mask & (x <= self.x_min + self.tol)
-        right = mask & (x >= self.x_max - self.tol)
-        bottom = mask & (y <= self.y_min + self.tol)
-        top = mask & (y >= self.y_max - self.tol)
-        return left, right, bottom, top
+        nx: torch.Tensor,
+        ny: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``grad(field) dot n`` at masked boundary points."""
+        dfield_dx = self._grad(field, x, silent=False)[mask]
+        dfield_dy = self._grad(field, y, silent=False)[mask]
+        return dfield_dx * nx + dfield_dy * ny
 
     def _normal_velocity_gradient_loss(
         self,
@@ -251,64 +777,126 @@ class LossComputer:
         x: torch.Tensor,
         y: torch.Tensor,
         mask: torch.Tensor,
+        normal_x: Optional[torch.Tensor],
+        normal_y: Optional[torch.Tensor],
+        *,
+        boundary_name: str,
     ) -> torch.Tensor:
-        left, right, bottom, top = self._boundary_side_masks(mask, x, y)
-        vertical = left | right
-        horizontal = bottom | top
-        terms = []
+        nx, ny = self._boundary_normals(
+            normal_x,
+            normal_y,
+            mask,
+            boundary_name=boundary_name,
+        )
+        du_dn = self._normal_derivative(u, x, y, nx, ny, mask)
+        dv_dn = self._normal_derivative(v, x, y, nx, ny, mask)
+        return torch.mean(du_dn.square() + dv_dn.square())
 
-        if bool(vertical.any()):
-            du_dx = self._grad(u, x, silent=False)
-            dv_dx = self._grad(v, x, silent=False)
-            terms.extend([du_dx[vertical] ** 2, dv_dx[vertical] ** 2])
+    def _slip_bc_loss(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        normal_x: Optional[torch.Tensor],
+        normal_y: Optional[torch.Tensor],
+        *,
+        boundary_name: str,
+    ) -> torch.Tensor:
+        nx, ny = self._boundary_normals(
+            normal_x,
+            normal_y,
+            mask,
+            boundary_name=boundary_name,
+        )
+        normal_velocity = u[mask] * nx + v[mask] * ny
+        return torch.mean(normal_velocity.square())
 
-        if bool(horizontal.any()):
-            du_dy = self._grad(u, y, silent=False)
-            dv_dy = self._grad(v, y, silent=False)
-            terms.extend([du_dy[horizontal] ** 2, dv_dy[horizontal] ** 2])
-
-        if not terms:
-            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        return torch.mean(torch.cat([term.flatten() for term in terms]))
-
-    def _slip_bc_losses(
+    def _symmetry_bc_losses(
         self,
         u: torch.Tensor,
         v: torch.Tensor,
         x: torch.Tensor,
         y: torch.Tensor,
         mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        left, right, bottom, top = self._boundary_side_masks(mask, x, y)
-        vertical = left | right
-        horizontal = bottom | top
+        normal_x: Optional[torch.Tensor],
+        normal_y: Optional[torch.Tensor],
+        *,
+        boundary_name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        nx, ny = self._boundary_normals(
+            normal_x,
+            normal_y,
+            mask,
+            boundary_name=boundary_name,
+        )
+        normal_velocity = u[mask] * nx + v[mask] * ny
+        full_length = torch.sqrt(normal_x.square() + normal_y.square())
+        safe_length = torch.where(
+            mask,
+            full_length,
+            torch.ones_like(full_length),
+        )
+        nx_full = torch.where(mask, normal_x / safe_length, torch.zeros_like(u))
+        ny_full = torch.where(mask, normal_y / safe_length, torch.zeros_like(v))
+        tangential_velocity = -u * ny_full + v * nx_full
+        dut_dn = self._normal_derivative(
+            tangential_velocity,
+            x,
+            y,
+            nx,
+            ny,
+            mask,
+        )
+        return torch.mean(normal_velocity.square()), torch.mean(dut_dn.square())
 
-        normal_terms = []
-        tangent_grad_terms = []
-        velocity_anchor_terms = []
+    def compute_wall_normals(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return unit wall normals as the one-sided gradient of the SDF.
 
-        if bool(horizontal.any()):
-            normal_terms.append((v[horizontal] - self.data_handler.inlet_v_norm) ** 2)
-            du_dy = self._grad(u, y, silent=False)
-            tangent_grad_terms.append(du_dy[horizontal] ** 2)
-            velocity_anchor_terms.append((u[horizontal] - self.data_handler.inlet_u_norm) ** 2)
+        The exact unsigned SDF has two opposite gradients at the surface.
+        ``PolylineDistanceField.surface_normals`` evaluates either one-sided
+        limit from the nearest segment.  The orientation is immaterial for the
+        squared Euler impermeability residual.
+        """
+        if self.sdf_module is None:
+            raise RuntimeError(
+                "Euler wall boundary conditions require an ordered airfoil "
+                "polyline for SDF-based surface normals."
+            )
+        if x.shape != y.shape or x.shape != mask.shape:
+            raise ValueError("x, y and wall mask must have identical shapes")
 
-        if bool(vertical.any()):
-            normal_terms.append((u[vertical] - self.data_handler.inlet_u_norm) ** 2)
-            dv_dx = self._grad(v, x, silent=False)
-            tangent_grad_terms.append(dv_dx[vertical] ** 2)
-            velocity_anchor_terms.append((v[vertical] - self.data_handler.inlet_v_norm) ** 2)
+        wall_points = torch.stack((x[mask], y[mask]), dim=1)
+        normals = self.sdf_module.surface_normals(wall_points)
+        if not bool(torch.isfinite(normals).all()):
+            raise RuntimeError("SDF-based wall normals contain non-finite values")
+        return normals[:, 0], normals[:, 1]
 
-        if not normal_terms:
-            normal_terms.append((v[mask] - self.data_handler.inlet_v_norm) ** 2)
-            du_dy = self._grad(u, y, silent=False)
-            tangent_grad_terms.append(du_dy[mask] ** 2)
-            velocity_anchor_terms.append((u[mask] - self.data_handler.inlet_u_norm) ** 2)
-
-        normal_loss = torch.mean(torch.cat([term.flatten() for term in normal_terms]))
-        tangent_grad_loss = torch.mean(torch.cat([term.flatten() for term in tangent_grad_terms]))
-        velocity_anchor_loss = torch.mean(torch.cat([term.flatten() for term in velocity_anchor_terms]))
-        return normal_loss, tangent_grad_loss, velocity_anchor_loss
+    def compute_wall_point_loss(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the PDE-appropriate wall residual squared per point."""
+        if self.pde_system == 'incompressible_navier_stokes':
+            return u.square() + v.square()
+        if self.pde_system == 'euler':
+            nx, ny = self.compute_wall_normals(x, y, mask)
+            point_loss = torch.zeros_like(u)
+            point_loss[mask] = (
+                u[mask] * nx + v[mask] * ny
+            ).square()
+            return point_loss
+        raise ValueError(
+            f"Unsupported PDE system for wall BC: {self.pde_system}"
+        )
 
     def compute_bc_loss(
         self,
@@ -317,7 +905,10 @@ class LossComputer:
         p: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
         x: torch.Tensor,
-        y: torch.Tensor
+        y: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+        normal_x: Optional[torch.Tensor] = None,
+        normal_y: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Вычисляет потери на границах для soft boundary conditions.
@@ -328,29 +919,51 @@ class LossComputer:
             u, v, p: поля скорости и давления
             boundary_types: one-hot тензор типов границ (или None)
             x, y: координаты
+            case_ids: идентификатор режима для каждой точки
+            normal_x, normal_y: единичные нормали граничных точек
 
         Returns:
             bc_comp: словарь {имя_границы: тензор потерь (скаляр)}
             extra_grad: дополнительная потеря от градиентов (скалярный тензор)
         """
-        if self.bc_type == 'hard' or boundary_types is None:
-            # Для hard границ потери не вычисляются
+        if boundary_types is None:
             return {}, torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
         bc_comp = {name: torch.tensor(0.0, device=self.device, dtype=self.dtype)
                    for name in self.data_handler.boundary_type_names}
         extra_grad = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        target_u, target_v = self.get_freestream_targets(x, case_ids)
 
         for idx, name in enumerate(self.data_handler.boundary_type_names):
+            boundary_config = self.boundary_conditions.get(
+                name,
+                {"enforcement": "soft"},
+            )
+            if boundary_config.get("enforcement", "soft") == "hard":
+                # The supported hard value constraint is already enforced by
+                # BoundaryOutputTransform. Other boundaries remain soft.
+                continue
             mask = boundary_types[:, idx].view(-1, 1) > 0.5
             if mask.sum() == 0:
                 continue
 
             if name == 'inlet':
-                bc_comp[name] += self._freestream_velocity_loss(u, v, mask)
+                bc_comp[name] += self._freestream_velocity_loss(
+                    u,
+                    v,
+                    mask,
+                    target_u,
+                    target_v,
+                )
 
             elif name in ('farfield', 'velocity_dirichlet'):
-                bc_comp[name] += self._freestream_velocity_loss(u, v, mask)
+                bc_comp[name] += self._freestream_velocity_loss(
+                    u,
+                    v,
+                    mask,
+                    target_u,
+                    target_v,
+                )
 
             elif name == 'outlet':
                 p_out = p[mask]
@@ -358,30 +971,53 @@ class LossComputer:
                 outlet_grad_weight = self.loss_weights.get('outlet_grad', 0.0)
                 if outlet_grad_weight > 0.0:
                     extra_grad += outlet_grad_weight * self._normal_velocity_gradient_loss(
-                        u, v, x, y, mask
+                        u,
+                        v,
+                        x,
+                        y,
+                        mask,
+                        normal_x,
+                        normal_y,
+                        boundary_name=name,
                     )
 
             elif name == 'wall':
-                u_w = u[mask]
-                v_w = v[mask]
-                bc_comp[name] += torch.mean(u_w ** 2)
-                bc_comp[name] += torch.mean(v_w ** 2)
-
-            elif name == 'slip':
-                normal_loss, tangent_grad_loss, velocity_anchor_loss = self._slip_bc_losses(
-                    u, v, x, y, mask
+                bc_comp[name] += torch.mean(
+                    self.compute_wall_point_loss(
+                        u,
+                        v,
+                        x,
+                        y,
+                        mask,
+                    )[mask]
                 )
-                bc_comp[name] += normal_loss
-                extra_grad += (
-                    self.loss_weights.get('slip_tangent_grad', 1.0) * tangent_grad_loss
-                    + self.loss_weights.get('slip_velocity', 0.1) * velocity_anchor_loss
+
+            elif name in ('slip_wall', 'slip'):
+                bc_comp[name] += self._slip_bc_loss(
+                    u,
+                    v,
+                    mask,
+                    normal_x,
+                    normal_y,
+                    boundary_name=name,
                 )
 
             elif name == 'symmetry':
-                bc_comp[name] += torch.mean(v[mask] ** 2)
-                # du/dy = 0 на линии симметрии: градиент по полному тензору, затем маска
-                du_dy = self._grad(u, y, silent=False)[mask]
-                extra_grad += self.loss_weights.get('symmetry_grad', 10.0) * torch.mean(du_dy ** 2)
+                normal_loss, tangent_grad_loss = self._symmetry_bc_losses(
+                    u,
+                    v,
+                    x,
+                    y,
+                    mask,
+                    normal_x,
+                    normal_y,
+                    boundary_name=name,
+                )
+                bc_comp[name] += normal_loss
+                extra_grad += (
+                    self.loss_weights.get('symmetry_grad', 10.0)
+                    * tangent_grad_loss
+                )
 
             elif name == 'axis_symmetry':
                 bc_comp[name] += torch.mean(u[mask] ** 2)
@@ -551,54 +1187,55 @@ class LossComputer:
         x: torch.Tensor,
         y: torch.Tensor,
         sdf: torch.Tensor,
-        boundary_types: Optional[torch.Tensor]
+        *,
+        case_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Собирает входной тензор для модели на основе координат, SDF,
-        опционального one-hot типа границы и дополнительных параметров
-        (скорость на входе, вязкость, плотность), если они включены
-        в конфигурацию.
+        """Assemble the manifest-defined dimensionless network input.
 
         Args:
-            x, y: координаты (тензоры)
-            sdf: нормализованное расстояние до стенки
-            boundary_types: one-hot тензор типов границ (или None).
-                Для loss-масок он передается всегда, но во вход модели
-                попадает только при input_params.boundary_types=True.
+            x: Chord-normalized x coordinate.
+            y: Chord-normalized y coordinate.
+            sdf: Chord-normalized differentiable/cached distance.
+            case_ids: Per-point flow-case identifiers.  When omitted, the
+                legacy single case ``0`` is used.
 
         Returns:
-            тензор формы (batch_size, input_dim)
+            Tensor with exactly ``feature_manifest.input_dim`` columns.
         """
-        inputs = []
-        if self.input_params.get('coordinates', True):
-            inputs.extend([x, y])
-        if self.input_params.get('sdf', True):
-            inputs.append(sdf)
-        if (
-            self.input_params.get('boundary_types', True)
-            and boundary_types is not None
-            and boundary_types.shape[1] > 0
-        ):
-            inputs.append(boundary_types)
+        flow = None
+        if self.feature_assembler.requires_flow:
+            flow = self.get_flow_case_batch(x, case_ids)
+        return self.feature_assembler.build(
+            x,
+            y,
+            sdf,
+            flow,
+        )
 
-        if self.input_params.get('inlet_velocity', False):
-            u_in = torch.ones_like(x) * self.data_handler.inlet_u_norm
-            v_in = torch.ones_like(x) * self.data_handler.inlet_v_norm
-            inputs.append(u_in)
-            inputs.append(v_in)
-
-        if self.input_params.get('viscosity', False):
-            mu = torch.ones_like(x) * self.mu_norm
-            inputs.append(mu)
-
-        if self.input_params.get('density', False):
-            rho = torch.ones_like(x) * self.rho_norm
-            inputs.append(rho)
-
-        if not inputs:
-            raise ValueError("build_input_tensor: не выбран ни один входной признак")
-
-        return torch.cat(inputs, dim=1)
+    def transform_outputs(
+        self,
+        raw_u: torch.Tensor,
+        raw_v: torch.Tensor,
+        raw_p: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        sdf: Optional[torch.Tensor] = None,
+        case_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply graph-level hard constraints to raw model outputs."""
+        flow = None
+        if case_ids is not None:
+            flow = self.get_flow_case_batch(x, case_ids)
+        return self.boundary_transform(
+            raw_u,
+            raw_v,
+            raw_p,
+            x,
+            y,
+            sdf=sdf,
+            flow=flow,
+        )
 
     # ------------------------------------------------------------------
     # Применение hard граничных условий
@@ -615,8 +1252,11 @@ class LossComputer:
         v_bc: torch.Tensor,
         p_bc: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Заменяет предсказанные значения на граничные там, где маски активны.
+        """Legacy pointwise boundary override.
+
+        This method is retained only for loading/debugging legacy runs. It is
+        not a mathematical hard boundary condition and must not be used by the
+        modern per-boundary training path.
 
         Args:
             u_raw, v_raw, p_raw: выход модели (без ограничений)
@@ -636,8 +1276,14 @@ class LossComputer:
         u_raw: torch.Tensor,
         v_raw: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
+        case_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Hard speed Dirichlet for boundary_type='velocity_dirichlet' in any BC mode."""
+        """Legacy pointwise velocity override.
+
+        Per-boundary configurations keep ``velocity_dirichlet`` soft during
+        the first hard-wall implementation. The override is retained only for
+        old global-hard direct callers.
+        """
         names = getattr(self.data_handler, 'boundary_type_names', [])
         if boundary_types is None or 'velocity_dirichlet' not in names:
             return u_raw, v_raw
@@ -650,8 +1296,9 @@ class LossComputer:
         if not bool(mask.any()):
             return u_raw, v_raw
 
-        u_final = torch.where(mask, torch.ones_like(u_raw) * self.data_handler.inlet_u_norm, u_raw)
-        v_final = torch.where(mask, torch.ones_like(v_raw) * self.data_handler.inlet_v_norm, v_raw)
+        target_u, target_v = self.get_freestream_targets(u_raw, case_ids)
+        u_final = torch.where(mask, target_u, u_raw)
+        v_final = torch.where(mask, target_v, v_raw)
         return u_final, v_final
 
     # ------------------------------------------------------------------

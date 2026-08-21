@@ -100,11 +100,13 @@ class Visualizer:
                 line, = ax.plot([], [])
                 self.lines_pde[key] = line
                 ax.set_xlabel('Epoch')
-                ax.set_ylabel('Value')
+                ax.set_ylabel('MSE / loss')
                 ax.set_title(title)
                 ax.set_yscale('log', nonpositive='clip')
                 ax.grid(True)
-            self.fig_pde.suptitle(f'PDE Residuals & Total Loss - {self.config_name}')
+            self.fig_pde.suptitle(
+                f'PDE MSE & Total Loss - {self.config_name}'
+            )
 
             # Окно для граничных условий (6 графиков: Inlet, Outlet, Wall, Symmetry, Axis Symmetry, Wall Speed)
             self.fig_bc, self.axes_bc = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
@@ -115,11 +117,13 @@ class Visualizer:
                 line, = ax.plot([], [])
                 self.lines_bc[title.lower().replace(' ', '_')] = (ax, line)
                 ax.set_xlabel('Epoch')
-                ax.set_ylabel('Value')
+                ax.set_ylabel('MSE / diagnostic')
                 ax.set_title(title)
                 ax.set_yscale('log', nonpositive='clip')
                 ax.grid(True)
-            self.fig_bc.suptitle(f'Boundary Conditions - {self.config_name}')
+            self.fig_bc.suptitle(
+                f'Boundary-condition MSE - {self.config_name}'
+            )
 
             # Окно для диагностики (3 графика: градиенты, средние скорости, ошибка масс)
             self.fig_diag, self.axes_diag = plt.subplots(1, 3, figsize=(18, 4), constrained_layout=True)
@@ -760,11 +764,6 @@ class Visualizer:
         v_np = v_plot.cpu().numpy().flatten()
         p_np = p_plot.cpu().numpy().flatten()
 
-        if (
-            getattr(data_handler, 'mesh_domain_coords', None) is None
-            and hasattr(data_handler, 'load_mesh_geometry_from_geom_config')
-        ):
-            data_handler.load_mesh_geometry_from_geom_config()
         geom_scale = 1.0 if plot_physical else 1.0 / float(getattr(data_handler, 'chord', 1.0) or 1.0)
         clip_polygon = self._scale_geometry_for_plot(
             getattr(data_handler, 'mesh_domain_coords', None),
@@ -844,7 +843,7 @@ class Visualizer:
 
         plt.figure(figsize=(10, 6))
         for x, (y, u) in profiles.items():
-            plt.plot(u, y, label=f'x = {x:.3f} м')
+            plt.plot(u, y, label=f'x/c = {x:.3f}')
         plt.xlabel('u, м/с')
         plt.ylabel('y, м')
         plt.title(f'Профили скорости в сечениях - {self.config_name}')
@@ -1080,22 +1079,35 @@ class Visualizer:
         Рекомендуется использовать plot_final_fields_from_tensors.
         """
         logger.warning("Метод plot_final_fields устарел. Используйте plot_final_fields_from_tensors.")
+        if loss_computer is None:
+            raise RuntimeError(
+                "plot_final_fields requires LossComputer so evaluation SDF "
+                "is recomputed by the canonical geometry engine"
+            )
         model.eval()
         dataset = data_handler.dataset
         x_norm = dataset.x.to(device)
         y_norm = dataset.y.to(device)
-        sdf_norm = dataset.sdf.to(device)
+        sdf_norm = loss_computer.evaluate_sdf_tensor(x_norm, y_norm)
         bt = dataset.boundary_types.to(device) if dataset.boundary_types is not None else None
 
         with torch.no_grad():
-            if loss_computer is not None:
-                input_tensor = loss_computer.build_input_tensor(x_norm, y_norm, sdf_norm, bt)
-            elif bt is not None:
-                input_tensor = torch.cat([x_norm, y_norm, sdf_norm, bt], dim=1)
-            else:
-                input_tensor = torch.cat([x_norm, y_norm, sdf_norm], dim=1)
+            input_tensor = loss_computer.build_input_tensor(
+                x_norm,
+                y_norm,
+                sdf_norm,
+            )
             output = model(input_tensor)
             u_norm, v_norm, p_norm = output[:, 0:1], output[:, 1:2], output[:, 2:3]
+            u_norm, v_norm, p_norm = loss_computer.transform_outputs(
+                u_norm,
+                v_norm,
+                p_norm,
+                x_norm,
+                y_norm,
+                sdf=sdf_norm,
+                case_ids=getattr(dataset, "case_id", None),
+            )
 
         self.plot_final_fields_from_tensors(u_norm, v_norm, p_norm, x_norm, y_norm,
                                             data_handler, savedir, epoch,

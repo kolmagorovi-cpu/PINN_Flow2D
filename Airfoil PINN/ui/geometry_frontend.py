@@ -62,7 +62,6 @@ class GeometryFrontendSession:
         self.foils_dir = paths.geometry_foils_dir
         self.output_dir = paths.geometry_domains_dir
         self.metadata_dir = paths.geometry_metadata_dir
-        self.geom_config_path = paths.geom_config_path
         self.foil_library_path = paths.foil_geoms_path
 
         self.name = "airfoil"
@@ -140,36 +139,6 @@ class GeometryFrontendSession:
         self.foil_points = points
         self.domain_points = []
         self.stats = self._compute_stats(points)
-
-    def load_from_config(self, config_path: str | Path | None = None) -> dict[str, Any]:
-        path = Path(config_path) if config_path else self.geom_config_path
-        if not path.exists():
-            raise GeometryReadError(f"Geometry config not found: {path}")
-
-        config = self._load_yaml_file(path)
-        geom_name = config.get("geom_name") or "airfoil"
-        common_params = config.get("common_params", {}) or {}
-        airfoil_params = config.get("airfoil_params", {}) or {}
-
-        self._apply_common_params(common_params)
-        source_type = airfoil_params.get("source_type", "inline")
-
-        if source_type == "file":
-            file_path = airfoil_params.get("file_path")
-            if not file_path:
-                raise GeometryReadError("geom_config.yaml: airfoil_params.file_path is empty")
-            self.load_file(self._resolve_path(file_path, base_dir=path.parent))
-            self.name = self._clean_name(geom_name)
-        elif source_type == "inline":
-            if "X" in airfoil_params and "Y" in airfoil_params:
-                self.load_inline_xy(airfoil_params.get("X", []), airfoil_params.get("Y", []), geom_name)
-            else:
-                self.load_from_library(geom_name)
-        else:
-            raise GeometryReadError(f"Unsupported airfoil source_type: {source_type}")
-
-        self.last_domain_params = self._domain_params_from_config(airfoil_params.get("domain_params", {}) or {})
-        return config
 
     def load_from_library(self, geom_name: str, library_path: str | Path | None = None) -> None:
         path = Path(library_path) if library_path else self.foil_library_path
@@ -502,24 +471,6 @@ class GeometryFrontendSession:
             elif char in {" ", "."}:
                 allowed.append("_")
         return "".join(allowed).strip("_") or "airfoil"
-
-    def _apply_common_params(self, common_params: dict[str, Any]) -> None:
-        output_dir = common_params.get("output_dir")
-        if output_dir:
-            self.output_dir = self._resolve_path(output_dir, base_dir=self.project_root)
-        save_format = common_params.get("save_format")
-        if save_format:
-            self.default_save_format = str(save_format).lower().lstrip(".")
-
-    def _domain_params_from_config(self, params: dict[str, Any]) -> dict[str, float]:
-        result = dict(self.last_domain_params)
-        for key in ("front", "rear", "top", "bottom"):
-            if key in params and params[key] is not None:
-                try:
-                    result[key] = float(params[key])
-                except (TypeError, ValueError):
-                    pass
-        return result
 
     def _resolve_path(self, value: str | Path, base_dir: Path) -> Path:
         path = Path(value)

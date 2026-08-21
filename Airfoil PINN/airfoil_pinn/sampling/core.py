@@ -20,7 +20,11 @@
 а также выбрать тип верхней границы (INLET или OUTLET).
 
 Example:
-    >>> config = SamplerConfig(step_size=0.01, num_processes=4)
+    >>> config = SamplerConfig(
+    ...     step_size=0.01,
+    ...     num_processes=4,
+    ...     geom_name="NACA0012",
+    ... )
     >>> sampler = CollocationPoints(config)
     >>> domain, foil = sampler.load_geometries()
     >>> sampler.generate_all_points(domain, foil)
@@ -38,7 +42,6 @@ from multiprocessing import Process, Queue, freeze_support
 import os
 import time
 import logging
-import yaml
 from typing import List, Tuple, Optional, Dict, Union, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -49,10 +52,8 @@ import queue
 from scipy.spatial import cKDTree
 
 from airfoil_pinn.app.paths import (
-    GEOM_CONFIG_PATH,
     GEOMETRY_DOMAINS_DIR,
     GEOMETRY_METADATA_DIR,
-    PATHS,
     SAMPLING_COLLOCATION_DIR,
     SAMPLING_MESH_DIR,
 )
@@ -70,7 +71,6 @@ except ImportError:
 
 # Сэмплинг читает геометрию из workspace/geometry и пишет свои артефакты
 # в workspace/sampling. Пути остаются строками для совместимости с os.path.
-PROJECT_ROOT = str(PATHS.project_root)
 DEFAULT_GEOMETRY_DIR = GEOMETRY_DOMAINS_DIR
 DEFAULT_METADATA_DIR = GEOMETRY_METADATA_DIR
 DEFAULT_OUTPUT_DIR = SAMPLING_COLLOCATION_DIR
@@ -89,6 +89,7 @@ from airfoil_pinn.data.sdf_diagnostics import (
     compute_sdf_summary,
     format_sdf_summary,
 )
+from airfoil_pinn.data.normalization import build_geometry_reference
 from airfoil_pinn.sampling.normal_layer import (
     DEFAULT_ETA_LEVELS,
     NormalLayerConfig,
@@ -104,6 +105,8 @@ class BoundaryType(Enum):
     INLET = "inlet"
     OUTLET = "outlet"
     FARFIELD = "farfield"
+    SLIP_WALL = "slip_wall"
+    # Legacy spelling accepted when loading old sampler configurations.
     SLIP = "slip"
     VELOCITY_DIRICHLET = "velocity_dirichlet"
     WALL = "wall"
@@ -133,6 +136,8 @@ class CollocationPoint:
     on_airfoil: bool = False
     on_boundary: bool = False
     segment_id: int = -1
+    normal_x: float = float("nan")
+    normal_y: float = float("nan")
 
     def to_dict(self) -> CollocationPointDict:
         """
@@ -148,7 +153,9 @@ class CollocationPoint:
             boundary_type=self.boundary_type.value,
             on_airfoil=self.on_airfoil,
             on_boundary=self.on_boundary,
-            segment_id=self.segment_id
+            segment_id=self.segment_id,
+            normal_x=self.normal_x,
+            normal_y=self.normal_y,
         )
 
     def to_tuple(self) -> Tuple[float, float]:
@@ -165,6 +172,7 @@ _VALID_BOUNDARY_TYPES = (
     'inlet',
     'outlet',
     'farfield',
+    'slip_wall',
     'slip',
     'velocity_dirichlet',
     'symmetry',
@@ -191,7 +199,9 @@ class SamplerConfig:
         output_dir: Директория для выходных файлов
         boundary_point_density: Плотность точек на границах
         interior_point_density: Плотность внутренних точек
-        left_boundary_type: Тип левой границы (x=x_min); одно из: inlet, outlet, farfield, slip, velocity_dirichlet, symmetry, axis_symmetry, wall
+        left_boundary_type: Тип левой границы (x=x_min); одно из: inlet,
+            outlet, farfield, slip_wall, velocity_dirichlet, symmetry,
+            axis_symmetry, wall
         right_boundary_type: Тип правой границы (x=x_max)
         top_boundary_type: Тип верхней границы (y=y_max)
         bottom_boundary_type: Тип нижней границы (y=y_min)
@@ -311,6 +321,8 @@ class SamplerConfig:
             normal_layer_min_point_distance_factor=self.normal_layer_min_point_distance_factor,
             normal_layer_max_points=self.normal_layer_max_points,
             normal_layer_fill_remaining=self.normal_layer_fill_remaining,
+            geom_type=self.geom_type,
+            geom_name=self.geom_name,
         )
 
 
@@ -502,66 +514,15 @@ class CollocationPoints:
         self.output_base: Optional[str] = None
         self._last_normal_layer_stats: Dict[str, Any] = {}
 
-        # Загрузка конфигурации геометрии
-        self.load_geometry_config()
-
         os.makedirs(config.output_dir, exist_ok=True)
 
     def _get_next_id(self) -> int:
         self.next_id += 1
         return self.next_id - 1
 
-    def load_geometry_config(self, config_path: str = None) -> None:
-        """
-        Загрузка конфигурации геометрии из YAML-файла.
-
-        Args:
-            config_path: Путь к geom_config.yaml (по умолчанию:
-                         workspace/geometry/geom_config.yaml)
-        """
-        if config_path is None:
-            # Основной путь живёт в workspace/geometry. Старые варианты оставлены
-            # только как мягкий fallback для пользовательских рабочих копий.
-            possible_paths = [
-                GEOM_CONFIG_PATH,
-                os.path.join(PROJECT_ROOT, "geom_config.yaml"),
-                "geom_config.yaml"
-            ]
-            logger.info("🔍 Поиск geom_config.yaml по путям:")
-            for path in possible_paths:
-                exists = "✅" if os.path.exists(path) else "❌"
-                logger.info(f"   {exists} {path}")
-
-            for path in possible_paths:
-                if os.path.exists(path):
-                    config_path = path
-                    logger.info(f"✅ Найден: {config_path}")
-                    break
-
-        if config_path is None or not os.path.exists(config_path):
-            logger.warning("⚠️ geom_config.yaml не найден, используется конфигурация по умолчанию (airfoil)")
-            return
-
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                geom_config = yaml.safe_load(f)
-
-            self.config.geom_type = geom_config.get('geom_type', 'airfoil')
-            # Не перезаписываем geom_name если он уже задан (например, через меню S2DR)
-            if self.config.geom_name is None:
-                self.config.geom_name = geom_config.get('geom_name')
-
-            logger.info(f"✅ Конфигурация геометрии загружена: {config_path}")
-            logger.info(f"   geom_type: {self.config.geom_type}")
-            logger.info(f"   geom_name: {self.config.geom_name or 'default'}")
-
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось загрузить geom_config.yaml: {e}")
-            logger.info("   Используется конфигурация по умолчанию (airfoil)")
-
     def find_geometry_files(self) -> Dict[str, Optional[str]]:
         """
-        Поиск файлов геометрии по geom_name из конфига.
+        Поиск файлов геометрии по ``SamplerConfig.geom_name``.
 
         domain   → workspace/geometry/domains/   ({geom_name}_domain.npy)
         foil     → workspace/geometry/metadata/  ({geom_name}_foil.npy)
@@ -613,13 +574,22 @@ class CollocationPoints:
             Кортеж (domain, foil) — массивы координат области и профиля
 
         Raises:
+            ValueError: Если имя геометрии не передано явно
             FileNotFoundError: Если файл области не найден
         """
+        if not self.config.geom_name:
+            raise ValueError(
+                "SamplerConfig.geom_name не задан. Выберите геометрию в S2DR "
+                "или передайте имя явно при создании SamplerConfig."
+            )
         print("\n📂 Поиск файлов геометрии...")
 
         files = self.find_geometry_files()
         if files['domain'] is None:
-            raise FileNotFoundError(f"Файл области не найден в {self.config.geometry_dir}")
+            raise FileNotFoundError(
+                f"Геометрия '{self.config.geom_name}' не найдена в "
+                f"{self.config.geometry_dir}"
+            )
 
         print(f"\n📂 Загрузка области: {os.path.basename(files['domain'])}")
         domain = self._load_coords(files['domain'])
@@ -749,6 +719,53 @@ class CollocationPoints:
             reference = surface.copy()
         return surface, reference
 
+    @staticmethod
+    def _polyline_normals(
+        points: np.ndarray,
+        reference: np.ndarray,
+        *,
+        closed: bool,
+    ) -> np.ndarray:
+        """Return nearest-segment unit normals for sampled boundary points."""
+        points = np.asarray(points, dtype=np.float64)
+        reference = np.asarray(reference, dtype=np.float64)
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=np.float64)
+        if len(reference) < 2:
+            return np.full((len(points), 2), np.nan, dtype=np.float64)
+
+        starts = reference[:-1]
+        ends = reference[1:]
+        if closed and not np.allclose(reference[0], reference[-1]):
+            starts = np.vstack((starts, reference[-1]))
+            ends = np.vstack((ends, reference[0]))
+
+        segments = ends - starts
+        lengths_sq = np.einsum("ij,ij->i", segments, segments)
+        valid = lengths_sq > 1.0e-28
+        starts = starts[valid]
+        segments = segments[valid]
+        lengths_sq = lengths_sq[valid]
+        if len(segments) == 0:
+            return np.full((len(points), 2), np.nan, dtype=np.float64)
+
+        offset = points[:, None, :] - starts[None, :, :]
+        projection = np.einsum("nsi,si->ns", offset, segments)
+        projection = np.clip(
+            projection / lengths_sq[None, :],
+            0.0,
+            1.0,
+        )
+        nearest = starts[None, :, :] + projection[:, :, None] * segments[None, :, :]
+        distances_sq = np.sum(
+            (points[:, None, :] - nearest) ** 2,
+            axis=2,
+        )
+        nearest_segment = np.argmin(distances_sq, axis=1)
+        tangents = segments[nearest_segment]
+        lengths = np.linalg.norm(tangents, axis=1, keepdims=True)
+        return np.column_stack((-tangents[:, 1], tangents[:, 0])) / lengths
+
     # ------------------------------------------------------------------
     # Генерация точек на внешнем контуре (прямоугольник)
     # ------------------------------------------------------------------
@@ -805,7 +822,12 @@ class CollocationPoints:
         def _coord_key(x: float, y: float) -> Tuple[int, int]:
             return (int(round(x / tol)), int(round(y / tol)))
 
-        def _append_point(x: float, y: float) -> None:
+        def _append_point(
+            x: float,
+            y: float,
+            segment_id: int,
+            normal: np.ndarray,
+        ) -> None:
             key = _coord_key(x, y)
             if key in seen:
                 return
@@ -822,14 +844,18 @@ class CollocationPoints:
                 x=x, y=y,
                 boundary_type=btype,
                 on_airfoil=on_foil,
-                on_boundary=True
+                on_boundary=True,
+                segment_id=segment_id,
+                normal_x=float(normal[0]),
+                normal_y=float(normal[1]),
             ))
 
-        for a, b in segments:
+        for segment_id, (a, b) in enumerate(segments):
             seg = b - a
             seg_len = float(np.linalg.norm(seg))
             if seg_len <= 1e-14:
                 continue
+            normal = np.array([-seg[1], seg[0]], dtype=np.float64) / seg_len
 
             n_full = int(np.floor(seg_len / step))
             distances = [i * step for i in range(n_full + 1)]
@@ -839,7 +865,12 @@ class CollocationPoints:
             for distance in distances:
                 t = min(1.0, max(0.0, distance / seg_len))
                 xy = a + t * seg
-                _append_point(float(xy[0]), float(xy[1]))
+                _append_point(
+                    float(xy[0]),
+                    float(xy[1]),
+                    segment_id,
+                    normal,
+                )
 
         type_counts = {}
         for p in points:
@@ -910,6 +941,11 @@ class CollocationPoints:
         """
         if normal_layer_config is not None:
             surface, reference = self._normal_layer_surface_reference(foil, normal_layer_config)
+            surface_normals = self._polyline_normals(
+                surface,
+                reference,
+                closed=self.foil_is_closed,
+            )
             points = [
                 CollocationPoint(
                     id=self._get_next_id(),
@@ -918,8 +954,10 @@ class CollocationPoints:
                     boundary_type=BoundaryType.WALL,
                     on_airfoil=True,
                     on_boundary=True,
+                    normal_x=float(surface_normals[i, 0]),
+                    normal_y=float(surface_normals[i, 1]),
                 )
-                for x, y in surface
+                for i, (x, y) in enumerate(surface)
             ]
             self.mesh_foil_coords = reference
             logger.info(
@@ -942,12 +980,29 @@ class CollocationPoints:
         points = []
         for distance in distances:
             pt = line.interpolate(distance)
+            tangent_step = max(min(step * 0.25, length * 1.0e-4), 1.0e-12)
+            before = line.interpolate(max(0.0, distance - tangent_step))
+            after = line.interpolate(min(length, distance + tangent_step))
+            tangent = np.array(
+                [after.x - before.x, after.y - before.y],
+                dtype=np.float64,
+            )
+            tangent_norm = float(np.linalg.norm(tangent))
+            if tangent_norm <= 1.0e-14:
+                normal = np.array([np.nan, np.nan], dtype=np.float64)
+            else:
+                normal = np.array(
+                    [-tangent[1], tangent[0]],
+                    dtype=np.float64,
+                ) / tangent_norm
             points.append(CollocationPoint(
                 id=self._get_next_id(),
                 x=pt.x, y=pt.y,
                 boundary_type=BoundaryType.WALL,
                 on_airfoil=True,
                 on_boundary=True,
+                normal_x=float(normal[0]),
+                normal_y=float(normal[1]),
             ))
         logger.info(f"✅ Профиль (WALL): {len(points)} точек")
         return points
@@ -992,7 +1047,9 @@ class CollocationPoints:
                 x=x, y=y_min_dom,
                 boundary_type=btype,
                 on_airfoil=False,
-                on_boundary=True
+                on_boundary=True,
+                normal_x=0.0,
+                normal_y=1.0,
             ))
         logger.info(f"✅ Нижняя граница ({btype.value}): {len(points)} точек")
         return points
@@ -1857,11 +1914,15 @@ class CollocationPoints:
         for p in self.points:
             type_counts[p.boundary_type] = type_counts.get(p.boundary_type, 0) + 1
 
-        chord_for_sdf = None
-        if foil is not None and len(foil) >= 2:
-            chord_for_sdf = float(np.max(foil[:, 0]) - np.min(foil[:, 0]))
-            if chord_for_sdf <= 0.0:
-                chord_for_sdf = None
+        geometry_reference = build_geometry_reference(
+            foil,
+            geom_name=self.config.geom_name,
+        )
+        chord_for_sdf = (
+            float(geometry_reference["chord"])
+            if geometry_reference is not None
+            else None
+        )
         sdf_summary = self._log_sdf_statistics(chord_for_sdf)
 
         self.metadata = {
@@ -1879,6 +1940,8 @@ class CollocationPoints:
             'top_boundary_type': self.config.top_boundary_type,
             'bottom_boundary_type': self.config.bottom_boundary_type,
             'sampling_method': self.config.sampling_method,
+            'geom_name': self.config.geom_name,
+            'geometry_reference': geometry_reference,
             'adaptive_alpha': self.config.adaptive_alpha,
             'adaptive_epsilon_factor': self.config.adaptive_epsilon_factor,
             'normal_layer': self._last_normal_layer_stats if self._last_normal_layer_stats else None,
@@ -1995,9 +2058,11 @@ class CollocationPoints:
         if self.config.save_format == 'npy':
             dtype = [('id', 'i4'), ('x', 'f8'), ('y', 'f8'),
                      ('boundary_type', 'U20'), ('on_airfoil', 'bool'),
-                     ('on_boundary', 'bool'), ('segment_id', 'i4')]
+                     ('on_boundary', 'bool'), ('segment_id', 'i4'),
+                     ('normal_x', 'f8'), ('normal_y', 'f8')]
             arr = np.array([(p.id, p.x, p.y, p.boundary_type.value,
-                             p.on_airfoil, p.on_boundary, p.segment_id)
+                             p.on_airfoil, p.on_boundary, p.segment_id,
+                             p.normal_x, p.normal_y)
                             for p in self.points], dtype=dtype)
             np.save(f"{base}.npy", arr)
             interior_coords = [(p.x, p.y) for p in self.points_interior]
@@ -2009,10 +2074,14 @@ class CollocationPoints:
             logger.info(f"✅ Сохранено: {base}.npy")
         elif self.config.save_format == 'csv':
             with open(f"{base}.csv", 'w') as f:
-                f.write("id,x,y,boundary_type,on_airfoil,on_boundary,segment_id\n")
+                f.write(
+                    "id,x,y,boundary_type,on_airfoil,on_boundary,"
+                    "segment_id,normal_x,normal_y\n"
+                )
                 for p in self.points:
                     f.write(f"{p.id},{p.x},{p.y},{p.boundary_type.value},"
-                            f"{p.on_airfoil},{p.on_boundary},{p.segment_id}\n")
+                            f"{p.on_airfoil},{p.on_boundary},{p.segment_id},"
+                            f"{p.normal_x},{p.normal_y}\n")
             logger.info(f"✅ Сохранено: {base}.csv")
         np.save(f"{base}_metadata.npy", self.metadata)
         logger.info(f"✅ Метаданные сохранены")
@@ -2166,12 +2235,12 @@ def S2DR() -> None:
             "   4 - axis_symmetry (осевая симметрия)\n"
             "   5 - wall          (твёрдая стенка)\n"
             "   6 - farfield      (мягкая скорость U_inf)\n"
-            "   7 - slip          (непроникание + слабая скорость)\n"
+            "   7 - slip_wall     (непротекание u·n = 0)\n"
             "   8 - velocity_dirichlet (жёсткая скорость U_inf)"
         )
         _BOUNDARY_MAP = {'1': 'inlet', '2': 'outlet', '3': 'symmetry',
                          '4': 'axis_symmetry', '5': 'wall',
-                         '6': 'farfield', '7': 'slip',
+                         '6': 'farfield', '7': 'slip_wall',
                          '8': 'velocity_dirichlet'}
 
         print("\nТип ЛЕВОЙ границы (x = x_min):")

@@ -32,19 +32,25 @@ class DummyBoundaryLayerModel(torch.nn.Module):
 class DummyLossComputer:
     """Minimal adapter exposing the input API used by diagnostics."""
 
+    @staticmethod
+    def evaluate_sdf_tensor(
+        x: torch.Tensor,
+        y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return exact distance to the dummy flat-plate wall."""
+
+        del x
+        return torch.abs(y)
+
     def build_input_tensor(
         self,
         x: torch.Tensor,
         y: torch.Tensor,
         sdf: torch.Tensor,
-        boundary_types: torch.Tensor,
     ) -> torch.Tensor:
         """Concatenate the same logical inputs as the real LossComputer."""
 
-        parts = [x, y, sdf]
-        if boundary_types is not None:
-            parts.append(boundary_types)
-        return torch.cat(parts, dim=1)
+        return torch.cat([x, y, sdf], dim=1)
 
     def apply_velocity_dirichlet_constraint(
         self,

@@ -45,20 +45,6 @@ class GeometryConfigDict(TypedDict):
     verbose: bool
 
 
-class GeomConfigFileParamsDict(TypedDict, total=False):
-    """
-    Параметры для загрузки геометрии из файла.
-
-    Attributes:
-        source_type: Тип источника ('file' или 'inline' для профиля, 'config' или 'file' для тройника)
-        file_path: Путь к файлу с геометрией
-        file_format: Формат файла ('csv', 'txt', 'dat', 'npy', 'step', 'iges')
-    """
-    source_type: Literal['file', 'inline', 'config']
-    file_path: str
-    file_format: str
-
-
 class AirfoilDomainParamsDict(TypedDict, total=False):
     """
     Параметры расчётной области для профиля.
@@ -157,7 +143,8 @@ class CollocationPointDict(TypedDict):
         id: Уникальный идентификатор точки
         x: X-координата [м]
         y: Y-координата [м]
-        boundary_type: Тип границы ('inlet', 'outlet', 'wall', 'symmetry', 'axis_symmetry', 'interior')
+        boundary_type: Тип границы ('inlet', 'outlet', 'farfield',
+            'slip_wall', 'wall', 'symmetry', 'axis_symmetry', 'interior')
         on_airfoil: Находится ли точка на профиле
         on_boundary: Находится ли точка на границе
         segment_id: ID сегмента границы
@@ -169,6 +156,8 @@ class CollocationPointDict(TypedDict):
     on_airfoil: bool
     on_boundary: bool
     segment_id: int
+    normal_x: float
+    normal_y: float
 
 
 class SamplerConfigDict(TypedDict, total=False):
@@ -195,6 +184,8 @@ class SamplerConfigDict(TypedDict, total=False):
         sampling_method: Метод генерации ('regular', 'irregular', 'adaptive_foil', 'adaptive_all', 'normal_layer')
         adaptive_alpha: Степень сгущения (для адаптивных методов)
         adaptive_epsilon_factor: Масштаб сгущения (для адаптивных методов)
+        geom_type: Тип геометрии
+        geom_name: Явное имя геометрического артефакта
     """
     num_processes: int
     step_size: float
@@ -233,6 +224,8 @@ class SamplerConfigDict(TypedDict, total=False):
     normal_layer_min_point_distance_factor: float
     normal_layer_max_points: Optional[int]
     normal_layer_fill_remaining: bool
+    geom_type: str
+    geom_name: Optional[str]
 
 
 # =============================================================================
@@ -341,6 +334,10 @@ class InitializerMetadataDict(TypedDict, total=False):
         Re: Число Рейнольдса
         normalized: Флаг нормализации данных
         sdf_norm_factor: Фактор нормализации SDF
+        geometry_reference: Физический масштаб активной геометрии
+        normalization: Описание масштабов безразмеривания
+        sampling_points_file: Имя исходного файла collocation-точек
+        delta_bl_model: Модель оценки толщины пограничного слоя
         inlet_u_norm: Нормированная скорость U на входе
         inlet_v_norm: Нормированная скорость V на входе
     """
@@ -361,6 +358,10 @@ class InitializerMetadataDict(TypedDict, total=False):
     Re: float
     normalized: bool
     sdf_norm_factor: float
+    geometry_reference: Dict[str, object]
+    normalization: Dict[str, object]
+    sampling_points_file: str
+    delta_bl_model: str
     inlet_u_norm: float
     inlet_v_norm: float
 
@@ -373,17 +374,43 @@ class InputParamsDict(TypedDict, total=False):
     """Параметры входа модели."""
     coordinates: bool
     sdf: bool
-    boundary_types: bool
     inlet_velocity: bool
     viscosity: bool
     density: bool
     fluid_file: Optional[str]
 
 
+class FeatureToggleDict(TypedDict, total=False):
+    """Enable/disable one manifest-driven input feature."""
+    enabled: bool
+
+
+class ReynoldsFeatureDict(FeatureToggleDict, total=False):
+    """Log-scaled chord Reynolds input configuration."""
+    range: List[float]
+
+
+class GeometryFeaturesDict(FeatureToggleDict, total=False):
+    """Ordered dimensionless geometry parameter configuration."""
+    names: List[str]
+
+
+class InputFeaturesDict(TypedDict, total=False):
+    """Modern manifest-driven neural-network input configuration."""
+    coordinates: Union[bool, FeatureToggleDict]
+    sdf: Union[bool, FeatureToggleDict]
+    reynolds: Union[bool, ReynoldsFeatureDict]
+    angle_of_attack: Union[bool, FeatureToggleDict]
+    pressure_drop_coefficient: Union[bool, FeatureToggleDict]
+    geometry_parameters: Union[bool, GeometryFeaturesDict]
+
+
 class ArchitectureDict(TypedDict, total=False):
     """Архитектура нейронной сети."""
     hidden_layers: List[int]
     activation: str
+    siren_first_omega_0: float
+    siren_hidden_omega_0: float
     output_dim: int
     output_bias: Union[List[float], Tuple[float, ...]]
     coordinate_scaling: 'CoordinateScalingDict'
@@ -406,7 +433,24 @@ class PDEConfigDict(TypedDict, total=False):
 
 class BoundaryConditionsConfigDict(TypedDict, total=False):
     """Конфигурация граничных условий."""
+    wall: 'BoundaryRuleConfigDict'
+    inlet: 'BoundaryRuleConfigDict'
+    farfield: 'BoundaryRuleConfigDict'
+    outlet: 'BoundaryRuleConfigDict'
+    velocity_dirichlet: 'BoundaryRuleConfigDict'
+    slip_wall: 'BoundaryRuleConfigDict'
+    slip: 'BoundaryRuleConfigDict'  # Legacy alias for slip_wall.
+    symmetry: 'BoundaryRuleConfigDict'
+    axis_symmetry: 'BoundaryRuleConfigDict'
+    # Legacy input accepted only as ``soft``; global hard is invalid.
     type: str
+
+
+class BoundaryRuleConfigDict(TypedDict, total=False):
+    """Physical kind and enforcement mode of one named boundary."""
+    kind: str
+    enforcement: Literal['soft', 'hard']
+    distance_scale: float
 
 
 class LossWeightsConfigDict(TypedDict, total=False):
@@ -427,6 +471,7 @@ class FVMLossConfigDict(TypedDict, total=False):
     weight: float
     batch_interval: int
     reduction: str
+    schedule: str
 
 
 class TrainingConfigDict(TypedDict, total=False):
@@ -468,6 +513,9 @@ class EarlyStoppingDict(TypedDict, total=False):
 class OutputConfigDict(TypedDict, total=False):
     """Конфигурация вывода."""
     console_only: bool
+    progress_bar: bool
+    progress_bar_force: bool
+    progress_mininterval: float
     graphical_window: 'GraphicalWindowDict'
     plot_frequency: int
 
@@ -482,6 +530,9 @@ class GraphicalWindowDict(TypedDict, total=False):
 class CheckpointConfigDict(TypedDict, total=False):
     """Конфигурация контрольных точек."""
     interval: int
+    load_mode: str
+    strict_contract: bool
+    allow_legacy_without_contract: bool
     name_pattern: str
     model_name_pattern: str
     save_flow_images: bool
@@ -535,6 +586,7 @@ class DiagnosticsConfigDict(TypedDict, total=False):
     strict_autograd: bool
     save_rar_history: bool
     mass_metrics_interval: int
+    section_flow: Dict[str, Any]
 
 
 class FullConfigDict(TypedDict, total=False):
@@ -545,6 +597,7 @@ class FullConfigDict(TypedDict, total=False):
     """
     project_name: str
     input_params: InputParamsDict
+    input_features: InputFeaturesDict
     architecture: ArchitectureDict
     pde: PDEConfigDict
     boundary_conditions: BoundaryConditionsConfigDict
@@ -613,7 +666,6 @@ class L2ErrorDict(TypedDict):
 __all__ = [
     # Геометрия
     'GeometryConfigDict',
-    'GeomConfigFileParamsDict',
     'AirfoilDomainParamsDict',
     'AirfoilParamsDict',
     'DomainParamsDict',
@@ -631,6 +683,10 @@ __all__ = [
     'InitializerMetadataDict',
     # Конфигурация
     'InputParamsDict',
+    'FeatureToggleDict',
+    'ReynoldsFeatureDict',
+    'GeometryFeaturesDict',
+    'InputFeaturesDict',
     'ArchitectureDict',
     'CoordinateScalingDict',
     'PDEConfigDict',
