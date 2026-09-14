@@ -29,6 +29,9 @@ import multiprocessing as mp
 from functools import partial
 
 from scipy.spatial import cKDTree
+from pipe_bend_pinn.geometry.sdf import PolylineDistanceField
+from pipe_bend_pinn.data.normalization import ReferenceScales
+from pipe_bend_pinn.sampling.core import load_domain
 from pipe_bend_pinn.physics.fluids import FluidLibrary, Fluid
 from pipe_bend_pinn.physics.conditions import ConditionsManager, BoundaryConditions
 GEOMETRY_DIR = GEOMETRY_DOMAINS_DIR
@@ -93,6 +96,8 @@ class Initializer:
         self.mu: Optional[float] = None
         self.inlet_y_min: Optional[float] = None
         self.inlet_y_max: Optional[float] = None
+        self.velocity_initial_mode: Optional[str] = None
+        self.psi_initial: Optional[np.ndarray] = None
 
     def load_sampler_points(self, filename: Optional[str] = None) -> np.ndarray:
         """Загружает точки коллокации из Sampler."""
@@ -156,6 +161,131 @@ class Initializer:
                 return float(pw)
         logger.warning("pipe_width не найден, используется 0.5 м по умолчанию")
         return 0.5
+
+    def _ordered_wall_chains(self, tol_factor: float = 2.0) -> List[np.ndarray]:
+        """Разбивает точки стенок на упорядоченные цепочки по большим разрывам.
+
+        Точки стенок в коллокации сгенерированы по периметру контура, поэтому в
+        массиве они идут подряд вдоль стенки. Между концом внутренней стенки и
+        началом внешней (через вход/выход) есть разрыв размером ~pipe_width.
+        Разделяем по этим разрывам, получая отдельные открытые полилинии.
+        """
+        if self.wall_points is None or len(self.wall_points) < 2:
+            return []
+        pts = np.asarray(self.wall_points, dtype=np.float64)
+        if not np.allclose(pts[0], pts[-1]):
+            pts = np.vstack([pts, pts[0:1]])
+        delta = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        median_gap = float(np.median(delta))
+        threshold = tol_factor * max(median_gap, 1e-12)
+        breaks = np.where(delta > threshold)[0]
+        chains = []
+        start = 0
+        for boundary in np.append(breaks, len(pts) - 1):
+            chain = pts[start:boundary + 1]
+            if len(chain) >= 2:
+                chains.append(chain)
+            start = boundary + 1
+        return chains
+
+    def _compute_segment_sdf(self, xs: np.ndarray, ys: np.ndarray) -> Optional[np.ndarray]:
+        """Точный сегментный SDF через PolylineDistanceField (в метрах).
+
+        Возвращает массив расстояний до ближайшей стенки; None — если
+        упорядоченные цепочки стенок построить не удалось.
+        """
+        chains = self._ordered_wall_chains()
+        if not chains:
+            return None
+        query = np.column_stack((xs, ys))
+        distance = None
+        for chain in chains:
+            field = PolylineDistanceField(chain, closed=False, segment_chunk_size=256)
+            d = field.evaluate_numpy(query, point_chunk_size=8192)
+            distance = d if distance is None else np.minimum(distance, d)
+        return distance
+
+    def _stream_function_geometry(self) -> Tuple[Optional[float], Optional[float]]:
+        """Возвращает (R_outer, R_inner) из геометрии отвода или (None, None).
+
+        Контур домена лежит в абсолютных координатах с центром изгиба в (0, 0):
+        внешняя дуга радиусом R_outer, внутренняя — R_inner.
+        """
+        try:
+            domain = load_domain()
+        except Exception:
+            return None, None
+        if domain is None or len(domain) < 4:
+            return None, None
+        r_outer = float(-np.min(domain[:, 1]))
+        width = max(self.pipe_width or 0.0, 1e-12)
+        return r_outer, r_outer - width
+
+    def _compute_stream_function_field(
+        self, u0: float, v_in: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Начальное поле через функцию тока ψ: u = ∂ψ/∂y, v = −∂ψ/∂x.
+
+        Поле по построению бездивергентно (div u = 0 тождественно), что даёт
+        физически согласованную стартовую точку для PINN. Профиль поперёк
+        канала — параболический (Пуазейль): F(t) = 2t² − (4/3)t³.
+
+        В прямых участках поперечная координата t отсчитывается от внешней
+        стенки, в изгибе — радиально от внешней дуги. ψ непрерывна на стыках.
+        """
+        x = self.points['x']
+        y = self.points['y']
+        N = len(x)
+        r_outer, r_inner = self._stream_function_geometry()
+        width = self.pipe_width if self.pipe_width else 1.0
+
+        def poiseuille(t: np.ndarray) -> np.ndarray:
+            t = np.clip(t, 0.0, 1.0)
+            return 2.0 * t**2 - (4.0 / 3.0) * t**3
+
+        if r_outer is None or r_inner is None:
+            # Запасной вариант: поперечная координата только по y (входной канал).
+            if 'boundary_type' in self.points.dtype.names:
+                inlet_mask = self.points['boundary_type'] == 'inlet'
+                if np.any(inlet_mask):
+                    y0, y1 = float(np.min(y[inlet_mask])), float(np.max(y[inlet_mask]))
+                else:
+                    y0, y1 = float(np.min(y)), float(np.max(y))
+            else:
+                y0, y1 = float(np.min(y)), float(np.max(y))
+            channel = max(y1 - y0, 1e-12)
+            t = np.clip((y - y0) / channel, 0.0, 1.0)
+            psi = u0 * channel * poiseuille(t)
+            u = u0 * (4.0 * t - 4.0 * t**2)
+            v = np.full(N, v_in)
+            return u, v, psi
+
+        r = np.hypot(x, y)
+        eps = 1e-9
+        psi = np.zeros(N)
+        u = np.zeros(N)
+        v = np.zeros(N)
+        for i in range(N):
+            xi, yi = x[i], y[i]
+            if xi <= eps and yi <= eps:
+                # Входной канал: x <= 0, y in [-R_outer, -R_inner]
+                t = float(np.clip((yi + r_outer) / width, 0.0, 1.0))
+                psi[i] = u0 * width * poiseuille(np.array(t))
+                u[i] = u0 * (4.0 * t - 4.0 * t**2)
+            elif xi >= -eps and yi >= -eps:
+                # Выходной канал: y >= 0, x in [R_inner, R_outer]
+                t = float(np.clip((xi - r_inner) / width, 0.0, 1.0))
+                psi[i] = u0 * width * (poiseuille(np.array(1.0)) - poiseuille(np.array(t)))
+                v[i] = u0 * (4.0 * t - 4.0 * t**2)
+            else:
+                # Изгиб: x > 0, y < 0, r in [R_inner, R_outer]
+                ri = max(r[i], 1e-12)
+                t = float(np.clip((r_outer - ri) / width, 0.0, 1.0))
+                psi[i] = u0 * width * poiseuille(np.array(t))
+                fprime = u0 * (4.0 * t - 4.0 * t**2)
+                u[i] = -fprime * yi / ri
+                v[i] = fprime * xi / ri
+        return u, v, psi
 
     def select_fluid(self) -> str:
         """Интерактивный выбор жидкости."""
@@ -247,6 +377,7 @@ class Initializer:
         u0 = self.conditions.inlet_u
 
         if velocity_initial_mode == 'parabolic':
+            self.velocity_initial_mode = 'parabolic'
             # Параболический профиль на входе, линейное затухание по длине канала
             y = self.points['y']
             if 'boundary_type' in self.points.dtype.names:
@@ -276,7 +407,14 @@ class Initializer:
             # профиль на выходе развивается из PDE. Баланс массы обеспечивается
             # integral_condition в LossComputer. В данных на выходе остаётся
             # только p = outlet_pressure (p_norm = 0).
+        elif velocity_initial_mode == 'stream_function':
+            # Функция тока: psi = ∫u dy, u = ∂ψ/∂y, v = −∂ψ/∂x.
+            # Начальное поле бездивергентно по построению.
+            self.velocity_initial_mode = 'stream_function'
+            u_phys, v_phys, psi_phys = self._compute_stream_function_field(u0, v_in)
+            self.psi_initial = psi_phys
         else:
+            self.velocity_initial_mode = 'constant'
             u_phys = np.full(N, u0)
             v_phys = np.full(N, v_in)
 
@@ -312,26 +450,31 @@ class Initializer:
             logger.info("Вычисление SDF...")
             xs = self.points['x'].copy()
             ys = self.points['y'].copy()
-            if num_processes is None:
-                num_processes = mp.cpu_count()
-            num_processes = min(num_processes, N, 16)
-            if num_processes > 1:
-                logger.info(f"Используется процессов: {num_processes}")
-                indices = np.arange(N)
-                chunks = np.array_split(indices, num_processes)
-                sdf_phys = np.zeros(N)
-                for chunk_idx in chunks:
-                    for i in chunk_idx:
-                        dx = xs[i] - self.wall_points[:, 0]
-                        dy = ys[i] - self.wall_points[:, 1]
-                        dist_sq = dx**2 + dy**2
-                        sdf_phys[i] = np.sqrt(np.min(dist_sq))
-            else:
-                tree = cKDTree(self.wall_points)
-                sdf_phys = np.zeros(N)
-                for i in range(N):
-                    dist, _ = tree.query(np.array([xs[i], ys[i]]), k=1)
-                    sdf_phys[i] = dist
+            # Основной путь: точный сегментный SDF по полилиниям стенок.
+            sdf_phys = self._compute_segment_sdf(xs, ys)
+            if sdf_phys is None:
+                # Запасной путь: cKDTree по точкам стенок.
+                logger.info("Сегментный SDF недоступен, использую cKDTree по точкам стенок.")
+                if num_processes is None:
+                    num_processes = mp.cpu_count()
+                num_processes = min(num_processes, N, 16)
+                if num_processes > 1:
+                    logger.info(f"Используется процессов: {num_processes}")
+                    indices = np.arange(N)
+                    chunks = np.array_split(indices, num_processes)
+                    sdf_phys = np.zeros(N)
+                    for chunk_idx in chunks:
+                        for i in chunk_idx:
+                            dx = xs[i] - self.wall_points[:, 0]
+                            dy = ys[i] - self.wall_points[:, 1]
+                            dist_sq = dx**2 + dy**2
+                            sdf_phys[i] = np.sqrt(np.min(dist_sq))
+                else:
+                    tree = cKDTree(self.wall_points)
+                    sdf_phys = np.zeros(N)
+                    for i in range(N):
+                        dist, _ = tree.query(np.array([xs[i], ys[i]]), k=1)
+                        sdf_phys[i] = dist
 
         arr_norm['sdf_norm'] = sdf_phys / self.pipe_width
         self.points_norm = arr_norm
@@ -347,6 +490,19 @@ class Initializer:
 
         inlet_u_norm = self.conditions.inlet_u / self.U_inf if self.U_inf > 0 else 1.0
         inlet_v_norm = self.conditions.inlet_v / self.U_inf if self.U_inf > 0 else 0.0
+        # Единая система масштабов (порт ReferenceScales из Airfoil PINN)
+        try:
+            reference = ReferenceScales(
+                pipe_width=self.pipe_width,
+                velocity=self.U_inf,
+                density=self.rho,
+                dynamic_viscosity=self.mu,
+                static_pressure=self.p_ref,
+            )
+            normalization_reference = reference.to_metadata()
+        except Exception as exc:
+            logger.warning(f"Не удалось построить ReferenceScales: {exc}")
+            normalization_reference = None
         meta = {
             'description': description,
             'fluid_name': self.fluid_name,
@@ -363,10 +519,19 @@ class Initializer:
             'inlet_u_norm': inlet_u_norm,
             'inlet_v_norm': inlet_v_norm,
             'geom_type': 'pipe_bend',
+            'velocity_initial_mode': self.velocity_initial_mode,
+            'field_role': 'initial_guess_only',
+            'supervised_reference': False,
+            'normalization_reference': normalization_reference,
         }
         meta_path = os.path.join(self.output_dir, f"{description}_metadata.npy")
         np.save(meta_path, meta)
         logger.info(f"Метаданные сохранены: {meta_path}")
+        # Первичное поле через функцию тока: сохраняем ψ отдельным файлом.
+        if self.psi_initial is not None:
+            psi_path = os.path.join(self.output_dir, f"{description}_psi.npy")
+            np.save(psi_path, np.asarray(self.psi_initial, dtype=np.float64))
+            logger.info(f"Функция тока сохранена: {psi_path}")
 
     def plot_field(self, field_name: str, title: Optional[str] = None,
                    save: bool = True, show: bool = False) -> None:
@@ -436,8 +601,14 @@ def initialize_menu() -> None:
     print("\nРежим начального поля скорости:")
     print("   1 - параболический профиль (Пуазейль)")
     print("   2 - постоянное")
-    vel_choice = input("Выберите (1/2): ").strip()
-    vel_mode = 'parabolic' if vel_choice == '1' else 'constant'
+    print("   3 - функция тока (бездивергентное поле)")
+    vel_choice = input("Выберите (1/2/3): ").strip()
+    if vel_choice == '1':
+        vel_mode = 'parabolic'
+    elif vel_choice == '3':
+        vel_mode = 'stream_function'
+    else:
+        vel_mode = 'constant'
     print("\n🔧 Вычисление нормализованных полей...")
     try:
         init.initialize_fields(pressure_mode='linear_x', velocity_initial_mode=vel_mode)

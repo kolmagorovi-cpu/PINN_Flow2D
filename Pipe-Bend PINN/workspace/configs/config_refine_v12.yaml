@@ -1,0 +1,154 @@
+# Pipe-Bend v12: ЭТАП 1 — давление-Нейман на стенке (замыкание pressure-Poisson).
+# База: v6-polish, датасет v6 (9315 точек), loss-постановка v6 (mom/pp=2, ref off,
+# σ=3). Добавлен терм wall_pressure: на wall-точках нормальная невязка momentum
+# (0.5·∂p/∂n = ν·(∇²u)·n), нормали — по контуру области (геометрия-агностично).
+# Гипотеза: «двухслойность» у стенок = недостающее ГУ для p; терм фиксирует
+# градиент давления у стенки и убирает инверсию ∂Cp/∂r у внутренней стенки.
+
+project_name: pipe_bend_refine_v12
+
+flow_type: planar
+
+architecture:
+  hidden_layers:
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+  activation: gelu
+  output_dim: 3
+  output_bias: [0.0, 0.0, 0.0]
+  residual: true
+  fourier_features:
+    enabled: true
+    n_frequencies: 32
+    sigma: 3.0
+    gamma: 1.0
+  coordinate_scaling:
+    enabled: true
+    scale_factor: 0.25
+    input_min: -6.0
+    input_max: 6.0
+
+pde:
+  system: incompressible_navier_stokes
+  flow_type: planar
+
+boundary_conditions:
+  type: soft
+
+loss_weights:
+  pde_weights:
+    cont: 1.0
+    mom_x: 2.0
+    mom_y: 2.0
+  bc_weights:
+    inlet: 50.0
+    outlet: 50.0
+    wall: 200.0
+  adaptive_bc: true
+  use_sa_weights: true
+  sa_apply_to_bc: false
+  sa_lr: 0.01
+  integral_condition: true
+  integral_weight: 500.0
+  fvm:
+    enabled: true
+    weight: 10.0
+    balance_weight: 10.0
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+    batch_interval: 1
+  pressure_gauge:
+    enabled: true
+    weight: 0.1
+  reference_field:
+    enabled: false
+    weight: 0.0
+  pressure_poisson:
+    enabled: true
+    weight: 2.0
+  # Давление-Нейман на стенке (Этап 1): нормальная невязка momentum на wall-точках.
+  wall_pressure:
+    enabled: true
+    weight: 5.0
+
+training:
+  epochs: 2500
+  batch_size: 5000
+  gradient_accumulation_steps: 1
+  two_stage: false
+  stage1_epochs: 1000
+  stage2_pde_weight_start: 0.1
+  stage2_pde_weight_end: 1.0
+  stage2_ramp_epochs: 7000
+  lr_schedule: cosine
+  lr_cosine_eta_min: 0.000005
+  lr_cyclic_period: 100
+  lr_cyclic_amplitude: 0.5
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  reset_interval: 0
+  reset_noise: 0.01
+  grad_clip: 1.0
+  rar_enable: true
+  rar_interval: 1000
+  rar_num_points: 200
+  switch_to_lbfgs_epoch: 0
+  lbfgs_max_iter: 50
+  lbfgs_history_size: 100
+  early_stopping:
+    enabled: false
+    patience: 100
+    min_delta: 1e-6
+    restore_best: true
+
+optimizer_params:
+  lr: 0.0005
+  lbfgs_lr: 1.0
+
+process:
+  load_model_path: workspace/experiments/pipe_bend_refine_v6_polish_20260903_165657/checkpoints/pinn_final.pt
+  device: cuda
+  num_gpus: 1
+  dtype: float32
+  use_amp: false
+  seed: 42
+  torch_compile: false
+
+output:
+  console_only: true
+  graphical_window:
+    loss: true
+    pde: true
+    bc: false
+  plot_frequency: 100
+
+data:
+  points_file: workspace/initial/fields/initial.npy
+
+reference:
+  path: null
+
+diagnostics:
+  interval: 50
+  plot_residual_map: true
+  plot_profiles: true
+  profile_sections: [0.2, 0.5, 0.8]
+  plot_spectrum: true
+  spectrum_section_x: 0.5
+  plot_2d_spectrum: false
+  spectrum_2d_resolution: 256
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  save_rar_history: true
+
+enable_key_listener: false
+checkpoint_dir: workspace/experiments
+checkpoint:
+  interval: 500
+  name_pattern: '{project_name}_{timestamp}'
+  model_name_pattern: '{project_name}_{timestamp}'

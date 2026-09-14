@@ -191,6 +191,28 @@ class ConfigManager:
                 'sa_lr': 0.01,
                 'integral_condition': False,
                 'integral_weight': 0.0,
+                'fvm': {
+                    'enabled': False,
+                    'weight': 25.0,
+                    'reduction': 'divergence_l2_volume',
+                    'schedule': 'every_optimizer_step',
+                    'batch_interval': 1,
+                },
+                # Пристеночное усиление PDE: w_nw = 1 + mult·exp(-sdf/width)
+                # домножает выбранные компоненты pde_raw (весь NS: cont+mom,
+                # чтобы momentum у стенки не «развязывал» массу).
+                'near_wall_pde': {
+                    'enabled': False,
+                    'weight_mult': 8.0,
+                    'width_norm': 0.2,
+                    'apply_to': ['cont', 'mom_x', 'mom_y'],
+                },
+                'pressure_gauge': {'enabled': True, 'weight': 0.1},
+                'reference_field': {'enabled': False, 'weight': 0.0},
+                'pressure_poisson': {'enabled': False, 'weight': 0.0},
+                # Давление-Нейман на стенке: нормальная невязка momentum на
+                # wall-точках замыкает pressure-Poisson (0.5·∂p/∂n = ν·(∇²u)·n).
+                'wall_pressure': {'enabled': False, 'weight': 10.0},
             },
             'training': {
                 'two_stage': False,

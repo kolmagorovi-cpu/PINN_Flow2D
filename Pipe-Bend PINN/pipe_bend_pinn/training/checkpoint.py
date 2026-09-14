@@ -20,6 +20,7 @@ import logging
 from typing import Dict, Optional, Any
 
 from pipe_bend_pinn.training.models import SelfAdaptiveWeights
+from pipe_bend_pinn.training.reproducibility import capture_rng_state
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class CheckpointManager:
             'history': history,
             'epoch': epoch,
             'config': config,
+            'rng_state': capture_rng_state(),
         }
         if sa_weights is not None:
             checkpoint['sa_weights_state_dict'] = sa_weights.state_dict()

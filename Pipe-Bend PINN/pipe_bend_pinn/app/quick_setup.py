@@ -81,9 +81,22 @@ def quick_setup() -> None:
         init.fluid_name = fluid_name
         init.conditions_name = cond_name
 
-        init.initialize_fields(pressure_mode="linear_x", velocity_initial_mode="parabolic")
+        print(f"{Colors.CYAN}Режим начального поля скорости:{Colors.RESET}")
+        print("   1 - параболический профиль (Пуазейль) [по умолчанию]")
+        print("   2 - функция тока (бездивергентное поле)")
+        print("   3 - постоянное")
+        vel_choice = input("Выберите [1]: ").strip()
+        if vel_choice == '2':
+            vel_mode = "stream_function"
+        elif vel_choice == '3':
+            vel_mode = "constant"
+        else:
+            vel_mode = "parabolic"
+
+        init.initialize_fields(pressure_mode="linear_x", velocity_initial_mode=vel_mode)
         init.save(description="initial")
         print(f"      U_inf = {init.U_inf:.3f} м/с, Re = {init.Re:.2e}")
+        print(f"      Начальное поле: {vel_mode}")
         print(f"{Colors.GREEN}✅ Инициализация завершена{Colors.RESET}")
     except Exception as e:
         print(f"{Colors.RED}❌ Ошибка инициализации: {e}{Colors.RESET}")

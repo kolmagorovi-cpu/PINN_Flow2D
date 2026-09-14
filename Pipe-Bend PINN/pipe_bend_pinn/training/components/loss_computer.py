@@ -22,6 +22,7 @@ BC: inlet, outlet, wall (без symmetry).
 import torch
 import torch.nn as nn
 import logging
+import numpy as np
 from typing import Dict, Optional, Tuple
 
 from pipe_bend_pinn.physics.pde import PDEResiduals
@@ -69,9 +70,72 @@ class LossComputer:
         self.integral_condition = lw.get('integral_condition', False)
         self.integral_weight = lw.get('integral_weight', 100000.0)
 
+        # Слабая supervised-привязка к начальному полю (функция тока):
+        # якорь против дрейфа модели в нефизичный минимум на внутренних точках.
+        ref_cfg = lw.get('reference_field', {})
+        self.reference_weight = float(ref_cfg.get('weight', 0.0)) if isinstance(ref_cfg, dict) else 0.0
+
+        # Pressure-Poisson: ∇²p + 2·∇·(u·∇u) = 0 (развивает градиент давления).
+        pp_cfg = lw.get('pressure_poisson', {})
+        self.pp_weight = float(pp_cfg.get('weight', 0.0)) if isinstance(pp_cfg, dict) else 0.0
+
         # SA-веса
         self.use_sa_weights = lw.get('use_sa_weights', False)
         self.sa_apply_to_bc = lw.get('sa_apply_to_bc', False)
+
+        # Пристеночное усиление PDE (вариант 1, скорректированный): у стенок
+        # центробежный источник 2·uθ²/r → 0, и физический ∂p/∂n там задаётся
+        # вязким балансом пограничного слоя. Усиливать надо ВЕСЬ NS (momentum
+        # И continuity вместе), иначе модель «удовлетворяет» momentum ценой
+        # искажения скорости и разбаланса массы (эффект v7: balance 17.6%).
+        # Ядро w_nw = 1 + mult·exp(-sdf/width) (sdf нормирован на pipe_width)
+        # домножает выбранные компоненты pde_raw (apply_to), не трогая BC.
+        nw_cfg = lw.get('near_wall_pde', lw.get('near_wall_momentum', {}))
+        self.nw_enabled = bool(nw_cfg.get('enabled', False)) if isinstance(nw_cfg, dict) else False
+        self.nw_mult = float(nw_cfg.get('weight_mult', 8.0)) if isinstance(nw_cfg, dict) else 0.0
+        self.nw_width = float(nw_cfg.get('width_norm', 0.2)) if isinstance(nw_cfg, dict) else 0.2
+        nw_apply = nw_cfg.get('apply_to') if isinstance(nw_cfg, dict) else None
+        if nw_apply is None:
+            # совместимость с v7-ключом near_wall_momentum (только momentum)
+            self.nw_apply_to = frozenset(['mom_x', 'mom_y'])
+        else:
+            self.nw_apply_to = frozenset(str(c).strip() for c in nw_apply)
+
+        # Давление-Нейман на стенке (Этап 1): нормальная невязка momentum на
+        # wall-точках замыкает pressure-Poisson (0.5·∂p/∂n = ν·(∇²u)·n) и убирает
+        # гармоническую свободу p у стенок («двухслойность»). Нормали берутся из
+        # data_handler.wall_normals (геометрия-агностично, по контуру области).
+        wp_cfg = lw.get('wall_pressure', {})
+        self.wp_enabled = bool(wp_cfg.get('enabled', False)) if isinstance(wp_cfg, dict) else False
+        self.wp_weight = float(wp_cfg.get('weight', 10.0)) if isinstance(wp_cfg, dict) else 0.0
+        self.wp_components = str(wp_cfg.get('components', 'normal')) if isinstance(wp_cfg, dict) else 'normal'
+        self._wall_nx = None
+        self._wall_ny = None
+        self.wall_idx_in_bt = None
+        wnorm = getattr(self.data_handler, 'wall_normals', None)
+        if self.wp_enabled and wnorm is not None:
+            self._wall_nx = torch.tensor(np.ascontiguousarray(wnorm[:, 0]),
+                                         dtype=self.dtype, device=self.device).view(-1, 1)
+            self._wall_ny = torch.tensor(np.ascontiguousarray(wnorm[:, 1]),
+                                         dtype=self.dtype, device=self.device).view(-1, 1)
+        names = self.data_handler.boundary_type_names
+        if 'wall' in names:
+            self.wall_idx_in_bt = names.index('wall')
+
+    def _near_wall_kernel(self, sdf: torch.Tensor) -> torch.Tensor:
+        """Возвращает (B,1) множитель весов PDE: больше у стенки (sdf→0)."""
+        if not self.nw_enabled or self.nw_mult <= 0.0:
+            return torch.ones_like(sdf)
+        return (1.0 + self.nw_mult * torch.exp(-sdf / max(self.nw_width, 1e-6))).detach()
+
+    def refresh_normals(self) -> None:
+        """Пересоздаёт GPU-тензоры нормалей после расширения датасета (RAR)."""
+        wnorm = getattr(self.data_handler, 'wall_normals', None)
+        if wnorm is not None:
+            self._wall_nx = torch.tensor(np.ascontiguousarray(wnorm[:, 0]),
+                                         dtype=self.dtype, device=self.device).view(-1, 1)
+            self._wall_ny = torch.tensor(np.ascontiguousarray(wnorm[:, 1]),
+                                         dtype=self.dtype, device=self.device).view(-1, 1)
 
     def build_input_tensor(self, x: torch.Tensor, y: torch.Tensor,
                            sdf: torch.Tensor, bt: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -152,24 +216,72 @@ class LossComputer:
         bc_comp = self._compute_bc_loss(u, v, p, bt, mask_u, mask_v, mask_p,
                                          u_bc, v_bc, p_bc)
 
-        # Взвешенная сумма PDE (SA-PINN: per-point веса масштабируют вклад точек)
+        # Взвешенная сумма PDE (SA-PINN: per-point веса масштабируют вклад точек).
+        # Пристеночное ядро w_nw домножает выбранные компоненты pde_raw
+        # (по умолчанию весь NS: cont+mom_x+mom_y, чтобы не «развязывать» массу).
         w_cont = self.pde_weights.get('cont', 1.0)
         w_mom_x = self.pde_weights.get('mom_x', 1.0)
         w_mom_y = self.pde_weights.get('mom_y', 1.0)
+        w_nw = self._near_wall_kernel(sdf)   # (B,1), без градиента
+        wcomp = {'cont': w_cont, 'mom_x': w_mom_x, 'mom_y': w_mom_y}
+        pde_keys = ['cont', 'mom_x', 'mom_y']
 
         if sa_weights is not None:
             sa_out = sa_weights()                     # (N, 3) — per-point веса
             idx_dev = idx.to(self.device)             # DataLoader отдаёт idx на CPU
             wb = sa_out[idx_dev]                      # (B, 3) — веса для точек батча
-            loss_pde = (wb[:, 0:1] * w_cont * pde_raw['cont'] +
-                        wb[:, 1:2] * w_mom_x * pde_raw['mom_x'] +
-                        wb[:, 2:3] * w_mom_y * pde_raw['mom_y']).mean()
+            loss_pde = sum(
+                (wb[:, ci:ci + 1] * wcomp[key] * (w_nw if key in self.nw_apply_to else 1.0) * pde_raw[key]).mean()
+                for ci, key in enumerate(pde_keys)
+            )
         else:
-            loss_pde = (w_cont * pde_raw['cont'].mean() +
-                        w_mom_x * pde_raw['mom_x'].mean() +
-                        w_mom_y * pde_raw['mom_y'].mean())
+            loss_pde = sum(
+                wcomp[key] * (pde_raw[key] * (w_nw if key in self.nw_apply_to else 1.0)).mean()
+                for key in pde_keys
+            )
 
         loss_bc = sum(bc_comp.values())
+
+        # Pressure-Poisson: развивает градиент давления (часть PDE-слагаемых).
+        if self.pp_weight > 0:
+            pp_res = PDEResiduals.compute_pressure_poisson_residual(
+                u, v, p, x, y, safe_grad
+            )
+            loss_pde = loss_pde + self.pp_weight * pp_res.mean()
+
+        # Давление-Нейман на стенке (замыкание pressure-Poisson). Режимы:
+        #  'normal' — нормальная проекция momentum (0.5·∇p − ν·∇²u)·n;
+        #  'full'    — обе компоненты momentum на wall-точках (задаёт и ∂p/∂n,
+        #             и ∂p/∂s, «протягивающий» уровень давления вдоль стенки).
+        # Считаем на всём батче (у не-wall строк нормаль=0 — они не войдут в маску).
+        if self.wp_weight > 0 and self.wall_idx_in_bt is not None \
+                and bt is not None and bt.shape[1] > self.wall_idx_in_bt:
+            wm = bt[:, self.wall_idx_in_bt] > 0.5
+            if bool(wm.any()):
+                if self.wp_components == 'full':
+                    wp_res = pde_raw['mom_x'] + pde_raw['mom_y']
+                elif self._wall_nx is not None:
+                    idx_dev = idx.to(self.device)
+                    nx_b = self._wall_nx[idx_dev]
+                    ny_b = self._wall_ny[idx_dev]
+                    wp_res = PDEResiduals.compute_wall_normal_momentum_residual(
+                        u, v, p, x, y, nx_b, ny_b,
+                        self.rho_norm, self.mu_norm, safe_grad,
+                    )
+                else:
+                    wp_res = None
+                if wp_res is not None:
+                    loss_pde = loss_pde + self.wp_weight * wp_res[wm].mean()
+
+        # Слабая привязка к начальному полю (функция тока) на внутренних точках:
+        # якорь против дрейфа модели в нефизичный минимум.
+        if self.reference_weight > 0 and bt is not None and bt.shape[1] > 0:
+            interior = (bt.sum(dim=1, keepdim=True) < 0.5)
+            if bool(interior.any()):
+                n_int = interior.sum().clamp_min(1)
+                loss_ref = (((u - u_bc) ** 2) * interior).sum() / n_int
+                loss_ref = loss_ref + (((v - v_bc) ** 2) * interior).sum() / n_int
+                loss_bc = loss_bc + self.reference_weight * loss_ref
 
         # Интегральное условие (баланс масс)
         integral_loss = 0.0

@@ -1,0 +1,151 @@
+# L-BFGS-полировка результата v6-refine (pinn_final.pt, 2500 эпох Adam, сгущённая
+# коллокация 9315 точек). Цель: дожать momentum/pressure-Poisson на сгущённой
+# коллокации -> развить амплитуду давления (v6 дал dCp@45 +0.012 -> +0.044).
+# L-BFGS с полным батчем и history=200 вызывает OOM на 8 ГБ: рабочий режим
+# batch_size=4000, history_size=20, 6 эпох.
+
+project_name: pipe_bend_refine_v6_polish
+
+flow_type: planar
+
+architecture:
+  hidden_layers:
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+  activation: gelu
+  output_dim: 3
+  output_bias: [0.0, 0.0, 0.0]
+  residual: true
+  fourier_features:
+    enabled: true
+    n_frequencies: 32
+    sigma: 3.0
+    gamma: 1.0
+  coordinate_scaling:
+    enabled: true
+    scale_factor: 0.25
+    input_min: -6.0
+    input_max: 6.0
+
+pde:
+  system: incompressible_navier_stokes
+  flow_type: planar
+
+boundary_conditions:
+  type: soft
+
+loss_weights:
+  pde_weights:
+    cont: 1.0
+    mom_x: 2.0
+    mom_y: 2.0
+  bc_weights:
+    inlet: 50.0
+    outlet: 50.0
+    wall: 200.0
+  adaptive_bc: true
+  use_sa_weights: false
+  sa_apply_to_bc: false
+  sa_lr: 0.01
+  integral_condition: true
+  integral_weight: 500.0
+  fvm:
+    enabled: true
+    weight: 10.0
+    balance_weight: 10.0
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+    batch_interval: 1
+  pressure_gauge:
+    enabled: true
+    weight: 0.1
+  # Якорь выключен: полировка чистых momentum/PP невязок.
+  reference_field:
+    enabled: false
+    weight: 0.0
+  # Pressure-Poisson УСИЛЕН (0.1 -> 2.0): принуждает развить градиент давления.
+  pressure_poisson:
+    enabled: true
+    weight: 2.0
+
+training:
+  epochs: 6
+  batch_size: 4000
+  gradient_accumulation_steps: 1
+  two_stage: false
+  stage1_epochs: 0
+  stage2_pde_weight_start: 1.0
+  stage2_pde_weight_end: 1.0
+  stage2_ramp_epochs: 0
+  lr_schedule: cosine
+  lr_cosine_eta_min: 0.00001
+  lr_cyclic_period: 100
+  lr_cyclic_amplitude: 0.5
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  reset_interval: 0
+  reset_noise: 0.01
+  grad_clip: 1.0
+  rar_enable: false
+  rar_interval: 1000
+  rar_num_points: 200
+  switch_to_lbfgs_epoch: 1
+  lbfgs_max_iter: 100
+  lbfgs_history_size: 20
+  early_stopping:
+    enabled: false
+    patience: 100
+    min_delta: 1e-6
+    restore_best: true
+
+optimizer_params:
+  lr: 0.001
+  lbfgs_lr: 1.0
+
+process:
+  load_model_path: workspace/experiments/pipe_bend_refine_v6_20260903_160046/checkpoints/pinn_final.pt
+  device: cuda
+  num_gpus: 1
+  dtype: float32
+  use_amp: false
+  seed: 42
+  torch_compile: false
+
+output:
+  console_only: true
+  graphical_window:
+    loss: true
+    pde: true
+    bc: false
+  plot_frequency: 100
+
+data:
+  points_file: workspace/initial/fields/initial.npy
+
+reference:
+  path: null
+
+diagnostics:
+  interval: 50
+  plot_residual_map: true
+  plot_profiles: true
+  profile_sections: [0.2, 0.5, 0.8]
+  plot_spectrum: true
+  spectrum_section_x: 0.5
+  plot_2d_spectrum: false
+  spectrum_2d_resolution: 256
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  save_rar_history: true
+
+enable_key_listener: false
+checkpoint_dir: workspace/experiments
+checkpoint:
+  interval: 1000
+  name_pattern: '{project_name}_{timestamp}'
+  model_name_pattern: '{project_name}_{timestamp}'

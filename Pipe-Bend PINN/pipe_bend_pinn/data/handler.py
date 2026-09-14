@@ -257,6 +257,13 @@ class DataHandler:
     def add_points(self, indices: torch.Tensor) -> None:
         """Добавляет точки в датасет (для RAR)."""
         self.dataset = self.dataset.extend(indices)
+        # При добавлении точек (RAR) синхронно расширяем нормали к стенкам,
+        # иначе wall_pressure-член получит out-of-bounds при индексации.
+        if getattr(self, 'wall_normals', None) is not None:
+            idx_np = indices.detach().cpu().numpy()
+            self.wall_normals = np.concatenate(
+                [self.wall_normals, self.wall_normals[idx_np]], axis=0
+            )
         self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=self.shuffle)
         logger.info(f"Датасет расширен: добавлено {len(indices)} точек, всего {self.n_points}")
 

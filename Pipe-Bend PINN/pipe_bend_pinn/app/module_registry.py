@@ -64,6 +64,15 @@ def default_modules() -> tuple[ModuleDescriptor, ...]:
             description="Генерация точек коллокации с классификацией границ",
         ),
         ModuleDescriptor(
+            code="M2D",
+            command="mesh",
+            name="FVM-сетка (Mesh2D)",
+            module="pipe_bend_pinn.sampling.mesh.cli",
+            function="m2d",
+            status="готов",
+            description="Построение boundary-fitted сетки и проверка консервативности",
+        ),
+        ModuleDescriptor(
             code="Fluids",
             command="fluids",
             name="Свойства жидкости",

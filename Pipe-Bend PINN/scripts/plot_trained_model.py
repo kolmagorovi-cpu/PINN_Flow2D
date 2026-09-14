@@ -159,9 +159,16 @@ def plot_from_checkpoint(checkpoint_path: str, output_dir: str = None) -> None:
                                                      bt_s.to(device) if bt_s.shape[1] > 0 else None)
     actual_input_dim = input_tensor.shape[1]
     arch = config.get('architecture', {})
-    model = PINNIncompressible(input_dim=actual_input_dim, layers=arch.get('hidden_layers', [50,50,50,50]),
-                                activation=arch.get('activation', 'tanh'), output_dim=arch.get('output_dim', 3),
-                                output_bias=arch.get('output_bias', [0.0,0.0,0.0]))
+    model = PINNIncompressible(
+        input_dim=actual_input_dim,
+        layers=arch.get('hidden_layers', [50, 50, 50, 50]),
+        activation=arch.get('activation', 'tanh'),
+        output_dim=arch.get('output_dim', 3),
+        output_bias=arch.get('output_bias', [0.0, 0.0, 0.0]),
+        coordinate_scaling=arch.get('coordinate_scaling'),
+        fourier_features=arch.get('fourier_features'),
+        residual=bool(arch.get('residual', False)),
+    )
     model.eval()
     
     if 'model_state_dict' in checkpoint:

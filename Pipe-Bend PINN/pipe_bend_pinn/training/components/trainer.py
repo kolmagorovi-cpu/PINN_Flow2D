@@ -35,7 +35,13 @@ class Trainer:
 
     def __init__(self, model, optimizer, loss_computer, data_handler,
                  config: Dict, device, dtype, sa_weights=None, scaler=None,
-                 using_lbfgs=False, diagnostics_config: Optional[Dict] = None):
+                 using_lbfgs=False, diagnostics_config: Optional[Dict] = None,
+                 fvm_residuals=None, fvm_coords=None, fvm_sdf=None,
+                 fvm_weight: float = 10.0,
+                 fvm_reduction: str = 'divergence_l2_volume',
+                 gauge_weight: float = 0.0,
+                 balance_weight: float = 0.0,
+                 pipe_width: float = 1.0):
         self.model = model
         self.optimizer = optimizer
         self.loss_computer = loss_computer
@@ -57,10 +63,70 @@ class Trainer:
         self.reset_interval = config.get('reset_interval', 0)
         self.reset_noise = config.get('reset_noise', 0.01)
 
+        # FVM-невязка неразрывности на Mesh2D как РЕАЛЬНОЕ слагаемое loss.
+        # fvm_coords/fvm_sdf — координаты и SDF узлов сетки в порядке узлов Mesh2D.
+        self.fvm_residuals = fvm_residuals
+        self.fvm_coords = fvm_coords
+        self.fvm_sdf = fvm_sdf
+        self.fvm_weight = float(fvm_weight)
+        self.fvm_reduction = fvm_reduction
+        self.gauge_weight = float(gauge_weight)
+        self.balance_weight = float(balance_weight)
+        self.pipe_width = float(pipe_width) if pipe_width else 1.0
+        self.fvm_enabled = (
+            fvm_residuals is not None
+            and fvm_coords is not None
+            and fvm_sdf is not None
+        )
+        if self.fvm_enabled:
+            logger.info("Trainer: FVM-невязка включена в loss (weight=%.2f)",
+                        self.fvm_weight)
+
         self.sa_weights_changed = False
         self.point_residual = np.zeros(data_handler.n_points)
         self.point_pde_residual = np.zeros(data_handler.n_points)
         self.rar_history = []
+
+    def _compute_fvm_loss_term(self, pde_mult: float = 1.0) -> Optional[torch.Tensor]:
+        """Дифференцируемая FVM-невязка неразрывности + pressure gauge.
+
+        Полный проход по узлам Mesh2D (не по батчам). Вход — мягкий (профиль на
+        входе задаётся BC-потерей). Возвращает тензор с autograd-графом или None.
+        """
+        if not self.fvm_enabled:
+            return None
+        # Модель обучена на НОРМИРОВАННЫХ входах (x/W, y/W, sdf/W); сетка же
+        # построена по размерным координатам коллокации. Обязательно нормируем.
+        coords = np.asarray(self.fvm_coords, dtype=np.float64) / self.pipe_width
+        sdf = np.asarray(self.fvm_sdf, dtype=np.float64) / self.pipe_width
+        x = torch.as_tensor(coords[:, 0], device=self.device,
+                            dtype=self.dtype).reshape(-1, 1)
+        y = torch.as_tensor(coords[:, 1], device=self.device,
+                            dtype=self.dtype).reshape(-1, 1)
+        s = torch.as_tensor(sdf, device=self.device, dtype=self.dtype).reshape(-1, 1)
+        inp = torch.cat([x, y, s], dim=1)
+        out = self.model(inp)
+        u = out[:, :2]
+        p = out[:, 2]
+        try:
+            self.fvm_residuals.reset_prescribed('inlet')
+        except Exception:
+            pass
+        loss = self.fvm_residuals.mass_loss(u, reduction=self.fvm_reduction)
+        # Глобальный баланс масс по граничным граням сетки (по Гауссу):
+        # для бездивергентного поля Σ u·S по ВСЕМ граням = 0; стенки уже
+        # замаскированы нулевым потоком, поэтому балансируем вход и выход.
+        if self.balance_weight > 0:
+            fvm = self.fvm_residuals
+            inlet_mask = fvm.bnd_type == 1  # BC_CODES['inlet']
+            outlet_mask = fvm.bnd_type == 2  # BC_CODES['outlet']
+            if bool(inlet_mask.any()) and bool(outlet_mask.any()):
+                q_in = (u[fvm.bnd_node[inlet_mask]] * fvm.bnd_S[inlet_mask]).sum()
+                q_out = (u[fvm.bnd_node[outlet_mask]] * fvm.bnd_S[outlet_mask]).sum()
+                loss = loss + self.balance_weight * (q_in + q_out).square()
+        if self.gauge_weight > 0:
+            loss = loss + self.gauge_weight * p.mean().square()
+        return pde_mult * loss
 
     def _autocast_context(self):
         """AMP context manager."""
@@ -105,6 +171,11 @@ class Trainer:
         # Иначе optimizer.step() никогда не вызывается и веса не обновляются.
         n_total_batches = max(1, math.ceil(self.data_handler.n_points / max(1, self.batch_size)))
 
+        # FVM-невязка неразрывности на полной сетке Mesh2D — одно слагаемое
+        # на эпоху (как "every optimizer step"), масштабируется pde_mult.
+        with self._autocast_context():
+            fvm_term = self._compute_fvm_loss_term(pde_mult)
+
         for batch_idx, batch in enumerate(self._get_batches()):
             # Прямой проход → словарь
             with self._autocast_context():
@@ -112,6 +183,11 @@ class Trainer:
                                                           sa_weights=self.sa_weights)
 
             loss = result['loss']
+
+            # FVM-слагаемое добавляем к первому батчу эпохи (градиент идёт в тот
+            # же optimizer step). Вес — из конфига loss_weights.fvm.weight.
+            if batch_idx == 0 and fvm_term is not None:
+                loss = loss + self.fvm_weight * fvm_term
 
             if self.gradient_accumulation_steps > 1:
                 loss = loss / self.gradient_accumulation_steps
@@ -282,6 +358,14 @@ class Trainer:
 
         self.rar_history.append({'rar_added': len(top_indices)})
         self.sa_weights_changed = True
+
+        # Обновляем GPU-тензоры нормалей стенок после расширения датасета.
+        lc = getattr(self, 'loss_computer', None)
+        if lc is not None:
+            try:
+                lc.refresh_normals()
+            except Exception as exc:
+                logger.warning(f"Не удалось обновить нормали после RAR: {exc}")
 
     def compute_grad_norms_separately(self, batch) -> Dict:
         """

@@ -1,5 +1,7 @@
 # Конфигурация Pipe-Bend PINN (ламинарный Re=500, pressure-outlet, плотная сетка)
-# Сеть: Fourier features + 6x256 GeLU + residual. Обучение: two-stage + cosine LR (Adam).
+# Сеть: Fourier features + 6x256 GeLU + residual. Обучение: two-stage + cosine LR (Adam),
+# полировка L-BFGS с эпохи 12000, RAR, SA-PINN, FVM-невязка неразрывности В ЛOSS (Mesh2D).
+# Инициализация поля — через функцию тока (бездивергентное стартовое поле).
 
 project_name: pipe_bend_laminar
 
@@ -36,30 +38,57 @@ boundary_conditions:
   type: soft
 
 loss_weights:
+  # Ребаланс: ранее cont=50 при mom=1 давило неразрывность и не давало развиться
+  # градиенту давления (плоское p, нефизичный поворот в изгибе). Теперь равные веса.
   pde_weights:
-    cont: 50.0
+    cont: 1.0
     mom_x: 1.0
     mom_y: 1.0
   bc_weights:
     inlet: 50.0
     outlet: 50.0
-    wall: 50.0
+    wall: 200.0
   adaptive_bc: true
   use_sa_weights: true
-  sa_apply_to_bc: true
+  # SA-веса применяем только к PDE: веса BC фиксированы и сильные,
+  # чтобы no-slip и профиль на входе не «размазывались» адаптацией.
+  sa_apply_to_bc: false
   sa_lr: 0.01
   integral_condition: true
-  integral_weight: 200.0
+  integral_weight: 500.0
+  # FVM-невязка неразрывности на контрольных объёмах Mesh2D — РЕАЛЬНОЕ слагаемое loss.
+  # balance_weight: глобальный баланс масс по граничным граням сетки (по Гауссу),
+  # исключает «компенсацию дисбаланса» проскальзыванием на стенках.
+  fvm:
+    enabled: true
+    weight: 10.0
+    balance_weight: 10.0
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+    batch_interval: 1
+  # Давление: мягкая калибровка уровня (mean p ≈ 0), ломает gauge-симметрию.
+  pressure_gauge:
+    enabled: true
+    weight: 0.1
+  # Слабая supervised-привязка к начальному полю (функция тока) на внутренних
+  # точках: якорь против дрейфа модели в нефизичный минимум.
+  reference_field:
+    enabled: true
+    weight: 0.5
+  # Pressure-Poisson: ∇²p + 2·∇·(u·∇u) = 0 — развивает градиент давления.
+  pressure_poisson:
+    enabled: true
+    weight: 0.1
 
 training:
-  epochs: 20000
+  epochs: 10000
   batch_size: 5000
   gradient_accumulation_steps: 1
   two_stage: true
-  stage1_epochs: 2000
+  stage1_epochs: 1000
   stage2_pde_weight_start: 0.1
   stage2_pde_weight_end: 1.0
-  stage2_ramp_epochs: 12000
+  stage2_ramp_epochs: 7000
   lr_schedule: cosine
   lr_cosine_eta_min: 0.00001
   lr_cyclic_period: 100
@@ -73,8 +102,9 @@ training:
   rar_enable: true
   rar_interval: 1000
   rar_num_points: 200
+  # L-BFGS пока выключен: сначала оценим результат Adam с новыми термами.
   switch_to_lbfgs_epoch: 0
-  lbfgs_max_iter: 20
+  lbfgs_max_iter: 50
   lbfgs_history_size: 100
   early_stopping:
     enabled: false
@@ -88,11 +118,16 @@ optimizer_params:
 
 process:
   load_model_path: null
-  device: auto
+  # Явно CUDA: venv содержит torch 2.11.0+cu128 (RTX 5060). 'auto' тоже резолвится
+  # в cuda при torch.cuda.is_available(), но фиксируем, чтобы исключить сомнения.
+  device: cuda
   num_gpus: 1
   dtype: float32
   use_amp: false
   seed: 42
+  # Опциональная компиляция модели torch.compile (полезно на GPU; на CPU
+  # часто не даёт выигрыша и увеличивает время старта).
+  torch_compile: false
 
 output:
   console_only: true

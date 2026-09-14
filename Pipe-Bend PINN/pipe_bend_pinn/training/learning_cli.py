@@ -157,6 +157,29 @@ def create_config(cfg: ConfigManager) -> None:
     two_stage = input("Двухэтапное обучение? (y/N): ").strip().lower()
     cfg.config['training']['two_stage'] = two_stage in ('y', 'yes')
 
+    # RAR (адаптивное сгущение точек коллокации)
+    rar = input("RAR-адаптация точек коллокации? (Y/n): ").strip().lower()
+    cfg.config['training']['rar_enable'] = rar not in ('n', 'no')
+
+    # L-BFGS полировка в конце обучения
+    lbfgs = input("L-BFGS полировка: эпоха переключения [0 = выкл, 16000]: ").strip()
+    if lbfgs:
+        cfg.config['training']['switch_to_lbfgs_epoch'] = int(lbfgs)
+
+    # FVM-диагностика неразрывности (Mesh2D)
+    fvm = input("FVM-диагностика неразрывности (Mesh2D)? (y/N): ").strip().lower()
+    cfg.config['loss_weights']['fvm'] = {
+        'enabled': fvm in ('y', 'yes'),
+        'weight': 25.0,
+        'reduction': 'divergence_l2_volume',
+        'schedule': 'every_optimizer_step',
+        'batch_interval': 1,
+    }
+
+    # torch.compile (GPU)
+    tcompile = input("torch.compile модели (GPU)? (y/N): ").strip().lower()
+    cfg.config['process']['torch_compile'] = tcompile in ('y', 'yes')
+
     print("✅ Конфигурация создана.")
     input("Нажмите Enter...")
 

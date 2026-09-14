@@ -1,0 +1,167 @@
+# Pipe-Bend v11: ЭКСПЕРИМЕНТ A-2 — обучение С НУЛЯ при σ=48 (было 3), частотный
+# диапазон λ≈0.26 м (достаточно для пристеночной структуры ~0.1–0.2 м).
+# База: config.yaml (полный цикл v5, 10000 эпох, two-stage), но load_model_path
+# = null (с нуля, чтобы высокочастотный базис обучался согласованно, без
+# «пересадки» весов, обученных под σ=3). Изменяется ТОЛЬКО fourier sigma.
+# Цель: проверить, уходит ли инверсия ∂Cp/∂r у внутренней стенки («двухслойность»)
+# при достаточной представимости высоких частот.
+
+project_name: pipe_bend_refine_v11
+
+flow_type: planar
+
+architecture:
+  hidden_layers:
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+  activation: gelu
+  output_dim: 3
+  output_bias: [0.0, 0.0, 0.0]
+  residual: true
+  fourier_features:
+    enabled: true
+    n_frequencies: 32
+    sigma: 48.0
+    gamma: 1.0
+  coordinate_scaling:
+    enabled: true
+    scale_factor: 0.25
+    input_min: -6.0
+    input_max: 6.0
+
+pde:
+  system: incompressible_navier_stokes
+  flow_type: planar
+
+boundary_conditions:
+  type: soft
+
+loss_weights:
+  # Постановка потерь — как в v6/v10b (mom/pp усилены, reference выкл):
+  # изолируем влияние ТОЛЬКО fourier sigma (48 против 12).
+  pde_weights:
+    cont: 1.0
+    mom_x: 2.0
+    mom_y: 2.0
+  bc_weights:
+    inlet: 50.0
+    outlet: 50.0
+    wall: 200.0
+  adaptive_bc: true
+  use_sa_weights: true
+  # SA-веса применяем только к PDE: веса BC фиксированы и сильные,
+  # чтобы no-slip и профиль на входе не «размазывались» адаптацией.
+  sa_apply_to_bc: false
+  sa_lr: 0.01
+  integral_condition: true
+  integral_weight: 500.0
+  # FVM-невязка неразрывности на контрольных объёмах Mesh2D — РЕАЛЬНОЕ слагаемое loss.
+  # balance_weight: глобальный баланс масс по граничным граням сетки (по Гауссу),
+  # исключает «компенсацию дисбаланса» проскальзыванием на стенках.
+  fvm:
+    enabled: true
+    weight: 10.0
+    balance_weight: 10.0
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+    batch_interval: 1
+  # Давление: мягкая калибровка уровня (mean p ≈ 0), ломает gauge-симметрию.
+  pressure_gauge:
+    enabled: true
+    weight: 0.1
+  # Слабая supervised-привязка к начальному полю (функция тока) — ВЫКЛЮЧЕНА
+  # (как в v6/v10b); якорь искажал бы скорость в изгибе.
+  reference_field:
+    enabled: false
+    weight: 0.0
+  # Pressure-Poisson: ∇²p + 2·∇·(u·∇u) = 0 — развивает градиент давления.
+  pressure_poisson:
+    enabled: true
+    weight: 2.0
+
+training:
+  epochs: 10000
+  batch_size: 5000
+  gradient_accumulation_steps: 1
+  two_stage: true
+  stage1_epochs: 1000
+  stage2_pde_weight_start: 0.1
+  stage2_pde_weight_end: 1.0
+  stage2_ramp_epochs: 7000
+  lr_schedule: cosine
+  lr_cosine_eta_min: 0.00001
+  lr_cyclic_period: 100
+  lr_cyclic_amplitude: 0.5
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  reset_interval: 0
+  reset_noise: 0.01
+  grad_clip: 1.0
+  rar_enable: true
+  rar_interval: 1000
+  rar_num_points: 200
+  # L-BFGS пока выключен: сначала оценим результат Adam с новыми термами.
+  switch_to_lbfgs_epoch: 0
+  lbfgs_max_iter: 50
+  lbfgs_history_size: 100
+  early_stopping:
+    enabled: false
+    patience: 100
+    min_delta: 1e-6
+    restore_best: true
+
+optimizer_params:
+  lr: 0.001
+  lbfgs_lr: 1.0
+
+process:
+  load_model_path: null
+  # Явно CUDA: venv содержит torch 2.11.0+cu128 (RTX 5060). 'auto' тоже резолвится
+  # в cuda при torch.cuda.is_available(), но фиксируем, чтобы исключить сомнения.
+  device: cuda
+  num_gpus: 1
+  dtype: float32
+  use_amp: false
+  seed: 42
+  # Опциональная компиляция модели torch.compile (полезно на GPU; на CPU
+  # часто не даёт выигрыша и увеличивает время старта).
+  torch_compile: false
+
+output:
+  console_only: true
+  graphical_window:
+    loss: true
+    pde: true
+    bc: false
+  plot_frequency: 100
+
+data:
+  points_file: workspace/initial/fields/initial.npy
+
+reference:
+  path: null
+
+diagnostics:
+  interval: 50
+  plot_residual_map: true
+  plot_profiles: true
+  profile_sections: [0.2, 0.5, 0.8]
+  plot_spectrum: true
+  spectrum_section_x: 0.5
+  plot_2d_spectrum: false
+  spectrum_2d_resolution: 256
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  save_rar_history: true
+
+enable_key_listener: false
+checkpoint_dir: workspace/experiments
+checkpoint:
+  interval: 1000
+  name_pattern: '{project_name}_{timestamp}'
+  model_name_pattern: '{project_name}_{timestamp}'
