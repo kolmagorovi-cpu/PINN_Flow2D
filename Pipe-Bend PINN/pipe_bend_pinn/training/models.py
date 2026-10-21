@@ -79,7 +79,10 @@ class PINNIncompressible(nn.Module):
         output_bias: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         coordinate_scaling: Optional[Dict] = None,
         fourier_features: Optional[Dict] = None,
-        residual: bool = False
+        residual: bool = False,
+        parametric: bool = False,
+        spatial_dim: int = 3,
+        param_dim: int = 1,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -87,6 +90,19 @@ class PINNIncompressible(nn.Module):
         self.activation_name = activation
         self.activation = self._get_activation(activation)
         self.residual = bool(residual)
+
+        # Параметрический режим: 4-й вход — безразмерный параметр Re (re_norm).
+        # Fourier-признаки применяются ТОЛЬКО к пространственным входам, а
+        # параметр конкатенируется после них: иначе каждая скорость получала бы
+        # собственный случайный embedding и обобщение по Re ломалось бы.
+        self.parametric = bool(parametric)
+        self.spatial_dim = int(spatial_dim) if self.parametric else int(input_dim)
+        self.param_dim = int(param_dim) if self.parametric else 0
+        if self.parametric and self.spatial_dim + self.param_dim != int(input_dim):
+            raise ValueError(
+                "parametric: spatial_dim + param_dim = "
+                f"{self.spatial_dim + self.param_dim} != input_dim = {input_dim}"
+            )
 
         self.coordinate_scaling = coordinate_scaling or {'enabled': False, 'scale_factor': 1.0}
         self.scale_factor = self.coordinate_scaling.get('scale_factor', 1.0) if self.coordinate_scaling.get('enabled', False) else 1.0
@@ -96,14 +112,14 @@ class PINNIncompressible(nn.Module):
         ff_cfg = fourier_features or {}
         if ff_cfg.get('enabled', False):
             self.fourier = FourierFeatures(
-                in_dim=input_dim,
+                in_dim=self.spatial_dim,
                 n_frequencies=ff_cfg.get('n_frequencies', 32),
                 sigma=ff_cfg.get('sigma', 3.0),
                 gamma=ff_cfg.get('gamma', 1.0),
             )
-            prev = self.fourier.output_dim(input_dim)
+            prev = self.fourier.output_dim(self.spatial_dim) + self.param_dim
         else:
-            prev = input_dim
+            prev = self.spatial_dim + self.param_dim
 
         for hidden in layers:
             if prev == hidden and self.residual:
@@ -153,13 +169,23 @@ class PINNIncompressible(nn.Module):
         init.xavier_uniform_(self.output_layer.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.coordinate_scaling.get('enabled', False):
-            h = x * self.scale_factor
+        if self.parametric:
+            spatial = x[:, :self.spatial_dim]
+            param = x[:, self.spatial_dim:]
         else:
-            h = x
+            spatial = x
+            param = None
+
+        if self.coordinate_scaling.get('enabled', False):
+            h = spatial * self.scale_factor
+        else:
+            h = spatial
 
         if self.fourier is not None:
             h = self.fourier(h)
+
+        if param is not None:
+            h = torch.cat([h, param], dim=1)
 
         for layer in self.hidden_layers:
             if isinstance(layer, ResidualBlock):

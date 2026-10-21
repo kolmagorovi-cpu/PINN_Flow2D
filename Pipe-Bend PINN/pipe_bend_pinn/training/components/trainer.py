@@ -41,7 +41,9 @@ class Trainer:
                  fvm_reduction: str = 'divergence_l2_volume',
                  gauge_weight: float = 0.0,
                  balance_weight: float = 0.0,
-                 pipe_width: float = 1.0):
+                 pipe_width: float = 1.0,
+                 cfd_dataloader=None,
+                 data_weight: float = 0.0):
         self.model = model
         self.optimizer = optimizer
         self.loss_computer = loss_computer
@@ -87,6 +89,25 @@ class Trainer:
         self.point_pde_residual = np.zeros(data_handler.n_points)
         self.rar_history = []
 
+        # Data-loss по CFD-полям (включается конфигом loss_weights.data_loss).
+        self.cfd_dataloader = cfd_dataloader
+        self.data_weight = float(data_weight)
+        self._cfd_iter = None
+        self.last_data_loss = 0.0
+        self.last_data_comp: Dict[str, float] = {}
+
+    def _next_data_batch(self):
+        """Возвращает следующий батч CFD-данных (циклически)."""
+        if self.cfd_dataloader is None:
+            return None
+        if self._cfd_iter is None:
+            self._cfd_iter = iter(self.cfd_dataloader)
+        try:
+            return next(self._cfd_iter)
+        except StopIteration:
+            self._cfd_iter = iter(self.cfd_dataloader)
+            return next(self._cfd_iter)
+
     def _compute_fvm_loss_term(self, pde_mult: float = 1.0) -> Optional[torch.Tensor]:
         """Дифференцируемая FVM-невязка неразрывности + pressure gauge.
 
@@ -104,7 +125,7 @@ class Trainer:
         y = torch.as_tensor(coords[:, 1], device=self.device,
                             dtype=self.dtype).reshape(-1, 1)
         s = torch.as_tensor(sdf, device=self.device, dtype=self.dtype).reshape(-1, 1)
-        inp = torch.cat([x, y, s], dim=1)
+        inp = self.loss_computer.build_input_tensor(x, y, s)
         out = self.model(inp)
         u = out[:, :2]
         p = out[:, 2]
@@ -165,6 +186,9 @@ class Trainer:
         max_pde = 0.0
         n_batches = 0
         total_grad = 0.0
+        total_data_loss = 0.0
+        data_batches = 0
+        self.last_data_comp = {}
 
         # Критично: шаг оптимизатора должен выполняться в т.ч. на последнем
         # батче эпохи, если число батчей меньше gradient_accumulation_steps.
@@ -177,12 +201,19 @@ class Trainer:
             fvm_term = self._compute_fvm_loss_term(pde_mult)
 
         for batch_idx, batch in enumerate(self._get_batches()):
+            data_batch = self._next_data_batch()
             # Прямой проход → словарь
             with self._autocast_context():
-                result = self.loss_computer.compute_loss(batch, self.model, pde_mult,
-                                                          sa_weights=self.sa_weights)
+                result = self.loss_computer.compute_loss(
+                    batch, self.model, pde_mult, sa_weights=self.sa_weights,
+                    data_batch=data_batch,
+                )
 
             loss = result['loss']
+            if data_batch is not None:
+                total_data_loss += float(result.get('data_loss', 0.0))
+                data_batches += 1
+                self.last_data_comp = result.get('data_comp', {})
 
             # FVM-слагаемое добавляем к первому батчу эпохи (градиент идёт в тот
             # же optimizer step). Вес — из конфига loss_weights.fvm.weight.
@@ -233,6 +264,7 @@ class Trainer:
         avg_wall = total_wall_speed / max(n_batches, 1)
 
         grad_norm = last_grad_norm if n_batches > 0 else 0.0
+        self.last_data_loss = total_data_loss / max(data_batches, 1)
 
         return avg_loss, avg_pde, avg_bc, total_integral, avg_wall, max_pde, 0.0, grad_norm
 
@@ -260,7 +292,9 @@ class Trainer:
         def closure():
             self.optimizer.zero_grad()
             batch = next(iter(self.data_handler.get_dataloader()))
-            result = self.loss_computer.compute_loss(batch, self.model)
+            result = self.loss_computer.compute_loss(
+                batch, self.model, data_batch=self._next_data_batch()
+            )
             loss = result['loss']
             loss.backward()
             return loss
@@ -278,8 +312,12 @@ class Trainer:
 
         # Получаем потери после шага
         batch = next(iter(self.data_handler.get_dataloader()))
-        result = self.loss_computer.compute_loss(batch, self.model)
+        result = self.loss_computer.compute_loss(
+            batch, self.model, data_batch=self._next_data_batch()
+        )
         avg_loss = result['loss'].item()
+        self.last_data_loss = float(result.get('data_loss', 0.0))
+        self.last_data_comp = result.get('data_comp', {})
         avg_pde = result['pde_raw']
         avg_bc = result['bc_comp']
         avg_wall = result['wall_speed']
@@ -305,17 +343,19 @@ class Trainer:
         sdf_t = dataset.sdf.to(self.device, dtype=self.dtype)
         bt = dataset.boundary_types.to(self.device, dtype=self.dtype) if dataset.boundary_types is not None else None
 
-        input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt)
+        re_norm = self.loss_computer.make_re_norm(x_t)
+        input_tensor = self.loss_computer.build_input_tensor(x_t, y_t, sdf_t, bt, re_norm)
         out = self.model(input_tensor)
         u, v, p = out[:, 0:1], out[:, 1:2], out[:, 2:3]
 
         from pipe_bend_pinn.physics.pde import PDEResiduals
         from pipe_bend_pinn.utils.helpers import safe_grad
 
+        mu_batch = self.loss_computer.mu_from_re_norm(re_norm)
         residuals = PDEResiduals.compute_residuals_2d(
             u, v, p, x_t, y_t,
             torch.tensor(1.0, device=self.device),
-            torch.tensor(1.0 / self.data_handler.Re, device=self.device),
+            mu_batch,
             safe_grad
         )
 

@@ -99,13 +99,46 @@ class PINNSolver:
         # data_handler, откуда их забирает LossComputer.
         self._attach_wall_normals()
 
+        # --- CFD-данные (опционально): параметризация по Re + data-loss ------
+        self.cfd_handler = None
+        self.cfd_dataloader = None
+        self.re_ref = float(Re)
+        self.data_loss_enabled = bool(
+            config.get('loss_weights', {}).get('data_loss', {}).get('enabled', False)
+        )
+        cfd_cfg = config.get('data', {}).get('cfd', {}) or {}
+        if cfd_cfg.get('enabled', False):
+            try:
+                from pipe_bend_pinn_data import CFDataHandler
+            except ImportError:
+                sys.path.insert(0, str(PROJECT_ROOT))
+                from pipe_bend_pinn_data import CFDataHandler
+            self.cfd_handler = CFDataHandler(
+                cfd_cfg['manifest'],
+                device=self.device,
+                dtype=self.dtype,
+                strict=bool(cfd_cfg.get('strict', False)),
+            ).load()
+            self.cfd_dataloader = self.cfd_handler.dataloader(
+                batch_size=int(cfd_cfg.get('batch_size', config['training']['batch_size'])),
+                shuffle=True,
+            )
+            self.re_ref = float(self.cfd_handler.ref_scales.reynolds)
+            logger.info(
+                "CFD-данные подключены: %d точек, %d кейсов, Re_ref=%.1f",
+                len(self.cfd_handler), self.cfd_handler.data.n_cases, self.re_ref,
+            )
+        else:
+            logger.info("CFD-данные отключены (data.cfd.enabled=false)")
+
         # LossComputer
         self.loss_computer = LossComputer(
             config=config, data_handler=self.data_handler,
             rho_norm=self.rho_norm, mu_norm=self.mu_norm,
             x_min=self.x_min, x_max=self.x_max,
             y_min=self.y_min, y_max=self.y_max,
-            device=self.device, dtype=self.dtype
+            device=self.device, dtype=self.dtype,
+            re_ref=self.re_ref,
         )
 
         # Self-Adaptive Weights
@@ -161,6 +194,8 @@ class PINNSolver:
             gauge_weight=float(lw_cfg.get('pressure_gauge', {}).get('weight', 0.0)),
             balance_weight=float(lw_cfg.get('fvm', {}).get('balance_weight', 0.0)),
             pipe_width=float(getattr(self.data_handler, 'pipe_width', 1.0) or 1.0),
+            cfd_dataloader=self.cfd_dataloader,
+            data_weight=float(lw_cfg.get('data_loss', {}).get('weight', 0.0)),
         )
 
         # MetricsCollector
@@ -370,6 +405,7 @@ class PINNSolver:
                 self.device, self.dtype,
                 reduction=self.config.get('loss_weights', {}).get('fvm', {}).get('reduction', 'divergence_l2_volume'),
                 inlet_velocity=inlet_vel,
+                parametric=bool(self.config.get('architecture', {}).get('parametric', False)),
             )
             return mse, rms
         except Exception as exc:
@@ -438,13 +474,15 @@ class PINNSolver:
 
     def _build_model(self) -> PINNIncompressible:
         arch = self.config['architecture']
+        parametric = bool(arch.get('parametric', False))
         sample_batch = next(iter(self.data_handler.get_dataloader()))
         _, x, y, sdf, bt, _, _, _, _, _, _ = sample_batch
         x = x.to(self.device)
         y = y.to(self.device)
         sdf = sdf.to(self.device)
         bt = bt.to(self.device) if bt.shape[1] > 0 else None
-        input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt)
+        re_norm = torch.ones_like(x) if parametric else None
+        input_tensor = self.loss_computer.build_input_tensor(x, y, sdf, bt, re_norm)
         actual_input_dim = input_tensor.shape[1]
         coord_scaling = arch.get('coordinate_scaling', {'enabled': False, 'scale_factor': 1.0})
         return PINNIncompressible(
@@ -456,6 +494,9 @@ class PINNSolver:
             coordinate_scaling=coord_scaling,
             fourier_features=arch.get('fourier_features', None),
             residual=arch.get('residual', False),
+            parametric=parametric,
+            spatial_dim=int(arch.get('spatial_dim', 3)),
+            param_dim=int(arch.get('param_dim', 1)),
         )
 
     def _maybe_compile_model(self, model: nn.Module) -> nn.Module:
@@ -804,6 +845,17 @@ class PINNSolver:
                     wall_speed, pde_max, pde_rate, grad_norm,
                     extra_diag
                 )
+                # Data-loss (если включён) — в историю метрик.
+                self.metrics.history.setdefault('data_loss', []).append(
+                    float(getattr(self.trainer, 'last_data_loss', 0.0))
+                )
+                if self.data_loss_enabled:
+                    logger.info(
+                        "  data_loss=%.3e",
+                        float(getattr(self.trainer, 'last_data_loss', 0.0)),
+                    )
+                for key, value in getattr(self.trainer, 'last_data_comp', {}).items():
+                    self.metrics.history.setdefault(key, []).append(float(value))
                 # Запись строки в CSV (иначе metrics.csv остаётся пустым)
                 try:
                     self.metrics.add_row_to_csv(epoch, loss, pde_raw, bc_comp, wall_speed, pde_max)

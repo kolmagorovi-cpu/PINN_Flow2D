@@ -1,0 +1,176 @@
+# Конфигурация Pipe-Bend PINN с CFD-данными (параметрический режим + data-loss).
+# Сеть: (x, y, sdf, re_norm) -> (u, v, p); Fourier только по (x, y, sdf).
+# Включает data-loss по CFD-полям; PDE/BC остаются регуляризаторами.
+#
+# ВАЖНО: CSV в манифесте должны быть экспортированы с геометрии PB_R100
+# (bend center (0,0), R=1.0, D=0.5; вход x=-2, выход y=+2). Пример
+# docs/export.csv снят с ДРУГОЙ геометрии и при strict=true не пройдёт
+# валидацию (outside_domain).
+
+project_name: pipe_bend_cfd_parametric
+
+flow_type: planar
+
+architecture:
+  hidden_layers:
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+    - 256
+  activation: gelu
+  output_dim: 3
+  output_bias: [0.0, 0.0, 0.0]
+  residual: true
+  # Параметрический режим: 4-й вход — re_norm = U_in/U_ref.
+  parametric: true
+  spatial_dim: 3
+  param_dim: 1
+  fourier_features:
+    enabled: true
+    n_frequencies: 32
+    sigma: 3.0
+    gamma: 1.0
+  coordinate_scaling:
+    enabled: true
+    scale_factor: 0.25
+    input_min: -6.0
+    input_max: 6.0
+
+pde:
+  system: incompressible_navier_stokes
+  flow_type: planar
+
+boundary_conditions:
+  type: soft
+
+loss_weights:
+  pde_weights:
+    cont: 1.0
+    mom_x: 1.0
+    mom_y: 1.0
+  bc_weights:
+    inlet: 50.0
+    outlet: 50.0
+    wall: 200.0
+  adaptive_bc: true
+  use_sa_weights: true
+  sa_apply_to_bc: false
+  sa_lr: 0.01
+  # DATA-LOSS: ВКЛЮЧЕН. Отключение: enabled: false (обучение пойдёт только
+  # по PDE + BC + регуляризаторам).
+  data_loss:
+    enabled: true
+    weight: 5.0
+    weights: {u: 1.0, v: 1.0, p: 0.5}
+  integral_condition: true
+  integral_weight: 500.0
+  fvm:
+    enabled: true
+    weight: 10.0
+    balance_weight: 10.0
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+    batch_interval: 1
+  pressure_gauge:
+    enabled: true
+    weight: 0.1
+  # CFD-поля задают внутреннее поле, поэтому слабый якорь к начальному полю
+  # (функция тока) больше не нужен.
+  reference_field:
+    enabled: false
+    weight: 0.0
+  pressure_poisson:
+    enabled: true
+    weight: 0.1
+
+training:
+  epochs: 10000
+  batch_size: 5000
+  gradient_accumulation_steps: 1
+  # Data-loss работает с 1-й эпохи; PDE/BC разогреваются ramp'ом.
+  two_stage: true
+  stage1_epochs: 500
+  stage2_pde_weight_start: 0.1
+  stage2_pde_weight_end: 1.0
+  stage2_ramp_epochs: 5000
+  lr_schedule: cosine
+  lr_cosine_eta_min: 0.00001
+  lr_cyclic_period: 100
+  lr_cyclic_amplitude: 0.5
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  reset_interval: 0
+  reset_noise: 0.01
+  grad_clip: 1.0
+  rar_enable: true
+  rar_interval: 1000
+  rar_num_points: 200
+  switch_to_lbfgs_epoch: 0
+  lbfgs_max_iter: 50
+  lbfgs_history_size: 100
+  early_stopping:
+    enabled: false
+    patience: 100
+    min_delta: 1e-6
+    restore_best: true
+
+optimizer_params:
+  lr: 0.0005
+  lbfgs_lr: 1.0
+
+process:
+  load_model_path: null
+  device: cuda
+  num_gpus: 1
+  dtype: float32
+  use_amp: false
+  seed: 42
+  torch_compile: false
+
+output:
+  console_only: true
+  graphical_window:
+    loss: true
+    pde: true
+    bc: false
+  plot_frequency: 100
+
+data:
+  points_file: workspace/initial/fields/initial.npy
+  cfd:
+    enabled: true
+    manifest: workspace/cfd/cfd_manifest.yaml
+    batch_size: 5000
+    # strict=true: не обучаться, если CFD-точки вне заданной геометрии.
+    strict: true
+    # Диапазон re_norm = U_in/U_ref для PDE/BC-точек (покрытие Re).
+    # Должен соответствовать диапазону U_in в манифесте.
+    re_range: [0.5, 2.0]
+    re_default: 1.0
+
+reference:
+  path: null
+
+diagnostics:
+  interval: 50
+  plot_residual_map: true
+  plot_profiles: true
+  profile_sections: [0.2, 0.5, 0.8]
+  plot_spectrum: true
+  spectrum_section_x: 0.5
+  plot_2d_spectrum: false
+  spectrum_2d_resolution: 256
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  save_rar_history: true
+
+enable_key_listener: false
+checkpoint_dir: workspace/experiments
+checkpoint:
+  interval: 1000
+  name_pattern: '{project_name}_{timestamp}'
+  model_name_pattern: '{project_name}_{timestamp}'
+

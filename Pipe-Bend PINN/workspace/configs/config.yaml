@@ -19,6 +19,11 @@ architecture:
   output_dim: 3
   output_bias: [0.0, 0.0, 0.0]
   residual: true
+  # Параметрический режим: 4-й вход сети — re_norm = U_in/U_ref (или Re/Re_ref).
+  # Включается вместе с data.cfd.enabled и data-loss.
+  parametric: false
+  spatial_dim: 3
+  param_dim: 1
   fourier_features:
     enabled: true
     n_frequencies: 32
@@ -54,6 +59,12 @@ loss_weights:
   # чтобы no-slip и профиль на входе не «размазывались» адаптацией.
   sa_apply_to_bc: false
   sa_lr: 0.01
+  # Data-loss по CFD-полям: включается/отключается флагом enabled.
+  # При enabled: false в loss идут только PDE + BC + регуляризаторы.
+  data_loss:
+    enabled: false
+    weight: 5.0
+    weights: {u: 1.0, v: 1.0, p: 0.5}
   integral_condition: true
   integral_weight: 500.0
   # FVM-невязка неразрывности на контрольных объёмах Mesh2D — РЕАЛЬНОЕ слагаемое loss.
@@ -139,6 +150,15 @@ output:
 
 data:
   points_file: workspace/initial/fields/initial.npy
+  # CFD-данные (Fluent/CFX export) для параметрического режима и data-loss.
+  cfd:
+    enabled: false
+    manifest: workspace/cfd/cfd_manifest.yaml
+    batch_size: 5000
+    strict: false
+    # Диапазон re_norm = U_in/U_ref для PDE/BC-точек. null -> re_norm=1.0.
+    re_range: null
+    re_default: 1.0
 
 reference:
   path: null

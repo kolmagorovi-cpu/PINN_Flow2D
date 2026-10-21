@@ -23,7 +23,16 @@ from pipe_bend_pinn.training.solver import PINNSolver
 
 
 def main() -> int:
-    config_path = os.path.join(PROJECT_ROOT, "workspace", "configs", "config.yaml")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Обучение Pipe-Bend PINN")
+    parser.add_argument(
+        "--config",
+        default=os.path.join(PROJECT_ROOT, "workspace", "configs", "config.yaml"),
+        help="путь к YAML-конфигу (по умолчанию workspace/configs/config.yaml)",
+    )
+    args = parser.parse_args()
+    config_path = args.config
     print(f"=== Запуск обучения по конфигу: {config_path}")
     cm = ConfigManager(config_path=config_path)
     cfg = cm.config

@@ -882,6 +882,8 @@ def evaluate_fvm_metrics(
     dtype: torch.dtype,
     reduction: str = "divergence_l2_volume",
     inlet_velocity: Optional[torch.Tensor] = None,
+    parametric: bool = False,
+    param_value: float = 1.0,
 ) -> Tuple[float, float]:
     """РћС†РµРЅРёРІР°РµС‚ FVM-РЅРµРІСЏР·РєСѓ РЅРµСЂР°Р·СЂС‹РІРЅРѕСЃС‚Рё РґР»СЏ РјРѕРґРµР»Рё РЅР° СѓР·Р»Р°С… СЃРµС‚РєРё.
 
@@ -901,6 +903,8 @@ def evaluate_fvm_metrics(
     y = torch.as_tensor(node_y, dtype=dtype, device=device).reshape(-1, 1)
     s = torch.as_tensor(node_sdf, dtype=dtype, device=device).reshape(-1, 1)
     inp = torch.cat([x, y, s], dim=1)
+    if parametric:
+        inp = torch.cat([inp, torch.full_like(x, float(param_value))], dim=1)
     with torch.no_grad():
         out = model(inp)
         u = out[:, :2]

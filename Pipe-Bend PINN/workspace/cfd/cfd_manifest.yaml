@@ -1,0 +1,40 @@
+# ============================================================================
+# Манифест CFD-кейсов для data-loss / параметрического режима.
+#
+# ЗАМЕНИТЕ cases на реальные CSV, экспортированные с геометрии PB_R100:
+#   bend center (0, 0), R = 1.0 м, D = 0.5 м,
+#   вход: x = -2.0, y ∈ [-1.25, -0.75] (центр y = -1.0), поток +x;
+#   выход: y = +2.0, x ∈ [0.75, 1.25] (центр x = 1.0), поток +y.
+#
+# Файл docs/export.csv ниже — ПРИМЕР ФОРМАТА с другой геометрии. При
+# strict: true в config_cfd_parametric.yaml он не пройдёт проверку
+# outside_domain (это ожидаемо).
+# ============================================================================
+
+ref_scales:
+  U_ref: 1.0                  # единая опорная скорость для всего диапазона
+  pipe_width: 0.5             # W, м
+  density: 998.0              # «Жидкость ламинарная (Re=500)»
+  dynamic_viscosity: 0.998    # mu, Па·с (nu = 1e-3 м²/с)
+  static_pressure: 100000.0   # абсолютное давление (выход = 1 атм)
+
+geometry:
+  domain_file: workspace/geometry/domains/pipe_bend_domain.npy
+  closed: true
+
+cases:
+  # --- Пример формата (замените на реальные кейсы) ------------------------
+  - file: docs/export.csv
+    U_in: 1.0
+    name: format_example
+
+  # --- Шаблон диапазона скоростей -----------------------------------------
+  # - file: workspace/cfd/case_U0.50.csv
+  #   U_in: 0.5
+  #   name: Re250
+  # - file: workspace/cfd/case_U1.00.csv
+  #   U_in: 1.0
+  #   name: Re500
+  # - file: workspace/cfd/case_U1.50.csv
+  #   U_in: 1.5
+  #   name: Re750
