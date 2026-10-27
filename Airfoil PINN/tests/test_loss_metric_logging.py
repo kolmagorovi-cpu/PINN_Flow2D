@@ -133,6 +133,58 @@ class LossMetricLoggingTests(unittest.TestCase):
         self.assertIn("clip limit: 1.000e-01", table)
         self.assertIn("clipping: YES", table)
 
+    def test_recent_loss_change_uses_at_most_100_epochs(self) -> None:
+        metrics = MetricsCollector.__new__(MetricsCollector)
+        metrics.history = {"loss": [200.0, 150.0, 100.0]}
+
+        change, epochs, start, end = metrics.get_recent_loss_change()
+
+        self.assertEqual(epochs, 3)
+        self.assertEqual(start, 200.0)
+        self.assertEqual(end, 100.0)
+        self.assertAlmostEqual(change, -50.0)
+
+        metrics.history["loss"] = [float(value) for value in range(101, 0, -1)]
+        change, epochs, start, end = metrics.get_recent_loss_change()
+
+        self.assertEqual(epochs, 100)
+        self.assertEqual(start, 100.0)
+        self.assertEqual(end, 1.0)
+        self.assertAlmostEqual(change, -99.0)
+
+    def test_epoch_table_prints_recent_loss_change(self) -> None:
+        metrics = MetricsCollector.__new__(MetricsCollector)
+        metrics.loss_computer = _loss_computer()
+        metrics.data_handler = _data_handler()
+        metrics.history = {
+            "loss": [20.0, 10.0],
+            "pde": {"cont": [], "mom_x": [], "mom_y": []},
+            "bc": {"inlet": []},
+            "total_bc": [],
+            "total_pde": [],
+            "fvm_loss": [],
+        }
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            metrics.print_epoch_table(
+                epoch=2,
+                total_epochs=10,
+                loss=10.0,
+                pde_raw={"cont": 4.0, "mom_x": 9.0, "mom_y": 16.0},
+                bc_comp={"inlet": 25.0},
+                integral_loss=0.0,
+                pde_max={"cont": 49.0, "mom_x": 64.0, "mom_y": 81.0},
+                epoch_time=1.0,
+                total_time=2.0,
+            )
+
+        self.assertIn(
+            "Loss change (last 2 epochs): -50.00% "
+            "(2.000e+01 -> 1.000e+01)",
+            output.getvalue(),
+        )
+
     def test_epoch_mse_is_weighted_by_active_point_count(self) -> None:
         trainer = Trainer.__new__(Trainer)
         trainer.model = torch.nn.Linear(1, 1)

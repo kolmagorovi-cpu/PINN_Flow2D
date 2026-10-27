@@ -1054,6 +1054,39 @@ class MetricsCollector:
     # ------------------------------------------------------------------
     # Вывод таблицы потерь в консоль
     # ------------------------------------------------------------------
+    def get_recent_loss_change(
+        self,
+        max_epochs: int = 100,
+    ) -> Tuple[Optional[float], int, Optional[float], Optional[float]]:
+        """Return total-loss change over the latest available epoch window.
+
+        The window contains at most ``max_epochs`` recorded epoch values. The
+        percentage is relative to the first loss in that window, so a negative
+        value means that the loss decreased. With fewer than two valid values
+        the percentage is undefined and ``None`` is returned.
+        """
+
+        if max_epochs <= 0:
+            raise ValueError("max_epochs must be positive")
+
+        values = self.history.get("loss", [])
+        if not isinstance(values, (list, tuple)) or not values:
+            return None, 0, None, None
+
+        window_epochs = min(max_epochs, len(values))
+        start_loss = float(values[-window_epochs])
+        end_loss = float(values[-1])
+        if (
+            window_epochs < 2
+            or not np.isfinite(start_loss)
+            or not np.isfinite(end_loss)
+            or abs(start_loss) <= 1e-12
+        ):
+            return None, window_epochs, start_loss, end_loss
+
+        change_percent = 100.0 * (end_loss - start_loss) / abs(start_loss)
+        return change_percent, window_epochs, start_loss, end_loss
+
     def print_epoch_table(
         self,
         epoch: int,
@@ -1229,6 +1262,22 @@ class MetricsCollector:
             f"Grad {grad_norm:.2e} {bullet} "
             f"PDE multiplier {pde_multiplier:.2f}"
         )
+        (
+            loss_change_percent,
+            loss_change_epochs,
+            loss_window_start,
+            loss_window_end,
+        ) = self.get_recent_loss_change(max_epochs=100)
+        if loss_change_percent is None:
+            print(
+                f"Loss change (last {loss_change_epochs} epoch): n/a"
+            )
+        else:
+            print(
+                f"Loss change (last {loss_change_epochs} epochs): "
+                f"{loss_change_percent:+.2f}% "
+                f"({loss_window_start:.3e} -> {loss_window_end:.3e})"
+            )
         print()
         print(top)
         print(

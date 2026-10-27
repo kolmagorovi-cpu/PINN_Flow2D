@@ -1406,6 +1406,12 @@ class PINNSolver:
                     name: float(np.sqrt(max(value, 0.0)))
                     for name, value in bc_comp.items()
                 }
+                (
+                    loss_change_percent,
+                    loss_change_epochs,
+                    loss_window_start,
+                    loss_window_end,
+                ) = self.metrics.get_recent_loss_change(max_epochs=100)
                 pde_max_abs = {
                     name: float(np.sqrt(max(value, 0.0)))
                     for name, value in pde_max.items()
@@ -1419,6 +1425,10 @@ class PINNSolver:
                         "learning_rate": learning_rate,
                         "pde_multiplier": pde_mult,
                         "loss": loss,
+                        "loss_change_percent": loss_change_percent,
+                        "loss_change_window_epochs": loss_change_epochs,
+                        "loss_change_window_start": loss_window_start,
+                        "loss_change_window_end": loss_window_end,
                         "pde_mse": pde_raw,
                         "pde_rms": pde_rms,
                         "pde_max_abs": pde_max_abs,
@@ -1519,8 +1529,19 @@ class PINNSolver:
                     f"{name}={value:.2e}"
                     for name, value in boundary_rms.items()
                 )
+                if loss_change_percent is None:
+                    loss_change_text = (
+                        f"loss_change_last_{loss_change_epochs}_epochs=n/a"
+                    )
+                else:
+                    loss_change_text = (
+                        f"loss_change_last_{loss_change_epochs}_epochs="
+                        f"{loss_change_percent:+.2f}% "
+                        f"({loss_window_start:.3e}->{loss_window_end:.3e})"
+                    )
                 self.metrics.save_log(
                     f"Epoch {epoch}: loss={loss:.2e}, "
+                    f"{loss_change_text}; "
                     f"pde_mse: {mse_text}; pde_rms: {rms_text}; "
                     f"bc_mse: {bc_mse_text}; bc_rms: {bc_rms_text}; "
                     f"integral_mse={integral_loss:.2e}; "

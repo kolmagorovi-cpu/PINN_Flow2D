@@ -102,6 +102,29 @@ def _one_cell_mesh() -> SimpleNamespace:
 class FVMObjectiveTests(unittest.TestCase):
     """Verify analytical scaling, differentiability and strict validation."""
 
+    def test_local_flux_imbalance_is_divided_by_control_volume(self) -> None:
+        """The local residual is divergence ``Phi_i / V_i``, not raw flux."""
+
+        residuals = []
+        for volume in (1.0, 0.01):
+            mesh = _one_cell_mesh()
+            mesh.cv_volumes[0] = volume
+            mesh.bnd_face_type[0] = "inlet"
+            fvm = FVMResiduals(mesh)
+            fvm.set_inlet_velocity(
+                torch.tensor([1.0, 0.0], dtype=torch.float64)
+            )
+            residual = fvm.compute_residual(
+                torch.zeros((1, 2), dtype=torch.float64)
+            )
+            residuals.append(residual)
+            torch.testing.assert_close(
+                residual,
+                torch.tensor([-1.0 / volume], dtype=torch.float64),
+            )
+
+        torch.testing.assert_close(residuals[1], 100.0 * residuals[0])
+
     def test_constant_field_is_discretely_divergence_free(self) -> None:
         mesh, _ = _structured_cell_mesh(8)
         fvm = FVMResiduals(mesh)
