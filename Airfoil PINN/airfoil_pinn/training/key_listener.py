@@ -65,7 +65,7 @@ class KeyListener:
         else:
             logger.warning(
                 "Модуль 'keyboard' не установлен. Интерактивные функции недоступны.\n"
-                "Установите: pip install keyboard"
+                "Добавьте пакет keyboard в общее окружение D:\\Python\\BaseEnv."
             )
 
     def _run(self):

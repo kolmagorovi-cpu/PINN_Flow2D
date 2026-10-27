@@ -61,6 +61,7 @@ class ConfigManager:
                 # Масштабирование координат для функции активации
                 'coordinate_scaling': {
                     'enabled': False,
+                    'mode': 'multiply',
                     'scale_factor': 1.0,  # Будет вычислено автоматически
                     'input_min': -6.0,
                     'input_max': 6.0,
@@ -193,6 +194,7 @@ class ConfigManager:
                 'lbfgs_history_size': 100,
                 'batch_size': 10,
                 'gradient_accumulation_steps': 1,
+                'full_epoch_optimizer_step': False,
                 'epochs': 1000,
                 # Early stopping
                 'early_stopping': {
@@ -513,6 +515,10 @@ class ConfigManager:
             print(f"    lbfgs_history_size    : {tr['lbfgs_history_size']}")
         print(f"  batch_size              : {tr['batch_size']}")
         print(f"  gradient_accumulation_steps: {tr['gradient_accumulation_steps']}")
+        print(
+            "  full_epoch_optimizer_step: "
+            f"{tr.get('full_epoch_optimizer_step', False)}"
+        )
         print(f"  epochs                  : {tr['epochs']}")
         print()
 
@@ -681,8 +687,8 @@ ACTIVATION_WARNINGS = {
     },
     'siren': {
         'level': 'info',
-        'message': 'Масштабирование не требуется. SIREN (sin) работает с любым диапазоном — градиенты периодические.',
-        'recommendation': 'Специальная инициализация уже настроена в models.py'
+        'message': 'SIREN допускает исходный диапазон, но частота зависит от масштаба координат.',
+        'recommendation': 'Для предсказуемой omega_0 приведите x и y к [-1, 1] внутри сети.'
     },
 }
 
@@ -734,7 +740,7 @@ def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.
         scale_factor = 1.0
 
     if warning['level'] == 'info':
-        print(f"\n   ✅ Масштабирование не требуется (scale_factor = {scale_factor:.3f})")
+        print("\n   ✅ Для SIREN будет доступно внутреннее масштабирование x,y к [-1, 1].")
         input("   Нажмите Enter для продолжения...")
         return True, scale_factor
 

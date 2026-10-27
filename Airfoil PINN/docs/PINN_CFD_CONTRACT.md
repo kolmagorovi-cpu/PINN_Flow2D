@@ -109,6 +109,21 @@ u^*\partial_{x^*}v^*+v^*\partial_{y^*}v^*
 Начальные поля в collocation-артефакте имеют роль `initial_guess_only`. Они
 не являются supervised labels и не должны неявно добавляться в loss.
 
+`architecture.coordinate_scaling.mode: dataset_minmax` выполняет отдельное
+аффинное преобразование только первых двух входов сети:
+
+\[
+x_{NN}=2\frac{x^*-x^*_{min}}{x^*_{max}-x^*_{min}}-1,\qquad
+y_{NN}=2\frac{y^*-y^*_{min}}{y^*_{max}-y^*_{min}}-1.
+\]
+
+Границы берутся из фактически загруженного датасета. Преобразование является
+частью вычислительного графа, поэтому autograd автоматически применяет цепное
+правило, а PDE, FVM, граничные условия, SDF и сохраняемые поля продолжают
+использовать физически определённые безразмерные координаты \(x^*,y^*\).
+Режим предназначен в том числе для SIREN; `omega_0` тогда относится к
+стабильному диапазону `[-1, 1]`. Режим `multiply` сохранён для совместимости.
+
 Пример современного раздела признаков:
 
 ```yaml
@@ -356,6 +371,14 @@ mesh routines используют собственные progress bars. `data.n
 На Windows используется воспроизводимый top-level worker initializer и
 обязателен `__main__` guard.
 
+`training.full_epoch_optimizer_step=true` замораживает параметры Adam на весь
+проход по DataLoader, накапливает градиенты всех batch и выполняет ровно один
+`optimizer.step()` в конце эпохи. В этом режиме
+`gradient_accumulation_steps` временно игнорируется. Глобальные FVM и integral
+члены вычисляются не более одного раза на эпоху (с учётом FVM schedule) и
+масштабируются независимо от числа batch. L-BFGS уже является полноэпоховым:
+его closure проходит весь DataLoader.
+
 ## 8. Проверки
 
 Полный smoke-набор:
@@ -366,11 +389,11 @@ $failed = @()
 Get-ChildItem tests -Filter '*.py' |
     Sort-Object Name |
     ForEach-Object {
-        .\venv\Scripts\python.exe $_.FullName
+        D:\Python\BaseEnv\Scripts\python.exe $_.FullName
         if ($LASTEXITCODE -ne 0) { $failed += $_.Name }
     }
 if ($failed) { throw "Failed: $($failed -join ', ')" }
-.\venv\Scripts\python.exe -m compileall -q airfoil_pinn tests
+D:\Python\BaseEnv\Scripts\python.exe -m compileall -q airfoil_pinn tests
 git diff --check
 ```
 

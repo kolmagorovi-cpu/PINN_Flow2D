@@ -23,8 +23,14 @@
 $env:PYTHONPATH = (Get-Location).Path
 Get-ChildItem tests -Filter '*.py' |
     Sort-Object Name |
-    ForEach-Object { .\venv\Scripts\python.exe $_.FullName }
+    ForEach-Object { D:\Python\BaseEnv\Scripts\python.exe $_.FullName }
 ```
+
+На Windows проект использует заранее подготовленное окружение
+`D:\Python\BaseEnv`. Путь можно переопределить переменной
+`AIRFOIL_PINN_PYTHON_ENV`. Bootstrap не создаёт локальный `venv` и не вызывает
+`pip`: если окружение или обязательная библиотека отсутствуют, запуск
+останавливается с диагностикой.
 
 Основные пользовательские конфигурации находятся в `workspace/configs`.
 Обучение следует запускать штатным CLI проекта; на Windows при

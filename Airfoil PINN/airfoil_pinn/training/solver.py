@@ -434,6 +434,9 @@ class PINNSolver:
             if self.loss_computer.feature_assembler.coordinates_enabled
             else 0
         )
+        if coord_scaling.get('mode', 'multiply') == 'dataset_minmax':
+            coord_scaling['resolved_min'] = [self.x_min, self.y_min]
+            coord_scaling['resolved_max'] = [self.x_max, self.y_max]
 
         return PINNIncompressible(
             input_dim=actual_input_dim,
@@ -906,10 +909,16 @@ class PINNSolver:
             }
         )
 
-    def _save_checkpoint_flow_images(self, identifier: Union[int, str]) -> None:
+    def _save_checkpoint_flow_images(
+        self,
+        identifier: Union[int, str],
+        *,
+        force: bool = False,
+        save_npy: Optional[bool] = None,
+    ) -> None:
         """Saves predicted flow-field maps next to periodic checkpoints."""
         checkpoint_cfg = self.config.get('checkpoint', {})
-        if not checkpoint_cfg.get('save_flow_images', True):
+        if not force and not checkpoint_cfg.get('save_flow_images', True):
             return
 
         try:
@@ -933,7 +942,11 @@ class PINNSolver:
                 identifier,
                 boundary_types=boundary_types,
                 boundary_type_names=self.data_handler.boundary_type_names,
-                save_npy=bool(checkpoint_cfg.get('save_flow_npy', False)),
+                save_npy=(
+                    bool(checkpoint_cfg.get('save_flow_npy', False))
+                    if save_npy is None
+                    else bool(save_npy)
+                ),
                 plot_physical=bool(checkpoint_cfg.get('flow_plot_physical', False)),
                 config=self.config,
             )
@@ -945,6 +958,39 @@ class PINNSolver:
                 exc,
                 exc_info=True,
             )
+
+    def _save_terminal_artifacts(self, identifier: str) -> None:
+        """Best-effort loss plots and fields for every training exit path."""
+        plots_dir = self._get_plots_dir()
+        try:
+            self.visualizer.save_plots(plots_dir, identifier)
+        except Exception as exc:
+            logger.warning(
+                "Не удалось сохранить live-графики (%s): %s",
+                identifier,
+                exc,
+                exc_info=True,
+            )
+        try:
+            self.visualizer.save_loss_history(
+                self.metrics.history,
+                plots_dir,
+                identifier,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось сохранить историю потерь (%s): %s",
+                identifier,
+                exc,
+                exc_info=True,
+            )
+        # Terminal artifacts always include images plus normalized and physical
+        # NumPy fields, independently of the periodic-checkpoint preferences.
+        self._save_checkpoint_flow_images(
+            identifier,
+            force=True,
+            save_npy=True,
+        )
 
     # ------------------------------------------------------------------
     # Диагностическая процедура
@@ -1440,6 +1486,7 @@ class PINNSolver:
                     optimizer_name=optimizer_name,
                     learning_rate=learning_rate,
                     grad_norm=grad_norm,
+                    grad_clip=self.trainer.grad_clip,
                     pde_multiplier=pde_mult,
                     eta_seconds=eta_seconds,
                     avg_u_in=avg_u_in,
@@ -1481,6 +1528,19 @@ class PINNSolver:
                     f"fvm_mse={self.trainer._last_fvm_raw_loss:.2e}; "
                     f"fvm_rms={self.trainer._last_fvm_rms:.2e}"
                 )
+                if self.trainer.grad_clip is not None:
+                    grad_clip = float(self.trainer.grad_clip)
+                    clipping_status = "yes" if grad_norm > grad_clip else "no"
+                    self.metrics.save_log(
+                        f"   gradient norm (pre-clip) = {grad_norm:.3e}; "
+                        f"clip limit = {grad_clip:.3e}; "
+                        f"clipping = {clipping_status}"
+                    )
+                else:
+                    self.metrics.save_log(
+                        f"   gradient norm (pre-clip) = {grad_norm:.3e}; "
+                        "clipping = disabled"
+                    )
                 self.metrics.save_log(line2)
                 if section_line is not None:
                     self.metrics.save_log(section_line)
@@ -1505,15 +1565,36 @@ class PINNSolver:
 
         except KeyboardInterrupt:
             logger.warning("Обучение прервано пользователем. Сохраняю модель и метрики...")
-            self._save_checkpoint('interrupted')
-            self.visualizer.save_plots(self._get_plots_dir(), 'interrupted')
-            self.interactive._save_current_results(epoch)
+            try:
+                self._save_checkpoint('interrupted')
+            except Exception as checkpoint_exc:
+                logger.warning(
+                    "Не удалось сохранить interrupted-чекпоинт: %s",
+                    checkpoint_exc,
+                    exc_info=True,
+                )
+            self._save_terminal_artifacts('interrupted')
             self._finalize()
             return
         except Exception as e:
             logger.error(f"Критическая ошибка во время обучения: {e}", exc_info=True)
-            self._save_checkpoint('error')
-            self._finalize()
+            try:
+                self._save_checkpoint('error')
+            except Exception as checkpoint_exc:
+                logger.warning(
+                    "Не удалось сохранить error-чекпоинт: %s",
+                    checkpoint_exc,
+                    exc_info=True,
+                )
+            self._save_terminal_artifacts('error')
+            try:
+                self._finalize()
+            except Exception as finalize_exc:
+                logger.warning(
+                    "Ошибка финализации после сбоя обучения: %s",
+                    finalize_exc,
+                    exc_info=True,
+                )
             raise
         finally:
             if hasattr(epoch_progress, "close"):
@@ -1521,10 +1602,11 @@ class PINNSolver:
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
-        self._save_checkpoint('final')
-        self.visualizer.save_plots(self._get_plots_dir(), 'final')
-        self.interactive._save_current_results(epoch)
-        self._finalize()
+        try:
+            self._save_checkpoint('final')
+        finally:
+            self._save_terminal_artifacts('final')
+            self._finalize()
 
     def _get_pde_multiplier(self, epoch: int) -> float:
         if not self.two_stage:

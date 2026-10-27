@@ -8,7 +8,8 @@ try:
     from PySide6.QtWidgets import QApplication
 except ImportError as exc:  # pragma: no cover - depends on local environment
     raise SystemExit(
-        "PySide6 is not installed. Run: python -m pip install -r requirements_ui.txt"
+        "PySide6 отсутствует в общем окружении D:\\Python\\BaseEnv. "
+        "Проект не устанавливает GUI-зависимости автоматически."
     ) from exc
 
 from ui.main_window import MainWindow

@@ -103,6 +103,14 @@ class Trainer:
         tr = config
         self.grad_clip = tr.get('grad_clip')
         self.accum_steps = tr.get('gradient_accumulation_steps', 1)
+        self.full_epoch_optimizer_step = bool(
+            tr.get('full_epoch_optimizer_step', False)
+        )
+        if self.full_epoch_optimizer_step:
+            logger.info(
+                "Full-epoch optimizer step enabled: Adam weights stay fixed "
+                "until every batch in the epoch has contributed a gradient."
+            )
         self.reset_interval = tr.get('reset_interval', 0)
         self.reset_noise = tr.get('reset_noise', 0.01)
         self.rar_enable = tr.get('rar_enable', False)
@@ -1999,7 +2007,10 @@ class Trainer:
         if not enabled or n_batches <= 0:
             return {}
 
-        accumulation_steps = max(1, int(getattr(self, "accum_steps", 1)))
+        if bool(getattr(self, "full_epoch_optimizer_step", False)):
+            accumulation_steps = n_batches
+        else:
+            accumulation_steps = max(1, int(getattr(self, "accum_steps", 1)))
         optimizer_batches = [
             index
             for index in range(n_batches)
@@ -2039,6 +2050,7 @@ class Trainer:
         fvm_scale: float = 1.0,
         add_integral: bool = False,
         integral_scale: float = 1.0,
+        loss_divisor: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Выполняет один прямой проход и накопление градиентов для батча (Adam).
@@ -2049,6 +2061,8 @@ class Trainer:
             accum_step: флаг, указывающий, нужно ли выполнять шаг оптимизации
             pde_mult: множитель для PDE потерь
             add_fvm: если True, добавляет FVM-потерю (полный проход по сетке) к total_loss
+            loss_divisor: фактическое число batch в текущем окне накопления.
+                Если не задано, используется ``gradient_accumulation_steps``.
 
         Returns:
             словарь с результатами (те же поля, что и в forward_pass, плюс grad_norm)
@@ -2062,7 +2076,15 @@ class Trainer:
                 add_integral=add_integral,
                 integral_scale=integral_scale,
             )
-            total_loss = fwd['total'] / self.accum_steps
+            divisor = max(
+                1,
+                int(
+                    self.accum_steps
+                    if loss_divisor is None
+                    else loss_divisor
+                ),
+            )
+            total_loss = fwd['total'] / divisor
         ensure_finite_loss(
             total_loss,
             stage="Adam forward",
@@ -2179,6 +2201,12 @@ class Trainer:
         self.model.train()
         dataloader = self.data_handler.get_dataloader()
 
+        # Every accumulation window must start from a clean gradient buffer.
+        # This is especially important in full-epoch mode, where no optimizer
+        # step clears gradients until the final batch.
+        if hasattr(self, 'optimizer'):
+            self.optimizer.zero_grad()
+
         # Инициализация накопителей
         epoch_losses = {
             'total': 0.0,
@@ -2208,6 +2236,13 @@ class Trainer:
         }
         n_batches = 0
         n_total_batches = len(dataloader)
+        configured_accum_steps = max(1, int(self.accum_steps))
+        effective_accum_steps = (
+            n_total_batches
+            if bool(getattr(self, 'full_epoch_optimizer_step', False))
+            and n_total_batches > 0
+            else configured_accum_steps
+        )
 
         self._fvm_epoch_counter += 1
         fvm_this_epoch = (
@@ -2222,15 +2257,19 @@ class Trainer:
             and self.loss_computer.integral_weight != 0.0
         )
         integral_batches = {n_total_batches - 1} if integral_this_epoch and n_total_batches > 0 else set()
-        integral_scale = float(self.accum_steps) if integral_batches else 1.0
         self._last_integral_loss = 0.0
 
         for i, batch in enumerate(dataloader):
             is_last_batch = (i == n_total_batches - 1)
-            accum_step = ((i + 1) % self.accum_steps == 0) or is_last_batch
+            window_start = (i // effective_accum_steps) * effective_accum_steps
+            window_size = min(
+                effective_accum_steps,
+                n_total_batches - window_start,
+            )
+            accum_step = ((i + 1) % effective_accum_steps == 0) or is_last_batch
             add_fvm = i in fvm_batches
             fvm_scale = (
-                float(self.accum_steps) * fvm_batches[i]
+                float(window_size) * fvm_batches[i]
                 if add_fvm
                 else 1.0
             )
@@ -2242,7 +2281,8 @@ class Trainer:
                 add_fvm=add_fvm,
                 fvm_scale=fvm_scale,
                 add_integral=add_integral,
-                integral_scale=integral_scale,
+                integral_scale=(float(window_size) if add_integral else 1.0),
+                loss_divisor=window_size,
             )
 
             epoch_losses['total'] += batch_losses['total']

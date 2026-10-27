@@ -123,11 +123,15 @@ def _configure_activation(cfg: ConfigManager) -> None:
             enabled, scale_factor = warn_activation(selected_activation, x_min, x_max)
 
             arch['activation'] = selected_activation
-            arch['coordinate_scaling']['enabled'] = enabled
-            arch['coordinate_scaling']['scale_factor'] = scale_factor
-            arch['coordinate_scaling']['input_min'] = x_min
-            arch['coordinate_scaling']['input_max'] = x_max
+            scaling = arch.setdefault('coordinate_scaling', {})
+            scaling['enabled'] = enabled
+            scaling['scale_factor'] = scale_factor
+            scaling['input_min'] = x_min
+            scaling['input_max'] = x_max
             if selected_activation == 'siren':
+                # Dataset min/max are resolved by Solver at runtime. Only the
+                # coordinates entering the MLP change; PDE coordinates do not.
+                scaling['mode'] = 'dataset_minmax'
                 first = input(
                     "SIREN first omega_0 "
                     f"[{arch.get('siren_first_omega_0', 30.0)}]: "
@@ -150,18 +154,27 @@ def _configure_activation(cfg: ConfigManager) -> None:
 def _configure_coordinate_scaling(cfg: ConfigManager) -> None:
     """Меню настройки масштабирования координат."""
     arch = cfg.config['architecture']
-    scaling = arch.get('coordinate_scaling', {})
+    scaling = arch.setdefault('coordinate_scaling', {})
 
     while True:
         clear_screen()
         print_submenu_header("Масштабирование координат")
 
+        mode = scaling.get('mode', 'multiply')
+        print(f"Активация: {arch.get('activation', 'tanh')}")
         print(f"Включено: {scaling.get('enabled', False)}")
-        print(f"scale_factor: {scaling.get('scale_factor', 1.0):.4f}")
-        print(f"Диапазон координат: [{scaling.get('input_min', -6.0):.2f}, {scaling.get('input_max', 6.0):.2f}]")
+        print(f"Режим: {mode}")
+        if mode == 'dataset_minmax':
+            print("Преобразование в сети: x,y -> [-1, 1] по границам датасета")
+            if arch.get('activation') == 'siren':
+                print("Рекомендовано для SIREN: частотный масштаб становится предсказуемым.")
+        else:
+            print(f"scale_factor: {scaling.get('scale_factor', 1.0):.4f}")
+            print(f"Диапазон координат: [{scaling.get('input_min', -6.0):.2f}, {scaling.get('input_max', 6.0):.2f}]")
         print("\n1. Включить/выключить масштабирование")
-        print("2. Изменить scale_factor")
-        print("3. Изменить диапазон координат (input_min, input_max)")
+        print("2. Выбрать режим масштабирования")
+        print("3. Изменить scale_factor (режим multiply)")
+        print("4. Изменить диапазон координат (подсказка для multiply)")
         print("0. Выход")
 
         scale_sub = input("Выберите пункт: ").strip()
@@ -170,13 +183,26 @@ def _configure_coordinate_scaling(cfg: ConfigManager) -> None:
             scaling['enabled'] = not scaling.get('enabled', False)
             print(f"✅ Масштабирование {'включено' if scaling['enabled'] else 'выключено'}")
         elif scale_sub == '2':
+            print("1. dataset_minmax: аффинно привести x,y к [-1, 1] внутри сети")
+            print("2. multiply: умножить x,y на scale_factor (совместимый режим)")
+            selected_mode = input("Выберите режим (1/2): ").strip()
+            if selected_mode == '1':
+                scaling['mode'] = 'dataset_minmax'
+                scaling['enabled'] = True
+                print("✅ Включено внутреннее масштабирование x,y к [-1, 1]")
+            elif selected_mode == '2':
+                scaling['mode'] = 'multiply'
+                print("✅ Выбран режим multiply")
+            else:
+                print("⚠️ Неизвестный режим")
+        elif scale_sub == '3':
             try:
                 new_scale = input(f"Введите scale_factor (текущее: {scaling.get('scale_factor', 1.0):.4f}): ").strip()
                 scaling['scale_factor'] = float(new_scale)
                 print(f"✅ scale_factor установлен: {scaling['scale_factor']:.4f}")
             except ValueError:
                 print("⚠️ Введите корректное число!")
-        elif scale_sub == '3':
+        elif scale_sub == '4':
             try:
                 new_min = input(f"Введите input_min (текущее: {scaling.get('input_min', -6.0):.2f}): ").strip()
                 new_max = input(f"Введите input_max (текущее: {scaling.get('input_max', 6.0):.2f}): ").strip()
@@ -228,7 +254,12 @@ def architecture_menu(cfg: ConfigManager) -> None:
     print("1. Выбор входных параметров нейронной сети")
     print("2. Настройка скрытых слоёв")
     print(f"3. Функция активации (текущая: {arch.get('activation', 'tanh')})")
-    print(f"4. Масштабирование координат (включено: {arch.get('coordinate_scaling', {}).get('enabled', False)}, scale_factor: {arch.get('coordinate_scaling', {}).get('scale_factor', 1.0):.4f})")
+    scaling = arch.get('coordinate_scaling', {})
+    print(
+        "4. Масштабирование координат "
+        f"(включено: {scaling.get('enabled', False)}, "
+        f"режим: {scaling.get('mode', 'multiply')})"
+    )
     print("5. Настройка выходных параметров")
     print("6. Визуализация сети (схема)")
     print("0. Выход")

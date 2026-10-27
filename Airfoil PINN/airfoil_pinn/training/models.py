@@ -117,14 +117,74 @@ class PINNIncompressible(nn.Module):
         # Параметры масштабирования координат
         self.coordinate_scaling = coordinate_scaling or {
             'enabled': False,
+            'mode': 'multiply',
             'scale_factor': 1.0,
         }
+        self.coordinate_scaling_mode = str(
+            self.coordinate_scaling.get('mode', 'multiply')
+        ).lower()
+        if self.coordinate_scaling_mode not in {'multiply', 'dataset_minmax'}:
+            raise ValueError(
+                "coordinate_scaling.mode must be 'multiply' or "
+                "'dataset_minmax'"
+            )
         self.scale_factor = (
             self.coordinate_scaling.get('scale_factor', 1.0)
             if self.coordinate_scaling.get('enabled', False)
             else 1.0
         )
         self.coord_dim = int(self.coordinate_scaling.get('coord_dim', 2))
+        coord_min = self.coordinate_scaling.get(
+            'resolved_min',
+            self.coordinate_scaling.get('input_min', -1.0),
+        )
+        coord_max = self.coordinate_scaling.get(
+            'resolved_max',
+            self.coordinate_scaling.get('input_max', 1.0),
+        )
+        coord_min_tensor = torch.as_tensor(
+            coord_min,
+            dtype=torch.get_default_dtype(),
+        ).flatten()
+        coord_max_tensor = torch.as_tensor(
+            coord_max,
+            dtype=torch.get_default_dtype(),
+        ).flatten()
+        if coord_min_tensor.numel() == 1 and self.coord_dim > 1:
+            coord_min_tensor = coord_min_tensor.repeat(self.coord_dim)
+        if coord_max_tensor.numel() == 1 and self.coord_dim > 1:
+            coord_max_tensor = coord_max_tensor.repeat(self.coord_dim)
+        if self.coord_dim > 0 and (
+            coord_min_tensor.numel() < self.coord_dim
+            or coord_max_tensor.numel() < self.coord_dim
+        ):
+            raise ValueError(
+                "Coordinate scaling bounds must cover every coordinate"
+            )
+        if (
+            self.coordinate_scaling.get('enabled', False)
+            and self.coordinate_scaling_mode == 'dataset_minmax'
+            and self.coord_dim > 0
+            and torch.any(
+                coord_max_tensor[:self.coord_dim]
+                <= coord_min_tensor[:self.coord_dim]
+            )
+        ):
+            raise ValueError(
+                "Every coordinate maximum must be greater than its minimum"
+            )
+        # Runtime data bounds belong to the computational transform, but not to
+        # checkpoints: they are reproducibly rebuilt from the dataset.
+        self.register_buffer(
+            '_coordinate_min',
+            coord_min_tensor,
+            persistent=False,
+        )
+        self.register_buffer(
+            '_coordinate_max',
+            coord_max_tensor,
+            persistent=False,
+        )
 
         prev = input_dim
         for index, hidden in enumerate(layers):
@@ -226,6 +286,28 @@ class PINNIncompressible(nn.Module):
         else:
             init.xavier_uniform_(self.output_layer.weight)
 
+    def _scale_model_inputs(self, x: torch.Tensor) -> torch.Tensor:
+        """Transform coordinates in network space without detaching autograd."""
+        if (
+            not self.coordinate_scaling.get('enabled', False)
+            or self.coord_dim <= 0
+        ):
+            return x
+
+        h = x.clone()
+        coord_dim = min(self.coord_dim, h.shape[1])
+        if self.coordinate_scaling_mode == 'dataset_minmax':
+            coord_min = self._coordinate_min[:coord_dim]
+            coord_range = (
+                self._coordinate_max[:coord_dim] - coord_min
+            )
+            h[:, :coord_dim] = (
+                2.0 * (h[:, :coord_dim] - coord_min) / coord_range - 1.0
+            )
+        else:
+            h[:, :coord_dim] = h[:, :coord_dim] * self.scale_factor
+        return h
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Прямой проход с масштабированием координат (если включено).
@@ -235,13 +317,9 @@ class PINNIncompressible(nn.Module):
         Returns:
             тензор формы (batch_size, output_dim)
         """
-        # Масштабирование только координат x,y; остальные признаки сохраняют физический смысл.
-        if self.coordinate_scaling.get('enabled', False) and self.coord_dim > 0:
-            h = x.clone()
-            coord_dim = min(self.coord_dim, h.shape[1])
-            h[:, :coord_dim] = h[:, :coord_dim] * self.scale_factor
-        else:
-            h = x
+        # Масштабируются только x,y. SDF и параметры режима течения остаются в
+        # своих нормировках, а PDE продолжает видеть исходные координаты.
+        h = self._scale_model_inputs(x)
 
         for layer, activation in zip(
             self.hidden_layers,

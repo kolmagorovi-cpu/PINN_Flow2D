@@ -31,7 +31,7 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
         print("4. Отсечение градиентов")
         print("5. RAR")
         print("6. Переключение Adam → L-BFGS")
-        print("7. Размер батча и градиентное накопление")
+        print("7. Размер батча и шаг оптимизатора")
         print("8. Количество эпох")
         print("9. Early stopping")
         print("10. Вывод текущей стратегии")
@@ -184,7 +184,20 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
                 tr['lbfgs_history_size'] = int(input(f"history_size [{tr['lbfgs_history_size']}]: ") or tr['lbfgs_history_size'])
         elif sub == '7':
             tr['batch_size'] = int(input(f"Размер батча [{tr['batch_size']}]: ") or tr['batch_size'])
-            tr['gradient_accumulation_steps'] = int(input(f"Шаги градиентного накопления [{tr['gradient_accumulation_steps']}]: ") or tr['gradient_accumulation_steps'])
+            tr['full_epoch_optimizer_step'] = yes_no(
+                "Один шаг оптимизатора после всех батчей эпохи",
+                tr.get('full_epoch_optimizer_step', False),
+            )
+            if tr['full_epoch_optimizer_step']:
+                print(
+                    "Градиенты будут накоплены по всей эпохе; "
+                    "gradient_accumulation_steps временно игнорируется."
+                )
+            else:
+                tr['gradient_accumulation_steps'] = int(input(
+                    "Шаги градиентного накопления "
+                    f"[{tr['gradient_accumulation_steps']}]: "
+                ) or tr['gradient_accumulation_steps'])
         elif sub == '8':
             tr['epochs'] = int(input(f"Количество эпох [{tr['epochs']}]: ") or tr['epochs'])
         elif sub == '9':
@@ -235,7 +248,12 @@ def training_strategy_menu(cfg: ConfigManager) -> None:
                         f"min_distance_factor={boundary_rar.get('min_distance_factor', 0.02)}"
                     )
             print(f"Переключение на L-BFGS: эпоха {tr['switch_to_lbfgs_epoch']}")
-            print(f"Батч: {tr['batch_size']}, накопление: {tr['gradient_accumulation_steps']}")
+            print(
+                f"Батч: {tr['batch_size']}, "
+                f"накопление: {tr['gradient_accumulation_steps']}, "
+                "полноэпоховый шаг: "
+                f"{tr.get('full_epoch_optimizer_step', False)}"
+            )
             print(f"Эпох: {tr['epochs']}")
             es = tr.get('early_stopping', {})
             print(f"Early stopping: {es.get('enabled', False)} "

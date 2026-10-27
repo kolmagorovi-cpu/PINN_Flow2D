@@ -96,6 +96,7 @@ class LossMetricLoggingTests(unittest.TestCase):
                 optimizer_name="Adam",
                 learning_rate=1e-3,
                 grad_norm=0.25,
+                grad_clip=0.1,
                 pde_multiplier=1.0,
                 eta_seconds=60.0,
                 avg_u_in=0.99,
@@ -127,6 +128,10 @@ class LossMetricLoggingTests(unittest.TestCase):
             "Flow: u_in=0.9900 · u_out=0.9700 · mass error=2.000e-02",
             table,
         )
+
+        self.assertIn("Gradient norm (pre-clip): 2.500e-01", table)
+        self.assertIn("clip limit: 1.000e-01", table)
+        self.assertIn("clipping: YES", table)
 
     def test_epoch_mse_is_weighted_by_active_point_count(self) -> None:
         trainer = Trainer.__new__(Trainer)

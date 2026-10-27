@@ -270,6 +270,106 @@ class Visualizer:
         except Exception as e:
             logger.warning(f"Не удалось сохранить графики: {e}")
 
+    def save_loss_history(
+        self,
+        history: Dict,
+        savedir: str,
+        identifier: Optional[Union[int, str]] = None,
+    ) -> None:
+        """Save loss curves even when live plotting is disabled.
+
+        ``console_only`` intentionally disables live matplotlib windows, but it
+        must not disable the final training report. This method creates a fresh
+        headless figure from the recorded metric history and closes it after
+        saving, so it is also safe to call from interruption/error handlers.
+        """
+        os.makedirs(savedir, exist_ok=True)
+        suffix = (
+            f"_epoch_{identifier}" if identifier is not None else "_final"
+        )
+        figure = None
+        try:
+            figure, axes = plt.subplots(
+                2,
+                2,
+                figsize=(14, 9),
+                constrained_layout=True,
+            )
+
+            def plot_series(ax, values, label: str) -> bool:
+                if values is None:
+                    return False
+                try:
+                    array = np.asarray(values, dtype=float).reshape(-1)
+                except (TypeError, ValueError):
+                    return False
+                if array.size == 0:
+                    return False
+                array = array.copy()
+                array[~np.isfinite(array) | (array <= 0.0)] = np.nan
+                if np.isnan(array).all():
+                    return False
+                ax.plot(np.arange(1, array.size + 1), array, label=label)
+                return True
+
+            panels = (
+                (axes[0, 0], {'total': history.get('loss')}, 'Total loss'),
+                (
+                    axes[0, 1],
+                    history.get('pde_mse') or history.get('pde') or {},
+                    'PDE residual MSE',
+                ),
+                (
+                    axes[1, 0],
+                    history.get('bc_mse') or history.get('bc') or {},
+                    'Boundary-condition MSE',
+                ),
+                (
+                    axes[1, 1],
+                    {
+                        key: history.get(key)
+                        for key in (
+                            'total_pde',
+                            'total_bc',
+                            'integral_mse',
+                            'fvm_mse',
+                            'pressure_gauge_mse',
+                        )
+                    },
+                    'Loss diagnostics',
+                ),
+            )
+            for ax, series, title in panels:
+                plotted = False
+                for label, values in series.items():
+                    plotted = plot_series(ax, values, label) or plotted
+                ax.set_title(title)
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('Loss / MSE')
+                ax.set_yscale('log', nonpositive='clip')
+                ax.grid(True, which='both', alpha=0.3)
+                if plotted:
+                    ax.legend(fontsize='small')
+                else:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        'Нет записанных данных',
+                        ha='center',
+                        va='center',
+                        transform=ax.transAxes,
+                    )
+            figure.suptitle(f'Training losses - {self.config_name}')
+            filename = os.path.join(
+                savedir,
+                f"loss_history{suffix}.png",
+            )
+            figure.savefig(filename, dpi=150)
+            logger.info("График истории функции потерь сохранён: %s", filename)
+        finally:
+            if figure is not None:
+                plt.close(figure)
+
     def save_final_report(self, savedir: str, metrics: Dict) -> None:
         """
         Сохраняет финальный отчёт с количественными метриками в текстовый файл.

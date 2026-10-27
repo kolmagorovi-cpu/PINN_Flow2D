@@ -1073,6 +1073,7 @@ class MetricsCollector:
         optimizer_name: str = "Adam",
         learning_rate: float = 0.0,
         grad_norm: float = 0.0,
+        grad_clip: Optional[float] = None,
         pde_multiplier: float = 1.0,
         eta_seconds: Optional[float] = None,
         avg_u_in: float = 0.0,
@@ -1427,6 +1428,26 @@ class MetricsCollector:
             format_delta(float(loss), history_values("loss")),
         )
         print(bottom)
+        clip_enabled = (
+            grad_clip is not None
+            and np.isfinite(float(grad_clip))
+            and float(grad_clip) > 0.0
+        )
+        if clip_enabled:
+            clip_limit = float(grad_clip)
+            clipping_status = (
+                "YES" if float(grad_norm) > clip_limit else "no"
+            )
+            print(
+                f"Gradient norm (pre-clip): {grad_norm:.3e} {bullet} "
+                f"clip limit: {clip_limit:.3e} {bullet} "
+                f"clipping: {clipping_status}"
+            )
+        else:
+            print(
+                f"Gradient norm (pre-clip): {grad_norm:.3e} {bullet} "
+                "clipping: disabled"
+            )
         print(
             f"Flow: u_in={avg_u_in:.4f} {bullet} "
             f"u_out={avg_u_out:.4f} {bullet} "

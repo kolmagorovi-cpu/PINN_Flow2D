@@ -50,6 +50,24 @@ class StaticValidationTests(unittest.TestCase):
         config = _default_config()
         validate_static_config(config)
         self.assertNotIn("boundary_types", config["input_params"])
+        self.assertFalse(config["training"]["full_epoch_optimizer_step"])
+
+    def test_full_epoch_optimizer_step_must_be_boolean(self) -> None:
+        config = _default_config()
+        config["training"]["full_epoch_optimizer_step"] = "yes"
+        with self.assertRaisesRegex(
+            ConfigurationError,
+            "full_epoch_optimizer_step",
+        ):
+            validate_static_config(config)
+
+    def test_coordinate_scaling_mode_is_validated(self) -> None:
+        config = _default_config()
+        config["architecture"]["coordinate_scaling"].update(
+            {"enabled": True, "mode": "unknown"}
+        )
+        with self.assertRaisesRegex(ConfigurationError, "coordinate_scaling.mode"):
+            validate_static_config(config)
 
     def test_legacy_boundary_feature_flags_are_removed_on_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -3,22 +3,24 @@
 PySide6 desktop interface for running Airfoil PINN training from a separate
 backend process.
 
-Install UI dependencies from the project root:
+The UI uses the same pre-provisioned environment as the backend. It never
+creates a project-local environment or installs packages automatically.
+Verify that the UI dependency is already present:
 
 ```powershell
-python -m pip install -r requirements_ui.txt
+D:\Python\BaseEnv\Scripts\python.exe -c "import PySide6"
 ```
 
 Run the UI:
 
 ```powershell
-python -m ui.app
+D:\Python\BaseEnv\Scripts\python.exe -m ui.app
 ```
 
 Run UI smoke checks:
 
 ```powershell
-python -m ui.smoke_tests
+D:\Python\BaseEnv\Scripts\python.exe -m ui.smoke_tests
 ```
 
 The Training panel can run `Airfoil_PINN.py train --config ... --experiment-dir ...`

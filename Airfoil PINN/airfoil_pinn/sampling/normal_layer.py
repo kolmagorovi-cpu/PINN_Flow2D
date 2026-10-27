@@ -61,6 +61,13 @@ class NormalLayerResult:
     points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.float64))
     surface_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.float64))
     offsets: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.float64))
+    points_by_column: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 0, 2), dtype=np.float64)
+    )
+    valid_mask: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=bool))
+    column_surface_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float64)
+    )
     stats: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -118,6 +125,9 @@ def generate_normal_layer_points(
     foil_path = Path(foil) if closed and len(foil) >= 4 else None
 
     points = []
+    point_columns = []
+    valid_columns = []
+    column_surface_points = []
     columns = 0
     accepted_normals = {"positive": 0, "negative": 0}
     for base, normal_a, normal_b in zip(base_points, normals_a, normals_b):
@@ -135,6 +145,9 @@ def generate_normal_layer_points(
             valid = _valid_flow_points(column, domain_path, foil_path)
             if np.any(valid):
                 points.append(column[valid])
+                point_columns.append(column)
+                valid_columns.append(valid)
+                column_surface_points.append(base)
                 columns += 1
                 accepted_normals[side_name] += 1
 
@@ -176,6 +189,9 @@ def generate_normal_layer_points(
         points=arr,
         surface_points=base_points.astype(np.float64, copy=False),
         offsets=offsets.astype(np.float64, copy=False),
+        points_by_column=np.asarray(point_columns, dtype=np.float64),
+        valid_mask=np.asarray(valid_columns, dtype=bool),
+        column_surface_points=np.asarray(column_surface_points, dtype=np.float64),
         stats=stats,
     )
 

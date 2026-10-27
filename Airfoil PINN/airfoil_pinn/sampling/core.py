@@ -93,6 +93,7 @@ from airfoil_pinn.data.normalization import build_geometry_reference
 from airfoil_pinn.sampling.normal_layer import (
     DEFAULT_ETA_LEVELS,
     NormalLayerConfig,
+    NormalLayerResult,
     generate_normal_layer_points,
     resample_profile_by_step,
 )
@@ -249,6 +250,8 @@ class SamplerConfig:
     normal_layer_min_point_distance_factor: float = 0.0
     normal_layer_max_points: Optional[int] = None
     normal_layer_fill_remaining: bool = True
+    normal_layer_transition_layers: int = 8
+    normal_layer_transition_clearance_factor: float = 0.45
 
     # Тип геометрии (только 'airfoil')
     geom_type: str = "airfoil"
@@ -275,6 +278,13 @@ class SamplerConfig:
                 raise ValueError(
                     f"{field_name}='{value}' не входит в допустимые значения: {_VALID_BOUNDARY_TYPES}"
                 )
+        if int(self.normal_layer_transition_layers) < 0:
+            raise ValueError("normal_layer_transition_layers must be non-negative")
+        clearance_factor = float(self.normal_layer_transition_clearance_factor)
+        if not 0.0 <= clearance_factor <= 1.0:
+            raise ValueError(
+                "normal_layer_transition_clearance_factor must be in [0, 1]"
+            )
 
     def to_dict(self) -> SamplerConfigDict:
         """
@@ -321,6 +331,8 @@ class SamplerConfig:
             normal_layer_min_point_distance_factor=self.normal_layer_min_point_distance_factor,
             normal_layer_max_points=self.normal_layer_max_points,
             normal_layer_fill_remaining=self.normal_layer_fill_remaining,
+            normal_layer_transition_layers=self.normal_layer_transition_layers,
+            normal_layer_transition_clearance_factor=self.normal_layer_transition_clearance_factor,
             geom_type=self.geom_type,
             geom_name=self.geom_name,
         )
@@ -1365,6 +1377,252 @@ class CollocationPoints:
             )
         return points
 
+    def _prepare_normal_layer_transition(
+        self,
+        result: NormalLayerResult,
+        farfield_spacing: float,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+        """Прореживает внешние слои и возвращает контур защищённого ядра.
+
+        Фоновая область должна исключать именно фактически покрытую normal-layer
+        зону, а не евклидов буфер постоянного радиуса вокруг WALL. Для замкнутого
+        профиля контур одного из внутренних рядов задаёт такое ядро. Несколько
+        рядов снаружи ядра постепенно прореживаются до шага дальней области и
+        образуют зону перекрытия с фоновыми точками.
+        """
+        points_by_column = np.asarray(result.points_by_column, dtype=np.float64)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        stats: Dict[str, Any] = {
+            "transition_applied": False,
+            "transition_layers": 0,
+        }
+
+        if (
+            not bool(result.stats.get("closed_profile", False))
+            or points_by_column.ndim != 3
+            or points_by_column.shape[0] < 3
+            or points_by_column.shape[1] < 1
+            or valid_mask.shape != points_by_column.shape[:2]
+        ):
+            stats["transition_reason"] = "ordered closed-profile columns unavailable"
+            return result.points, None, stats
+
+        n_columns, n_layers = valid_mask.shape
+        requested = max(0, int(self.config.normal_layer_transition_layers))
+        transition_layers = min(requested, max(0, n_layers - 2))
+
+        # Пользовательские глобальные фильтры меняют соответствие между сырыми
+        # колонками и result.points. В этом редком режиме оставляем набор точек
+        # нетронутым, но всё равно используем реальный внешний контур вместо SDF.
+        can_thin = (
+            transition_layers > 0
+            and float(self.config.normal_layer_min_point_distance_factor) <= 0.0
+            and not self.config.normal_layer_max_points
+        )
+        core_index = n_layers - transition_layers - 1 if can_thin else n_layers - 1
+
+        if not np.all(valid_mask[:, core_index]):
+            stats["transition_reason"] = "core layer is clipped by domain"
+            return result.points, None, stats
+
+        contour = points_by_column[:, core_index, :]
+        contour_polygon = Polygon(contour)
+        if not contour_polygon.is_valid:
+            contour_polygon = contour_polygon.buffer(0)
+        if (
+            contour_polygon.is_empty
+            or contour_polygon.geom_type != "Polygon"
+            or not contour_polygon.is_valid
+            or contour_polygon.area <= 0.0
+        ):
+            stats["transition_reason"] = "normal-layer footprint is invalid"
+            return result.points, None, stats
+        contour = np.asarray(contour_polygon.exterior.coords[:-1], dtype=np.float64)
+
+        if not can_thin:
+            stats.update({
+                "transition_reason": (
+                    "disabled or incompatible with min-spacing/max-points filters"
+                ),
+                "transition_core_layer": int(core_index),
+                "transition_core_offset": float(result.offsets[core_index]),
+            })
+            return result.points, contour, stats
+
+        profile_step = max(float(result.stats.get("profile_step", 0.0)), 1.0e-12)
+        target_far_step = max(float(farfield_spacing), profile_step)
+        keep = valid_mask.copy()
+
+        for layer_index in range(core_index + 1, n_layers):
+            t = (layer_index - core_index) / float(n_layers - 1 - core_index)
+            smooth_t = t * t * (3.0 - 2.0 * t)
+            valid_columns = np.flatnonzero(valid_mask[:, layer_index])
+            if len(valid_columns) < 4:
+                continue
+
+            row = points_by_column[valid_columns, layer_index, :]
+            perimeter = float(np.linalg.norm(np.roll(row, -1, axis=0) - row, axis=1).sum())
+            far_count = min(
+                len(valid_columns),
+                max(3, int(np.ceil(perimeter / target_far_step))),
+            )
+            target_count = int(round(
+                (1.0 - smooth_t) * len(valid_columns) + smooth_t * far_count
+            ))
+            target_count = min(len(valid_columns), max(3, target_count))
+
+            selected_positions = np.floor(
+                np.linspace(0.0, len(valid_columns), target_count, endpoint=False)
+            ).astype(np.int64)
+            keep[:, layer_index] = False
+            keep[valid_columns[selected_positions], layer_index] = True
+
+        transitioned = points_by_column[keep]
+        if len(transitioned) > 0:
+            _, unique_idx = np.unique(
+                np.round(transitioned, decimals=12),
+                axis=0,
+                return_index=True,
+            )
+            transitioned = transitioned[np.sort(unique_idx)]
+
+        stats.update({
+            "transition_applied": True,
+            "transition_layers": int(transition_layers),
+            "transition_core_layer": int(core_index),
+            "transition_core_offset": float(result.offsets[core_index]),
+            "transition_outer_offset": float(result.offsets[-1]),
+            "transition_farfield_spacing": float(farfield_spacing),
+            "transition_points_before": int(len(result.points)),
+            "transition_points_after": int(len(transitioned)),
+            "transition_points_removed": int(len(result.points) - len(transitioned)),
+        })
+        return transitioned.astype(np.float64, copy=False), contour, stats
+
+    def sample_interior_irregular_outside_layer_footprint(
+        self,
+        domain: np.ndarray,
+        num_points: int,
+        footprint_contour: np.ndarray,
+        seed_points: np.ndarray,
+        min_spacing: float,
+        hole: Optional[np.ndarray] = None,
+    ) -> List[CollocationPoint]:
+        """Заполняет фон снаружи фактического normal-layer footprint.
+
+        ``seed_points`` включают разреженные переходные ряды. Минимальное
+        расстояние до них и между новыми точками предотвращает кластеры и
+        обеспечивает мягкое сопряжение с дальней областью.
+        """
+        if num_points <= 0:
+            return []
+
+        domain_path = Path(domain)
+        footprint = np.asarray(footprint_contour, dtype=np.float64).reshape(-1, 2)
+        if len(footprint) < 3:
+            return self.sample_interior_irregular(domain, num_points)
+        footprint_path = Path(np.vstack((footprint, footprint[0])))
+
+        hole_path = None
+        if hole is not None and len(hole) >= 3:
+            hole_arr = np.asarray(hole, dtype=np.float64)
+            if np.allclose(hole_arr[0], hole_arr[-1]):
+                hole_path = Path(hole_arr)
+
+        minx, miny, maxx, maxy = domain_path.get_extents().bounds
+        spacing = max(float(min_spacing), 0.0)
+        seeds = np.asarray(seed_points, dtype=np.float64).reshape(-1, 2)
+        seed_tree = cKDTree(seeds) if spacing > 0.0 and len(seeds) else None
+
+        points: List[CollocationPoint] = []
+        accepted_xy: List[Tuple[float, float]] = []
+        spatial_hash: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        attempts = 0
+        max_attempts = max(num_points * MAX_ATTEMPTS_MULTIPLIER * 5, DEFAULT_BATCH_SIZE)
+
+        def cell_key(x: float, y: float) -> Tuple[int, int]:
+            return (
+                int(np.floor((x - minx) / spacing)),
+                int(np.floor((y - miny) / spacing)),
+            )
+
+        def separated_from_background(x: float, y: float) -> bool:
+            if spacing <= 0.0:
+                return True
+            key_x, key_y = cell_key(x, y)
+            spacing_sq = spacing * spacing
+            for ix in range(key_x - 1, key_x + 2):
+                for iy in range(key_y - 1, key_y + 2):
+                    for point_index in spatial_hash.get((ix, iy), ()):
+                        px, py = accepted_xy[point_index]
+                        if (x - px) ** 2 + (y - py) ** 2 < spacing_sq:
+                            return False
+            return True
+
+        if TQDM_AVAILABLE and self.config.show_progress:
+            pbar = tqdm(total=num_points, desc="Переход и дальнее поле")
+        else:
+            pbar = None
+            last_log = time.time()
+
+        while len(points) < num_points and attempts < max_attempts:
+            batch_size = min(DEFAULT_BATCH_SIZE, max_attempts - attempts)
+            candidates = np.column_stack((
+                np.random.uniform(minx, maxx, batch_size),
+                np.random.uniform(miny, maxy, batch_size),
+            ))
+            attempts += batch_size
+
+            valid = domain_path.contains_points(candidates)
+            valid &= ~footprint_path.contains_points(candidates)
+            if hole_path is not None:
+                valid &= ~hole_path.contains_points(candidates)
+            candidates = candidates[valid]
+            if len(candidates) == 0:
+                continue
+
+            if seed_tree is not None:
+                seed_distance, _ = seed_tree.query(candidates, k=1)
+                candidates = candidates[np.asarray(seed_distance) >= spacing]
+
+            for x_raw, y_raw in candidates:
+                if len(points) >= num_points:
+                    break
+                x = float(x_raw)
+                y = float(y_raw)
+                if not separated_from_background(x, y):
+                    continue
+                point_index = len(accepted_xy)
+                accepted_xy.append((x, y))
+                if spacing > 0.0:
+                    spatial_hash[cell_key(x, y)].append(point_index)
+                points.append(CollocationPoint(
+                    id=self._get_next_id(),
+                    x=x,
+                    y=y,
+                    boundary_type=BoundaryType.INTERIOR,
+                    on_airfoil=False,
+                    on_boundary=False,
+                ))
+                if pbar:
+                    pbar.update(1)
+
+            if not pbar and self.config.show_progress and time.time() - last_log > QUEUE_TIMEOUT:
+                logger.info(
+                    "⏳ Переход и дальнее поле: %d/%d точек, h_min=%.3e м",
+                    len(points), num_points, spacing,
+                )
+                last_log = time.time()
+
+        if pbar:
+            pbar.close()
+        if len(points) < num_points:
+            logger.warning(
+                "⚠️ Переход и дальнее поле: сгенерировано только %d из %d точек",
+                len(points), num_points,
+            )
+        return points
+
     def _sample_interior_irregular_parallel(self, domain: np.ndarray,
                                             num_points: int) -> List[CollocationPoint]:
         path = Path(domain)
@@ -1679,7 +1937,17 @@ class CollocationPoints:
             logger.error("❌ normal_layer: ошибка генерации (%s). Использую нерегулярный метод.", exc)
             return self.sample_interior_irregular(domain, num_interior_target)
 
-        self._last_normal_layer_stats = result.stats
+        step_m = float(self.config.step_size)
+        if self.config.step_units == 'mm':
+            step_m /= 1000.0
+        farfield_spacing = step_m / np.sqrt(max(float(self.config.interior_point_density), 1.0e-12))
+        transitioned_points, footprint_contour, transition_stats = (
+            self._prepare_normal_layer_transition(result, farfield_spacing)
+        )
+
+        self._last_normal_layer_stats = dict(result.stats)
+        self._last_normal_layer_stats.update(transition_stats)
+        self._last_normal_layer_stats["points"] = int(len(transitioned_points))
         if self.mesh_foil_coords is None and len(result.surface_points) > 0:
             if self.foil_is_closed:
                 self.mesh_foil_coords = np.vstack([result.surface_points, result.surface_points[0]])
@@ -1695,7 +1963,7 @@ class CollocationPoints:
                 on_airfoil=False,
                 on_boundary=False,
             )
-            for x, y in result.points
+            for x, y in transitioned_points
         ]
 
         logger.info(
@@ -1719,21 +1987,43 @@ class CollocationPoints:
             if wall_reference is None or len(wall_reference) == 0:
                 wall_reference = result.surface_points
 
-            logger.info(
-                "   Добор дальнего поля вне normal-layer: %d точек, r_min=%.3e м",
-                num_interior_target,
-                outer_layer,
+            logger.info("   Добор переходной и дальней области: %d точек", num_interior_target)
+            transition_clearance = (
+                farfield_spacing
+                * max(float(self.config.normal_layer_transition_clearance_factor), 0.0)
             )
-            far_field_points = self.sample_interior_irregular_outside_wall_distance(
-                domain,
-                num_interior_target,
-                np.asarray(wall_reference, dtype=np.float64),
-                outer_layer,
-                hole=foil if self.foil_is_closed else None,
-            )
+            if footprint_contour is not None:
+                logger.info(
+                    "   Гибридное сопряжение: core_offset=%.3e м, h_far=%.3e м, h_min=%.3e м",
+                    float(self._last_normal_layer_stats.get("transition_core_offset", outer_layer)),
+                    farfield_spacing,
+                    transition_clearance,
+                )
+                far_field_points = self.sample_interior_irregular_outside_layer_footprint(
+                    domain,
+                    num_interior_target,
+                    footprint_contour,
+                    transitioned_points,
+                    transition_clearance,
+                    hole=foil if self.foil_is_closed else None,
+                )
+                self._last_normal_layer_stats["far_field_filter"] = "layer_footprint"
+                self._last_normal_layer_stats["transition_clearance"] = float(transition_clearance)
+                self._last_normal_layer_stats["far_field_exclusion_offset"] = float(
+                    self._last_normal_layer_stats.get("transition_core_offset", outer_layer)
+                )
+            else:
+                far_field_points = self.sample_interior_irregular_outside_wall_distance(
+                    domain,
+                    num_interior_target,
+                    np.asarray(wall_reference, dtype=np.float64),
+                    outer_layer,
+                    hole=foil if self.foil_is_closed else None,
+                )
+                self._last_normal_layer_stats["far_field_filter"] = "wall_distance_fallback"
+                self._last_normal_layer_stats["far_field_min_wall_distance"] = float(outer_layer)
             layer_points.extend(far_field_points)
             self._last_normal_layer_stats["far_field_points"] = int(len(far_field_points))
-            self._last_normal_layer_stats["far_field_min_wall_distance"] = float(outer_layer)
 
         return layer_points
 
@@ -2293,6 +2583,8 @@ def S2DR() -> None:
         normal_layer_min_point_distance_factor = 0.0
         normal_layer_max_points = None
         normal_layer_fill_remaining = True
+        normal_layer_transition_layers = 8
+        normal_layer_transition_clearance_factor = 0.45
 
         if sampling_method in ('adaptive_foil', 'adaptive_all'):
             print("\nДля адаптивных методов используются два параметра:")
@@ -2377,6 +2669,13 @@ def S2DR() -> None:
 
             fill_input = input("Добрать дальнее поле случайными interior-точками? (Y/n): ").strip().lower()
             normal_layer_fill_remaining = fill_input == '' or fill_input in ('y', 'yes')
+            if normal_layer_fill_remaining:
+                transition_input = input(
+                    f"Количество внешних слоёв для плавного перехода "
+                    f"[{normal_layer_transition_layers}]: "
+                ).strip()
+                if transition_input:
+                    normal_layer_transition_layers = max(0, int(transition_input))
 
         use_mp_input = input("\nИспользовать многопроцессорность? (Y/n): ").strip().lower()
         use_mp = use_mp_input == '' or use_mp_input in ('y', 'yes')
@@ -2413,6 +2712,8 @@ def S2DR() -> None:
             normal_layer_min_point_distance_factor=normal_layer_min_point_distance_factor,
             normal_layer_max_points=normal_layer_max_points,
             normal_layer_fill_remaining=normal_layer_fill_remaining,
+            normal_layer_transition_layers=normal_layer_transition_layers,
+            normal_layer_transition_clearance_factor=normal_layer_transition_clearance_factor,
             geom_name=selected_geom,
         )
 

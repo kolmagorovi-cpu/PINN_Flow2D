@@ -17,7 +17,7 @@ Example:
     ... }
 """
 
-from typing import TypedDict, List, Optional, Union, Literal, Tuple, Any
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 from typing_extensions import NotRequired
 
 
@@ -224,6 +224,8 @@ class SamplerConfigDict(TypedDict, total=False):
     normal_layer_min_point_distance_factor: float
     normal_layer_max_points: Optional[int]
     normal_layer_fill_remaining: bool
+    normal_layer_transition_layers: int
+    normal_layer_transition_clearance_factor: float
     geom_type: str
     geom_name: Optional[str]
 
@@ -419,6 +421,7 @@ class ArchitectureDict(TypedDict, total=False):
 class CoordinateScalingDict(TypedDict, total=False):
     """Параметры масштабирования координат."""
     enabled: bool
+    mode: Literal['multiply', 'dataset_minmax']
     scale_factor: float
     input_min: float
     input_max: float
@@ -498,6 +501,7 @@ class TrainingConfigDict(TypedDict, total=False):
     lbfgs_history_size: int
     batch_size: int
     gradient_accumulation_steps: int
+    full_epoch_optimizer_step: bool
     epochs: int
     early_stopping: 'EarlyStoppingDict'
 

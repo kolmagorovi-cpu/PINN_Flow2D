@@ -251,6 +251,7 @@ training:
     num_points: null
   grad_clip: 1.0
   gradient_accumulation_steps: 2
+  full_epoch_optimizer_step: false
   lbfgs_history_size: 100
   lbfgs_max_iter: 20
   lr_cyclic_amplitude: 0.5

@@ -152,21 +152,31 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
     coordinate_scaling = architecture.get("coordinate_scaling", {})
     if not isinstance(coordinate_scaling, Mapping):
         errors.append("architecture.coordinate_scaling must be a mapping")
-    elif bool(coordinate_scaling.get("enabled", False)):
-        try:
-            scale_factor = float(
-                coordinate_scaling.get("scale_factor", 1.0)
-            )
-        except (TypeError, ValueError):
+    else:
+        scaling_mode = coordinate_scaling.get("mode", "multiply")
+        if scaling_mode not in {"multiply", "dataset_minmax"}:
             errors.append(
-                "architecture.coordinate_scaling.scale_factor must be numeric"
+                "architecture.coordinate_scaling.mode must be one of: "
+                "multiply, dataset_minmax"
             )
-        else:
-            if not math.isfinite(scale_factor) or scale_factor <= 0.0:
-                errors.append(
-                    "architecture.coordinate_scaling.scale_factor must be "
-                    "finite and positive"
+        if (
+            bool(coordinate_scaling.get("enabled", False))
+            and scaling_mode == "multiply"
+        ):
+            try:
+                scale_factor = float(
+                    coordinate_scaling.get("scale_factor", 1.0)
                 )
+            except (TypeError, ValueError):
+                errors.append(
+                    "architecture.coordinate_scaling.scale_factor must be numeric"
+                )
+            else:
+                if not math.isfinite(scale_factor) or scale_factor <= 0.0:
+                    errors.append(
+                        "architecture.coordinate_scaling.scale_factor must be "
+                        "finite and positive"
+                    )
     if architecture.get("output_dim") != 3:
         errors.append(
             "architecture.output_dim must be 3 for [u/Uinf, v/Uinf, Cp]"
@@ -384,6 +394,8 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
             f"training.{key}",
             errors,
         )
+    if not isinstance(training.get("full_epoch_optimizer_step", False), bool):
+        errors.append("training.full_epoch_optimizer_step must be boolean")
     if training.get("switch_to_lbfgs_epoch", 0) < 0:
         errors.append("training.switch_to_lbfgs_epoch must be non-negative")
     if process.get("dtype") not in {"float32", "float64"}:
