@@ -68,6 +68,9 @@ class NormalLayerResult:
     column_surface_points: np.ndarray = field(
         default_factory=lambda: np.empty((0, 2), dtype=np.float64)
     )
+    column_side_names: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=object)
+    )
     stats: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -128,6 +131,7 @@ def generate_normal_layer_points(
     point_columns = []
     valid_columns = []
     column_surface_points = []
+    column_side_names = []
     columns = 0
     accepted_normals = {"positive": 0, "negative": 0}
     for base, normal_a, normal_b in zip(base_points, normals_a, normals_b):
@@ -148,6 +152,7 @@ def generate_normal_layer_points(
                 point_columns.append(column)
                 valid_columns.append(valid)
                 column_surface_points.append(base)
+                column_side_names.append(side_name)
                 columns += 1
                 accepted_normals[side_name] += 1
 
@@ -192,6 +197,7 @@ def generate_normal_layer_points(
         points_by_column=np.asarray(point_columns, dtype=np.float64),
         valid_mask=np.asarray(valid_columns, dtype=bool),
         column_surface_points=np.asarray(column_surface_points, dtype=np.float64),
+        column_side_names=np.asarray(column_side_names, dtype=object),
         stats=stats,
     )
 

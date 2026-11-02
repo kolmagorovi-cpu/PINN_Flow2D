@@ -525,6 +525,7 @@ class CollocationPoints:
         self.foil_is_closed = False
         self.output_base: Optional[str] = None
         self._last_normal_layer_stats: Dict[str, Any] = {}
+        self.normal_layer_quads = np.empty((0, 4, 2), dtype=np.float64)
 
         os.makedirs(config.output_dir, exist_ok=True)
 
@@ -1499,6 +1500,80 @@ class CollocationPoints:
         })
         return transitioned.astype(np.float64, copy=False), contour, stats
 
+    def _build_normal_layer_quads(
+        self,
+        result: NormalLayerResult,
+        core_index: int,
+    ) -> Tuple[np.ndarray, Dict[str, int]]:
+        """Build ordered quad candidates in the unthinned normal-layer core."""
+        points = np.asarray(result.points_by_column, dtype=np.float64)
+        surface = np.asarray(result.column_surface_points, dtype=np.float64)
+        valid = np.asarray(result.valid_mask, dtype=bool)
+        sides = np.asarray(result.column_side_names, dtype=object)
+        empty = np.empty((0, 4, 2), dtype=np.float64)
+        stats = {"quad_candidates": 0, "sharp_seams": 0}
+        if (
+            points.ndim != 3
+            or len(surface) != len(points)
+            or valid.shape != points.shape[:2]
+            or len(points) < 2
+            or float(self.config.normal_layer_min_point_distance_factor) > 0.0
+            or self.config.normal_layer_max_points
+        ):
+            return empty, stats
+
+        last_layer = min(max(int(core_index), 0), points.shape[1] - 1)
+        directions = points[:, 0] - surface
+        norms = np.linalg.norm(directions, axis=1)
+        directions = directions / np.maximum(norms[:, None], 1.0e-30)
+        cos_sharp = float(np.cos(np.deg2rad(70.0)))
+        quads: List[np.ndarray] = []
+
+        def _is_valid_quad(quad: np.ndarray) -> bool:
+            edges = np.roll(quad, -1, axis=0) - quad
+            next_edges = np.roll(edges, -1, axis=0)
+            cross = edges[:, 0] * next_edges[:, 1] - edges[:, 1] * next_edges[:, 0]
+            scale = max(float(np.max(np.linalg.norm(edges, axis=1))) ** 2, 1.0e-30)
+            tol = scale * 1.0e-14
+            return bool(np.all(cross > tol) or np.all(cross < -tol))
+
+        closed = bool(result.stats.get("closed_profile", False))
+        if closed:
+            ordered = np.arange(len(points))
+            pair_groups = [list(zip(ordered, np.roll(ordered, -1)))]
+        else:
+            side_values = (
+                list(dict.fromkeys(sides.tolist()))
+                if len(sides) == len(points)
+                else [None]
+            )
+            pair_groups = []
+            for side in side_values:
+                indices = np.flatnonzero(sides == side) if side is not None else np.arange(len(points))
+                pair_groups.append(list(zip(indices[:-1], indices[1:])))
+
+        for pairs in pair_groups:
+            for left, right in pairs:
+                if float(np.dot(directions[left], directions[right])) < cos_sharp:
+                    stats["sharp_seams"] += 1
+                    continue
+                for layer in range(last_layer + 1):
+                    if not (valid[left, layer] and valid[right, layer]):
+                        continue
+                    if layer > 0 and not (valid[left, layer - 1] and valid[right, layer - 1]):
+                        continue
+                    inner = surface if layer == 0 else points[:, layer - 1]
+                    outer = points[:, layer]
+                    quad = np.asarray(
+                        [inner[left], inner[right], outer[right], outer[left]],
+                        dtype=np.float64,
+                    )
+                    if _is_valid_quad(quad):
+                        quads.append(quad)
+
+        stats["quad_candidates"] = len(quads)
+        return (np.asarray(quads, dtype=np.float64) if quads else empty), stats
+
     def sample_interior_irregular_outside_layer_footprint(
         self,
         domain: np.ndarray,
@@ -1925,6 +2000,7 @@ class CollocationPoints:
         использоваться обе стороны.
         """
         self._last_normal_layer_stats = {}
+        self.normal_layer_quads = np.empty((0, 4, 2), dtype=np.float64)
         if foil is None or len(foil) < 2:
             logger.warning("⚠️ Для normal_layer нужен профиль. Использую нерегулярный метод.")
             return self.sample_interior_irregular(domain, num_interior_target)
@@ -1944,9 +2020,17 @@ class CollocationPoints:
         transitioned_points, footprint_contour, transition_stats = (
             self._prepare_normal_layer_transition(result, farfield_spacing)
         )
+        core_index = int(
+            transition_stats.get("transition_core_layer", len(result.offsets) - 1)
+        )
+        self.normal_layer_quads, quad_stats = self._build_normal_layer_quads(
+            result,
+            core_index,
+        )
 
         self._last_normal_layer_stats = dict(result.stats)
         self._last_normal_layer_stats.update(transition_stats)
+        self._last_normal_layer_stats.update(quad_stats)
         self._last_normal_layer_stats["points"] = int(len(transitioned_points))
         if self.mesh_foil_coords is None and len(result.surface_points) > 0:
             if self.foil_is_closed:
@@ -2079,6 +2163,7 @@ class CollocationPoints:
         logger.info("=" * 60)
         logger.info("ГЕНЕРАЦИЯ ТОЧЕК КОЛЛОКАЦИИ")
         logger.info("=" * 60)
+        self.normal_layer_quads = np.empty((0, 4, 2), dtype=np.float64)
 
         step_m = self.config.step_size
         if self.config.step_units == 'mm':

@@ -128,6 +128,9 @@ def test_hybrid_transition_fills_sharp_trailing_edge_wake() -> None:
     assert sampler._last_normal_layer_stats["far_field_filter"] == "layer_footprint"
     assert sampler._last_normal_layer_stats["transition_applied"] is True
     assert sampler._last_normal_layer_stats["transition_points_removed"] > 0
+    assert sampler._last_normal_layer_stats["quad_candidates"] > 0
+    assert sampler._last_normal_layer_stats["sharp_seams"] >= 1
+    assert len(sampler.normal_layer_quads) > 0
 
 
 if __name__ == "__main__":

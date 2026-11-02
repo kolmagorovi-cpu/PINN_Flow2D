@@ -123,6 +123,9 @@ class MeshData:
     bnd_face_area: np.ndarray
     node_type: np.ndarray
     node_bnd_type: np.ndarray
+    cell_nodes: Optional[np.ndarray] = None
+    cell_offsets: Optional[np.ndarray] = None
+    quads: Optional[np.ndarray] = None
 
     @property
     def n_nodes(self) -> int:
@@ -1059,6 +1062,13 @@ class DataHandler:
                 bnd_face_area=np.array(data['bnd_face_area']),
                 node_type=np.array(data['node_type']).astype(str),
                 node_bnd_type=np.array(data['node_bnd_type']).astype(str),
+                cell_nodes=(
+                    np.array(data['cell_nodes']) if 'cell_nodes' in data.files else None
+                ),
+                cell_offsets=(
+                    np.array(data['cell_offsets']) if 'cell_offsets' in data.files else None
+                ),
+                quads=np.array(data['quads']) if 'quads' in data.files else None,
             )
         logger.info(
             "FVM-сетка загружена: %d узлов, %d треуг., %d вн. граней, %d гран. граней",
@@ -1086,6 +1096,15 @@ class DataHandler:
             if bfaces else np.empty((0, 2), dtype=np.float64),
             node_type=np.array([nd.node_type for nd in mesh.nodes], dtype=object),
             node_bnd_type=np.array([nd.boundary_type for nd in mesh.nodes], dtype=object),
+            cell_nodes=(
+                np.concatenate(mesh.cells).astype(np.int32)
+                if mesh.cells else np.empty(0, dtype=np.int32)
+            ),
+            cell_offsets=np.concatenate((
+                np.zeros(1, dtype=np.int64),
+                np.cumsum([len(cell) for cell in mesh.cells], dtype=np.int64),
+            )),
+            quads=np.asarray(mesh.quads, dtype=np.int32),
         )
         self._prepare_fvm_tensors()
 
@@ -1135,10 +1154,14 @@ class DataHandler:
 
         from airfoil_pinn.sampling.mesh import Mesh2D
 
+        quad_cells_xy = None
+        if self.mesh_data.quads is not None and len(self.mesh_data.quads):
+            quad_cells_xy = self.mesh_data.coords[self.mesh_data.quads]
         mesh = Mesh2D(
             self.mesh_points_from_dataset(),
             domain_coords=self.mesh_domain_coords,
             airfoil_coords=self.mesh_airfoil_coords,
+            quad_cells_xy=quad_cells_xy,
         )
         mesh.build(verbose=verbose)
         return mesh
@@ -1489,6 +1512,9 @@ class DataHandler:
                 'bnd_face_area': self.mesh_data.bnd_face_area,
                 'node_type': self.mesh_data.node_type,
                 'node_bnd_type': self.mesh_data.node_bnd_type,
+                'cell_nodes': self.mesh_data.cell_nodes,
+                'cell_offsets': self.mesh_data.cell_offsets,
+                'quads': self.mesh_data.quads,
             }
 
         return {

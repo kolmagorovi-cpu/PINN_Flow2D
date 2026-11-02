@@ -682,16 +682,26 @@ class Mesh2D:
         points,
         domain_coords: Optional[np.ndarray] = None,
         airfoil_coords: Optional[np.ndarray] = None,
+        quad_cells_xy: Optional[np.ndarray] = None,
     ) -> None:
         self._raw_points = points
         self._domain_coords = (np.asarray(domain_coords, dtype=np.float64)
                                if domain_coords is not None else None)
         self._airfoil_coords = (np.asarray(airfoil_coords, dtype=np.float64)
                                 if airfoil_coords is not None else None)
+        self._quad_cells_xy = (
+            np.asarray(quad_cells_xy, dtype=np.float64).reshape(-1, 4, 2)
+            if quad_cells_xy is not None and np.asarray(quad_cells_xy).size
+            else np.empty((0, 4, 2), dtype=np.float64)
+        )
 
         self._nodes: List[MeshNode] = []
         self._coords: Optional[np.ndarray] = None
         self._triangles: Optional[np.ndarray] = None
+        self._cells: List[np.ndarray] = []
+        self._quads = np.empty((0, 4), dtype=np.int32)
+        self._requested_quads: List[Tuple[int, int, int, int]] = []
+        self._normal_layer_edges: Set[Tuple[int, int]] = set()
         self._cv_volumes: Optional[np.ndarray] = None
         self._faces: List[InternalFace] = []
         self._boundary_faces: List[BoundaryFace] = []
@@ -716,6 +726,7 @@ class Mesh2D:
             sampler.points,
             domain_coords=getattr(sampler, "domain_coords", None),
             airfoil_coords=mesh_foil_coords,
+            quad_cells_xy=getattr(sampler, "normal_layer_quads", None),
             **kwargs,
         )
 
@@ -796,11 +807,13 @@ class Mesh2D:
             "граничные грани",
             "консервативность",
         ]
+        step_names.insert(4, "mixed tri/quad cells")
         step_fns = [
             self._prepare_vertices,
             self._initial_delaunay,
             self._insert_all_constrained_edges,
             self._remove_holes,
+            self._build_mixed_cells,
             self._compute_cv_volumes,
             self._compute_internal_faces,
             self._compute_boundary_faces,
@@ -817,12 +830,14 @@ class Mesh2D:
             if i == 3:
                 return f"{len(self._triangles)} треуг. после удаления дырок"
             if i == 4:
-                return "КО готовы"
+                return f"{len(self._quads)} quad, {len(self._cells) - len(self._quads)} tri"
             if i == 5:
-                return f"{len(self._faces)} внутр. граней"
+                return "КО готовы"
             if i == 6:
-                return f"{len(self._boundary_faces)} граничн. граней"
+                return f"{len(self._faces)} внутр. граней"
             if i == 7:
+                return f"{len(self._boundary_faces)} граничн. граней"
+            if i == 8:
                 if self._conservativity_ok is None:
                     return "не запускалась"
                 return "OK" if self._conservativity_ok else "НАРУШЕНА ⚠"
@@ -866,6 +881,14 @@ class Mesh2D:
     @property
     def triangles(self) -> np.ndarray:
         self._assert_built(); return self._triangles
+
+    @property
+    def quads(self) -> np.ndarray:
+        self._assert_built(); return self._quads
+
+    @property
+    def cells(self) -> List[np.ndarray]:
+        self._assert_built(); return self._cells
 
     @property
     def cv_volumes(self) -> np.ndarray:
@@ -927,7 +950,10 @@ class Mesh2D:
             "num_interior_nodes": n_int,
             "num_boundary_nodes": n_bnd,
             "boundary_type_counts": bt_counts,
-            "num_triangles": int(len(self._triangles)),
+            "num_triangles": int(len(self._cells) - len(self._quads)),
+            "num_aux_triangles": int(len(self._triangles)),
+            "num_cells": int(len(self._cells)),
+            "num_quads": int(len(self._quads)),
             "num_internal_faces": len(self._faces),
             "num_boundary_faces": len(self._boundary_faces),
             "cv_volume_min": float(self._cv_volumes.min()),
@@ -963,11 +989,20 @@ class Mesh2D:
                     if self._faces else np.empty((0, 2), dtype=np.float64))
         bnd_area = (np.array([f.area_vector for f in self._boundary_faces], dtype=np.float64)
                     if self._boundary_faces else np.empty((0, 2), dtype=np.float64))
+        cell_offsets = np.zeros(len(self._cells) + 1, dtype=np.int64)
+        if self._cells:
+            cell_offsets[1:] = np.cumsum([len(cell) for cell in self._cells])
+            cell_nodes = np.concatenate(self._cells).astype(np.int32, copy=False)
+        else:
+            cell_nodes = np.empty(0, dtype=np.int32)
 
         np.savez_compressed(
             path,
             coords=self._coords,
             triangles=self._triangles,
+            quads=self._quads,
+            cell_nodes=cell_nodes,
+            cell_offsets=cell_offsets,
             cv_volumes=self._cv_volumes,
             int_face_node_i=np.array([f.node_i for f in self._faces], dtype=np.int32),
             int_face_node_j=np.array([f.node_j for f in self._faces], dtype=np.int32),
@@ -1016,15 +1051,15 @@ class Mesh2D:
             vols = self._cv_volumes
             norm = Normalize(vmin=vols.min(), vmax=vols.max())
             cmap = plt.cm.viridis
-            polys = c[self._triangles]
-            avg_vol = vols[self._triangles].mean(axis=1)
+            polys = [c[cell] for cell in self._cells]
+            avg_vol = np.asarray([vols[cell].mean() for cell in self._cells])
             pc = PolyCollection(polys, array=avg_vol, cmap=cmap, norm=norm,
                                 edgecolors="grey", linewidths=0.3, alpha=0.8)
             ax.add_collection(pc)
             fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax,
                          label="Ср. CV [м²]")
         elif show_triangulation:
-            pc = PolyCollection(c[self._triangles], facecolors="none",
+            pc = PolyCollection([c[cell] for cell in self._cells], facecolors="none",
                                 edgecolors="steelblue", linewidths=0.4)
             ax.add_collection(pc)
 
@@ -1058,7 +1093,8 @@ class Mesh2D:
         ax.set_xlabel("X, м"); ax.set_ylabel("Y, м")
         ax.set_title(
             f"CDT FVM-сетка: {len(self._nodes)} узлов, "
-            f"{len(self._triangles)} треуг., {len(self._faces)} граней"
+            f"{len(self._cells) - len(self._quads)} tri, "
+            f"{len(self._quads)} quad, {len(self._faces)} граней"
         )
         ax.legend(loc="upper right", fontsize=8, ncol=2)
         plt.tight_layout()
@@ -1435,6 +1471,7 @@ class Mesh2D:
                 if self._nodes[vi].boundary_type == "_domain":
                     self._nodes[vi].boundary_type = "interior"
 
+        self._map_quad_topology()
         return
 
         coords_arr = np.empty((0, 2), dtype=np.float64)
@@ -1488,6 +1525,31 @@ class Mesh2D:
                     if nd.boundary_type == "_domain":
                         _, nn = tree.query(self._coords[vi])
                         nd.boundary_type = bnd_bt[nn]
+
+    def _map_quad_topology(self) -> None:
+        """Map requested quad coordinates to the deduplicated mesh vertices."""
+        self._requested_quads = []
+        self._normal_layer_edges = set()
+        if len(self._quad_cells_xy) == 0 or len(self._coords) == 0:
+            return
+
+        tree = cKDTree(self._coords)
+        span = np.ptp(self._coords, axis=0)
+        tol = max(float(np.linalg.norm(span)) * 1.0e-10, 1.0e-12)
+        for quad_xy in self._quad_cells_xy:
+            distances, indices = tree.query(quad_xy)
+            quad = tuple(int(i) for i in indices)
+            if float(np.max(distances)) > tol or len(set(quad)) != 4:
+                continue
+            self._requested_quads.append(quad)
+            for a, b in zip(quad, quad[1:] + quad[:1]):
+                self._normal_layer_edges.add((min(a, b), max(a, b)))
+
+        logger.info(
+            "Normal layer: mapped %d/%d quad candidates",
+            len(self._requested_quads),
+            len(self._quad_cells_xy),
+        )
 
     def _initial_delaunay(self) -> None:
         """Начальная триангуляция Делоне (scipy) по всему пулу вершин."""
@@ -1750,7 +1812,8 @@ class Mesh2D:
             return
 
         dom_edges, foil_edges = self._build_constrained_edge_set()
-        required = dom_edges + foil_edges
+        layer_edges = list(self._normal_layer_edges)
+        required = dom_edges + foil_edges + layer_edges
 
         # ── Конвертация: List → Dict (O(T), один раз) ────────────────────────
         # Dict[tid → (a,b,c)] позволяет удалять/добавлять треугольники без
@@ -1795,7 +1858,10 @@ class Mesh2D:
         # Подрёбра помещаются в начало очереди (они короче и вставляются первыми).
         foil_keys_orig: Set[Tuple[int, int]] = {(min(s, t), max(s, t)) for s, t in foil_edges}
         dom_keys_orig: Set[Tuple[int, int]] = {(min(s, t), max(s, t)) for s, t in dom_edges}
-        all_constrained_keys: Set[Tuple[int, int]] = foil_keys_orig | dom_keys_orig
+        layer_keys_orig: Set[Tuple[int, int]] = set(layer_edges)
+        all_constrained_keys: Set[Tuple[int, int]] = (
+            foil_keys_orig | dom_keys_orig | layer_keys_orig
+        )
         foil_constrained_keys: Set[Tuple[int, int]] = set(foil_keys_orig)
         dom_constrained_keys: Set[Tuple[int, int]] = set(dom_keys_orig)
 
@@ -1989,20 +2055,84 @@ class Mesh2D:
         self._tris_list = tris
         self._triangles = np.array(tris, dtype=np.int32) if tris else np.empty((0, 3), dtype=np.int32)
 
+    def _build_mixed_cells(self) -> None:
+        """Replace the two triangles of each valid layer patch with one quad."""
+        triangles = np.asarray(self._triangles, dtype=np.int32)
+        triangle_lookup: Dict[frozenset, int] = {}
+        for index, triangle in enumerate(triangles):
+            triangle_lookup[frozenset(map(int, triangle))] = index
+
+        used: Set[int] = set()
+        quads: List[np.ndarray] = []
+        for requested in self._requested_quads:
+            pair: Set[int] = set()
+            for omit in range(4):
+                key = frozenset(v for i, v in enumerate(requested) if i != omit)
+                triangle_index = triangle_lookup.get(key)
+                if triangle_index is not None and triangle_index not in used:
+                    pair.add(triangle_index)
+            if len(pair) != 2:
+                continue
+            pair = list(pair)
+            if set(map(int, triangles[pair[0]])) | set(map(int, triangles[pair[1]])) != set(requested):
+                continue
+            polygon = np.asarray(requested, dtype=np.int32)
+            xy = self._coords[polygon]
+            signed_area = 0.5 * float(
+                np.sum(xy[:, 0] * np.roll(xy[:, 1], -1) - xy[:, 1] * np.roll(xy[:, 0], -1))
+            )
+            if abs(signed_area) <= 1.0e-20:
+                continue
+            if signed_area < 0.0:
+                polygon = polygon[::-1]
+            used.update(pair)
+            quads.append(polygon)
+
+        remaining = [triangle.copy() for i, triangle in enumerate(triangles) if i not in used]
+        self._quads = (
+            np.asarray(quads, dtype=np.int32)
+            if quads
+            else np.empty((0, 4), dtype=np.int32)
+        )
+        self._cells = remaining + [quad.copy() for quad in self._quads]
+        logger.info(
+            "Mixed mesh: %d triangles + %d quadrilaterals (%d merged triangles)",
+            len(remaining), len(self._quads), len(used),
+        )
+
     def _compute_cv_volumes(self) -> None:
         """CV_area(i) = (1/3) × Σ area(T) по треугольникам, содержащим i."""
-        c = self._coords
-        tri = self._triangles
-        a, b, k = tri[:, 0], tri[:, 1], tri[:, 2]
-        areas = 0.5 * np.abs(
-            (c[b, 0] - c[a, 0]) * (c[k, 1] - c[a, 1])
-            - (c[k, 0] - c[a, 0]) * (c[b, 1] - c[a, 1])
-        )
         cv = np.zeros(len(self._nodes), dtype=np.float64)
-        np.add.at(cv, a, areas / 3.0)
-        np.add.at(cv, b, areas / 3.0)
-        np.add.at(cv, k, areas / 3.0)
+        for cell in self._cells:
+            xy = self._coords[cell]
+            centroid = self._polygon_centroid(xy)
+            mids = 0.5 * (xy + np.roll(xy, -1, axis=0))
+            for local, node in enumerate(cell):
+                subcell = np.asarray(
+                    [xy[local], mids[local], centroid, mids[local - 1]],
+                    dtype=np.float64,
+                )
+                cv[int(node)] += self._polygon_area(subcell)
         self._cv_volumes = cv
+
+    @staticmethod
+    def _polygon_area(xy: np.ndarray) -> float:
+        return 0.5 * abs(float(
+            np.sum(xy[:, 0] * np.roll(xy[:, 1], -1) - xy[:, 1] * np.roll(xy[:, 0], -1))
+        ))
+
+    @staticmethod
+    def _polygon_centroid(xy: np.ndarray) -> np.ndarray:
+        x_next = np.roll(xy[:, 0], -1)
+        y_next = np.roll(xy[:, 1], -1)
+        cross = xy[:, 0] * y_next - x_next * xy[:, 1]
+        area6 = 3.0 * float(np.sum(cross))
+        if abs(area6) <= 1.0e-30:
+            return np.mean(xy, axis=0)
+        return np.asarray([
+            np.sum((xy[:, 0] + x_next) * cross) / area6,
+            np.sum((xy[:, 1] + y_next) * cross) / area6,
+        ], dtype=np.float64)
 
     def _compute_internal_faces(self) -> None:
         """
@@ -2018,23 +2148,27 @@ class Mesh2D:
            для всех граничных узлов.
         """
         coords = self._coords
-        triangles = self._triangles
-        centroids = coords[triangles].mean(axis=1)
+        cells = self._cells
+        centroids = np.asarray(
+            [self._polygon_centroid(coords[cell]) for cell in cells],
+            dtype=np.float64,
+        )
 
         edge_map: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
-        for t_idx, (a, b, c) in enumerate(triangles):
-            for u, v in ((a, b), (b, c), (c, a)):
+        for cell_idx, cell in enumerate(cells):
+            for u, v in zip(cell, np.roll(cell, -1)):
+                u, v = int(u), int(v)
                 key = (min(u, v), max(u, v))
-                edge_map.setdefault(key, []).append((t_idx, u, v))
+                edge_map.setdefault(key, []).append((cell_idx, u, v))
 
         faces: List[InternalFace] = []
         for (vi, vj), adj in edge_map.items():
             if len(adj) == 2:
-                t1_idx, a1, b1 = adj[0]
-                t2_idx, _, _ = adj[1]
+                cell1_idx, a1, b1 = adj[0]
+                cell2_idx, _, _ = adj[1]
 
-                G1 = centroids[t1_idx]
-                G2 = centroids[t2_idx]
+                G1 = centroids[cell1_idx]
+                G2 = centroids[cell2_idx]
                 dG = G2 - G1
                 S = np.array([-dG[1], dG[0]], dtype=np.float64)
 
@@ -2050,12 +2184,9 @@ class Mesh2D:
                 # Важно: используем vi/vj (канонические), а не a1/b1.
                 # Флип (i,j)=(j,i); S=-S знако-инвариантен: dot(-S,c[a]-c[b])=dot(S,c[b]-c[a]).
                 # Проверяем ориентацию через vi/vj напрямую.
-                t1_idx, _, _ = adj[0]
-                t1_tri = triangles[t1_idx]
-                k_v = next(v for v in t1_tri if v != vi and v != vj)
-
+                cell_idx, _, _ = adj[0]
                 M_ij = 0.5 * (coords[vi] + coords[vj])
-                G_T = (coords[vi] + coords[vj] + coords[k_v]) / 3.0
+                G_T = centroids[cell_idx]
                 dG = G_T - M_ij
                 S = np.array([-dG[1], dG[0]], dtype=np.float64)
 
@@ -2075,14 +2206,18 @@ class Mesh2D:
         Каждое ребро порождает по одному BoundaryFace для обоих его концов.
         """
         coords = self._coords
-        triangles = self._triangles
+        cells = self._cells
+        centroids = np.asarray(
+            [self._polygon_centroid(coords[cell]) for cell in cells],
+            dtype=np.float64,
+        )
 
-        edge_map: Dict[Tuple[int, int], List[Tuple[int, Tuple[int, int, int]]]] = {}
-        for t_idx, tri in enumerate(triangles):
-            a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-            for u, v in ((a, b), (b, c), (c, a)):
+        edge_map: Dict[Tuple[int, int], List[int]] = {}
+        for cell_idx, cell in enumerate(cells):
+            for u, v in zip(cell, np.roll(cell, -1)):
+                u, v = int(u), int(v)
                 key = (min(u, v), max(u, v))
-                edge_map.setdefault(key, []).append((t_idx, (a, b, c)))
+                edge_map.setdefault(key, []).append(cell_idx)
 
         node_bt = [nd.boundary_type for nd in self._nodes]
         foil_edges: Set[Tuple[int, int]] = getattr(self, "_foil_constrained_edges", set())
@@ -2092,14 +2227,13 @@ class Mesh2D:
             if len(adj) != 1:
                 continue  # внутреннее ребро
 
-            _, (a, b, c) = adj[0]
+            cell_idx = adj[0]
             # k — третья вершина (не vi, не vj)
-            k = next(v for v in (a, b, c) if v != vi and v != vj)
 
             edge_vec = coords[vj] - coords[vi]
             S_raw = np.array([-edge_vec[1], edge_vec[0]], dtype=np.float64)
             # Направить outward: от k наружу
-            if np.dot(S_raw, coords[vi] - coords[k]) < 0:
+            if np.dot(S_raw, coords[vi] - centroids[cell_idx]) < 0:
                 S_raw = -S_raw
 
             area_vec = 0.5 * S_raw
@@ -2172,13 +2306,21 @@ class Mesh2D:
 
         edge_counts: Counter = Counter()
         used_nodes: Set[int] = set()
-        for a_i, b_i, c_i in triangles:
-            ia, ib, ic = int(a_i), int(b_i), int(c_i)
-            used_nodes.update((ia, ib, ic))
-            for u, v in ((ia, ib), (ib, ic), (ic, ia)):
+        invalid_cells = 0
+        for cell in self._cells:
+            vertices = list(map(int, cell))
+            used_nodes.update(vertices)
+            if len(vertices) not in (3, 4) or len(set(vertices)) != len(vertices):
+                invalid_cells += 1
+            if self._polygon_area(coords[cell]) <= area_tol:
+                invalid_cells += 1
+            for u, v in zip(vertices, vertices[1:] + vertices[:1]):
                 if u > v:
                     u, v = v, u
                 edge_counts[(u, v)] += 1
+
+        if invalid_cells:
+            errors.append(f"{invalid_cells} invalid mixed cells")
 
         nonmanifold = sum(1 for n_adj in edge_counts.values() if n_adj > 2)
         if nonmanifold:
