@@ -129,6 +129,8 @@ class ConfigManager:
                     'enabled': False,
                     'weight': 1.0,
                     'batch_interval': 1,
+                    'forward_chunk_size': 32768,
+                    'activation_checkpoint': True,
                     'reduction': 'divergence_l2_volume',
                     'schedule': 'every_optimizer_step',
                 },
@@ -469,10 +471,16 @@ class ConfigManager:
             if isinstance(fvm_cfg, dict)
             else 'every_optimizer_step'
         )
+        fvm_chunk = (
+            fvm_cfg.get('forward_chunk_size', 32768)
+            if isinstance(fvm_cfg, dict)
+            else 32768
+        )
         print(
             f"  fvm_mass_flow   : {fvm_enabled} "
             f"(weight={fvm_weight}, schedule={fvm_schedule}, "
-            f"interval={fvm_bi}, reduction={fvm_red})"
+            f"interval={fvm_bi}, reduction={fvm_red}, "
+            f"face_chunk={fvm_chunk})"
         )
         print()
 

@@ -149,11 +149,20 @@ class LossComputer:
                     fvm_cfg.get('loss_reduction', 'divergence_l2_volume'),
                 )
             )
+            self.fvm_forward_chunk_size: int = max(
+                1,
+                int(fvm_cfg.get('forward_chunk_size', 32768)),
+            )
+            self.fvm_activation_checkpoint: bool = bool(
+                fvm_cfg.get('activation_checkpoint', True)
+            )
         else:
             self.fvm_weight: float = float(fvm_cfg)
             self.fvm_batch_interval: int = 1
             self.fvm_schedule: str = 'every_optimizer_step'
             self.fvm_loss_reduction: str = 'legacy'
+            self.fvm_forward_chunk_size: int = 32768
+            self.fvm_activation_checkpoint: bool = True
         # Заполняется из PINNSolver при наличии mesh_file в конфиге
         self.fvm: Optional["FVMResiduals"] = None
 
@@ -599,14 +608,18 @@ class LossComputer:
     def compute_fvm_loss(
         self,
         u_fvm: torch.Tensor,
+        u_boundary_fvm: Optional[torch.Tensor] = None,
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Вычисляет взвешенную FVM-потерю закона сохранения массы.
 
         Args:
-            u_fvm: тензор (N, 2) — нормированная скорость [u, v] во всех
-                   N узлах сетки (порядок совпадает с точками коллокации)
+            u_fvm: ``(Q, 2)`` direct PINN velocities at internal dual-face
+                segment midpoints. Legacy callers may still pass ``(N, 2)``
+                nodal velocities when ``u_boundary_fvm`` is omitted.
+            u_boundary_fvm: ``(B, 2)`` direct PINN velocities at physical
+                boundary half-edge midpoints.
             freestream_velocity: case-local ``(cos(alpha), sin(alpha))``
 
         Returns:
@@ -614,12 +627,14 @@ class LossComputer:
         """
         return self.compute_fvm_metrics(
             u_fvm,
+            u_boundary_fvm=u_boundary_fvm,
             freestream_velocity=freestream_velocity,
         )["weighted"]
 
     def compute_fvm_metrics(
         self,
         u_fvm: torch.Tensor,
+        u_boundary_fvm: Optional[torch.Tensor] = None,
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return the FVM mean-square objective and RMS diagnostic.
@@ -631,11 +646,22 @@ class LossComputer:
         if self.fvm is None:
             zero = torch.zeros((), device=self.device, dtype=self.dtype)
             return {"mse": zero, "raw": zero, "weighted": zero, "rms": zero}
-        mse, rms = self.fvm.loss_and_divergence_rms(
-            u_fvm,
-            reduction=self.fvm_loss_reduction,
-            freestream_velocity=freestream_velocity,
-        )
+        if u_boundary_fvm is None:
+            # Compatibility path for analytical tests and old external
+            # callers. Production training always supplies direct PINN
+            # predictions for internal and boundary quadrature points.
+            mse, rms = self.fvm.loss_and_divergence_rms(
+                u_fvm,
+                reduction=self.fvm_loss_reduction,
+                freestream_velocity=freestream_velocity,
+            )
+        else:
+            mse, rms = self.fvm.loss_and_divergence_rms_quadrature(
+                u_fvm,
+                u_boundary_fvm,
+                reduction=self.fvm_loss_reduction,
+                freestream_velocity=freestream_velocity,
+            )
         return {
             "mse": mse,
             "raw": mse,
@@ -1042,8 +1068,9 @@ class LossComputer:
         Интегральный баланс массы по FVM-граням.
 
         bnd_area хранит внешние векторы площадей/длин граней, поэтому сумма
-        flux = u · S по inlet+outlet является signed outflow. Для корректного
-        баланса целевое значение по умолчанию равно 0.
+        flux = u · S по всем открытым границам (inlet, outlet, farfield и
+        velocity_dirichlet) является signed outflow. Для корректного баланса
+        целевое значение по умолчанию равно 0.
         """
         if not self.integral_condition:
             return torch.tensor(0.0, device=self.device, dtype=self.dtype)
@@ -1055,9 +1082,13 @@ class LossComputer:
             from airfoil_pinn.physics.fvm import BC_CODES
             inlet_code = BC_CODES['inlet']
             outlet_code = BC_CODES['outlet']
+            farfield_code = BC_CODES['farfield']
+            velocity_code = BC_CODES['velocity_dirichlet']
         except Exception:
             inlet_code = 1
             outlet_code = 2
+            farfield_code = 6
+            velocity_code = 8
 
         device = velocity_nodes.device
         dtype = velocity_nodes.dtype
@@ -1065,7 +1096,12 @@ class LossComputer:
         bnd_area = bnd_area.to(device=device, dtype=dtype)
         bnd_type = bnd_type.to(device=device, dtype=torch.long)
 
-        mask = (bnd_type == inlet_code) | (bnd_type == outlet_code)
+        mask = (
+            (bnd_type == inlet_code)
+            | (bnd_type == outlet_code)
+            | (bnd_type == farfield_code)
+            | (bnd_type == velocity_code)
+        )
         if not bool(mask.any()):
             return torch.tensor(0.0, device=device, dtype=dtype)
 
@@ -1078,6 +1114,55 @@ class LossComputer:
         total_flux = flux[mask].sum()
         target = torch.as_tensor(self.integral_target, device=device, dtype=dtype)
         return (total_flux - target) ** 2
+
+    def compute_boundary_quadrature_integral_loss(
+        self,
+        boundary_velocity: torch.Tensor,
+        bnd_area: torch.Tensor,
+        bnd_type: torch.Tensor,
+        boundary_x: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Mass-balance loss from direct predictions at boundary midpoints."""
+        if not self.integral_condition or boundary_velocity.numel() == 0:
+            return torch.zeros((), device=self.device, dtype=self.dtype)
+        try:
+            from airfoil_pinn.physics.fvm import BC_CODES
+            inlet_code = BC_CODES['inlet']
+            outlet_code = BC_CODES['outlet']
+            farfield_code = BC_CODES['farfield']
+            velocity_code = BC_CODES['velocity_dirichlet']
+        except Exception:
+            inlet_code, outlet_code, farfield_code, velocity_code = 1, 2, 6, 8
+
+        device = boundary_velocity.device
+        dtype = boundary_velocity.dtype
+        area = bnd_area.to(device=device, dtype=dtype)
+        types = bnd_type.to(device=device, dtype=torch.long)
+        if boundary_velocity.shape != area.shape:
+            raise ValueError(
+                "Boundary quadrature velocity and area vectors must have "
+                f"the same shape, got {boundary_velocity.shape} and {area.shape}"
+            )
+        mask = (
+            (types == inlet_code)
+            | (types == outlet_code)
+            | (types == farfield_code)
+            | (types == velocity_code)
+        )
+        if not bool(mask.any()):
+            return torch.zeros((), device=device, dtype=dtype)
+
+        flux = (boundary_velocity * area).sum(dim=1)
+        if self.flow_type == 'axisymmetric' and boundary_x is not None:
+            radius = boundary_x.to(device=device, dtype=dtype).flatten()
+            flux = flux * torch.as_tensor(
+                self.two_pi,
+                device=device,
+                dtype=dtype,
+            ) * torch.clamp(radius, min=0.0)
+        total_flux = flux[mask].sum()
+        target = torch.as_tensor(self.integral_target, device=device, dtype=dtype)
+        return (total_flux - target).square()
 
     def compute_integral_loss(
         self,

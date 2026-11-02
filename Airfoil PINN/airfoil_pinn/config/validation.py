@@ -333,6 +333,15 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
             "loss_weights.fvm.batch_interval",
             errors,
         )
+        _positive_integer(
+            fvm.get("forward_chunk_size", 32768),
+            "loss_weights.fvm.forward_chunk_size",
+            errors,
+        )
+        if not isinstance(fvm.get("activation_checkpoint", True), bool):
+            errors.append(
+                "loss_weights.fvm.activation_checkpoint must be boolean"
+            )
         reduction = str(
             fvm.get(
                 "reduction",

@@ -161,8 +161,10 @@ loss_weights:
     velocity_dirichlet: 1.0
     wall: 1.0
   fvm:
+    activation_checkpoint: true
     batch_interval: 5
     enabled: true
+    forward_chunk_size: 32768
     reduction: divergence_l2_volume
     schedule: every_k_optimizer_steps
     weight: 1.0

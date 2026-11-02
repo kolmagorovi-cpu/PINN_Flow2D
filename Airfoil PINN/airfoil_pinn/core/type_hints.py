@@ -473,6 +473,8 @@ class FVMLossConfigDict(TypedDict, total=False):
     enabled: bool
     weight: float
     batch_interval: int
+    forward_chunk_size: int
+    activation_checkpoint: bool
     reduction: str
     schedule: str
 

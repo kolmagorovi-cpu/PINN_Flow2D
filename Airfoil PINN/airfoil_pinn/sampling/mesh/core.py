@@ -47,7 +47,13 @@ from scipy.spatial import Delaunay, cKDTree
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["BoundaryFace", "InternalFace", "Mesh2D", "MeshNode"]
+__all__ = [
+    "BoundaryFace",
+    "InternalFace",
+    "Mesh2D",
+    "MeshNode",
+    "build_dual_face_quadrature",
+]
 
 # Допуск детерминанта в тесте описанной окружности: предотвращает
 # случайные флипы кокруговых или почти-кокруговых рёбер.
@@ -133,6 +139,126 @@ class _PointAdapter:
     on_airfoil: bool
     on_boundary: bool
     segment_id: int
+
+
+def build_dual_face_quadrature(
+    coords: np.ndarray,
+    cells: List[np.ndarray],
+    int_face_node_i: np.ndarray,
+    int_face_node_j: np.ndarray,
+    int_face_area: np.ndarray,
+    bnd_face_node: np.ndarray,
+    bnd_face_neighbor: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """Build midpoint quadrature for the median-dual FVM faces.
+
+    A dual face associated with a primal edge is generally a polyline: one
+    segment connects the primal-edge midpoint to the centroid of every
+    adjacent cell.  Evaluating one velocity on the aggregated face would
+    therefore replace the real dual face by a straight surrogate.  This
+    helper returns one midpoint and one area vector per *straight segment*.
+
+    The internal segment vectors are oriented from ``node_i`` towards
+    ``node_j``.  Consequently every segment flux can be scattered with a
+    plus sign to ``node_i`` and a minus sign to ``node_j``.  Boundary points
+    are the midpoints of the boundary half-edges already represented by
+    ``BoundaryFace``.
+    """
+    xy = np.asarray(coords, dtype=np.float64)
+    edge_i = np.asarray(int_face_node_i, dtype=np.int64)
+    edge_j = np.asarray(int_face_node_j, dtype=np.int64)
+    edge_area = np.asarray(int_face_area, dtype=np.float64).reshape(-1, 2)
+    bnd_node = np.asarray(bnd_face_node, dtype=np.int64)
+    bnd_neighbor = np.asarray(bnd_face_neighbor, dtype=np.int64)
+
+    if edge_i.shape != edge_j.shape or edge_area.shape != (edge_i.size, 2):
+        raise ValueError("Invalid internal-face arrays for FVM quadrature")
+    if bnd_node.shape != bnd_neighbor.shape:
+        raise ValueError("Invalid boundary-face arrays for FVM quadrature")
+
+    def polygon_centroid(polygon_xy: np.ndarray) -> np.ndarray:
+        x_next = np.roll(polygon_xy[:, 0], -1)
+        y_next = np.roll(polygon_xy[:, 1], -1)
+        cross = (
+            polygon_xy[:, 0] * y_next
+            - x_next * polygon_xy[:, 1]
+        )
+        area6 = 3.0 * float(np.sum(cross))
+        if abs(area6) <= 1.0e-30:
+            return np.mean(polygon_xy, axis=0)
+        return np.asarray(
+            [
+                np.sum((polygon_xy[:, 0] + x_next) * cross) / area6,
+                np.sum((polygon_xy[:, 1] + y_next) * cross) / area6,
+            ],
+            dtype=np.float64,
+        )
+
+    edge_centroids: Dict[Tuple[int, int], List[np.ndarray]] = {}
+    for raw_cell in cells:
+        cell = np.asarray(raw_cell, dtype=np.int64).reshape(-1)
+        if cell.size < 3:
+            raise ValueError("FVM cells must contain at least three nodes")
+        centroid = polygon_centroid(xy[cell])
+        for u, v in zip(cell, np.roll(cell, -1)):
+            key = (min(int(u), int(v)), max(int(u), int(v)))
+            edge_centroids.setdefault(key, []).append(centroid)
+
+    quad_coords: List[np.ndarray] = []
+    quad_area: List[np.ndarray] = []
+    quad_i: List[int] = []
+    quad_j: List[int] = []
+    quad_face: List[int] = []
+
+    for face_id, (i_raw, j_raw) in enumerate(zip(edge_i, edge_j)):
+        i, j = int(i_raw), int(j_raw)
+        key = (min(i, j), max(i, j))
+        adjacent = edge_centroids.get(key)
+        if adjacent is None or len(adjacent) not in (1, 2):
+            count = 0 if adjacent is None else len(adjacent)
+            raise ValueError(
+                "Cannot build FVM face quadrature for edge "
+                f"{key}: expected one or two adjacent cells, got {count}"
+            )
+
+        midpoint = 0.5 * (xy[i] + xy[j])
+        segment_sum = np.zeros(2, dtype=np.float64)
+        edge_direction = xy[j] - xy[i]
+        for centroid in adjacent:
+            segment = centroid - midpoint
+            area = np.asarray([-segment[1], segment[0]], dtype=np.float64)
+            if float(np.dot(area, edge_direction)) < 0.0:
+                area = -area
+            quad_coords.append(0.5 * (midpoint + centroid))
+            quad_area.append(area)
+            quad_i.append(i)
+            quad_j.append(j)
+            quad_face.append(face_id)
+            segment_sum += area
+
+        tolerance = max(
+            1.0e-12,
+            1.0e-9 * max(float(np.linalg.norm(edge_area[face_id])), 1.0),
+        )
+        if float(np.linalg.norm(segment_sum - edge_area[face_id])) > tolerance:
+            raise ValueError(
+                "Segment FVM area vectors do not reproduce internal face "
+                f"{face_id}: {segment_sum} != {edge_area[face_id]}"
+            )
+
+    if bnd_node.size:
+        bnd_coords = 0.75 * xy[bnd_node] + 0.25 * xy[bnd_neighbor]
+    else:
+        bnd_coords = np.empty((0, 2), dtype=np.float64)
+
+    return {
+        "int_quad_coords": np.asarray(quad_coords, dtype=np.float64).reshape(-1, 2),
+        "int_quad_area": np.asarray(quad_area, dtype=np.float64).reshape(-1, 2),
+        "int_quad_node_i": np.asarray(quad_i, dtype=np.int64),
+        "int_quad_node_j": np.asarray(quad_j, dtype=np.int64),
+        "int_quad_face": np.asarray(quad_face, dtype=np.int64),
+        "bnd_quad_coords": np.asarray(bnd_coords, dtype=np.float64).reshape(-1, 2),
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -996,8 +1122,22 @@ class Mesh2D:
         else:
             cell_nodes = np.empty(0, dtype=np.int32)
 
+        quadrature = build_dual_face_quadrature(
+            self._coords,
+            self._cells,
+            np.array([f.node_i for f in self._faces], dtype=np.int32),
+            np.array([f.node_j for f in self._faces], dtype=np.int32),
+            int_area,
+            np.array([f.node for f in self._boundary_faces], dtype=np.int32),
+            np.array(
+                [f.neighbor_node for f in self._boundary_faces],
+                dtype=np.int32,
+            ),
+        )
+
         np.savez_compressed(
             path,
+            mesh_schema_version=np.asarray(2, dtype=np.int64),
             coords=self._coords,
             triangles=self._triangles,
             quads=self._quads,
@@ -1011,6 +1151,12 @@ class Mesh2D:
             bnd_face_neighbor=np.array([f.neighbor_node for f in self._boundary_faces], dtype=np.int32),
             bnd_face_type=np.array([f.boundary_type for f in self._boundary_faces], dtype=object),
             bnd_face_area=bnd_area,
+            int_quad_coords=quadrature["int_quad_coords"],
+            int_quad_area=quadrature["int_quad_area"],
+            int_quad_node_i=quadrature["int_quad_node_i"],
+            int_quad_node_j=quadrature["int_quad_node_j"],
+            int_quad_face=quadrature["int_quad_face"],
+            bnd_quad_coords=quadrature["bnd_quad_coords"],
             node_type=np.array([nd.node_type for nd in self._nodes], dtype=object),
             node_bnd_type=np.array([nd.boundary_type for nd in self._nodes], dtype=object),
             domain_coords=(self._domain_coords if self._domain_coords is not None

@@ -114,6 +114,8 @@ def weights_menu(cfg: ConfigManager) -> None:
                 'enabled': False,
                 'weight': 1.0,
                 'batch_interval': 1,
+                'forward_chunk_size': 32768,
+                'activation_checkpoint': True,
                 'reduction': 'divergence_l2_volume',
                 'schedule': 'every_optimizer_step',
             },
@@ -123,11 +125,15 @@ def weights_menu(cfg: ConfigManager) -> None:
                 'enabled': bool(fvm_cfg),
                 'weight': float(fvm_cfg) if float(fvm_cfg) > 0 else 1.0,
                 'batch_interval': 1,
+                'forward_chunk_size': 32768,
+                'activation_checkpoint': True,
                 'reduction': 'legacy',
                 'schedule': 'every_optimizer_step',
             }
             lw['fvm'] = fvm_cfg
         fvm_cfg.setdefault('batch_interval', 1)
+        fvm_cfg.setdefault('forward_chunk_size', 32768)
+        fvm_cfg.setdefault('activation_checkpoint', True)
         fvm_cfg.setdefault('reduction', 'divergence_l2_volume')
         fvm_cfg.setdefault('schedule', 'every_optimizer_step')
         fvm_enabled = bool(fvm_cfg.get('enabled', False))

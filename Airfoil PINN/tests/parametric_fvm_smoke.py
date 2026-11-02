@@ -190,6 +190,8 @@ class ParametricFVMTests(unittest.TestCase):
             torch.zeros_like(x),
             torch.zeros_like(x),
             None,
+            chunk_size=1,
+            activation_checkpoint=True,
         )
 
         self.assertEqual([case_id for case_id, _, _ in outputs], [0, 1])

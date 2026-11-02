@@ -411,6 +411,50 @@ class MetricsCollector:
             if self.data_handler.fvm_bt is not None
             else None
         )
+        return self._predict_velocity_at_fvm_inputs(x, y, sdf, bt, case_id)
+
+    def _predict_velocity_on_fvm_boundary_quadrature(
+        self,
+        case_id: int = 0,
+    ) -> Optional[torch.Tensor]:
+        """Predict velocity at physical boundary half-edge midpoints."""
+        if (
+            self.loss_computer.fvm is None
+            or not hasattr(self.data_handler, "fvm_quad_x")
+        ):
+            return None
+        offset = int(self.data_handler.fvm_int_quad_count)
+        x = self.data_handler.fvm_quad_x[offset:].to(
+            self.device,
+            dtype=self.dtype,
+        )
+        y = self.data_handler.fvm_quad_y[offset:].to(
+            self.device,
+            dtype=self.dtype,
+        )
+        sdf = self.data_handler.fvm_quad_sdf[offset:].to(
+            self.device,
+            dtype=self.dtype,
+        )
+        bt = (
+            self.data_handler.fvm_quad_bt[offset:].to(
+                self.device,
+                dtype=self.dtype,
+            )
+            if self.data_handler.fvm_quad_bt is not None
+            else None
+        )
+        return self._predict_velocity_at_fvm_inputs(x, y, sdf, bt, case_id)
+
+    def _predict_velocity_at_fvm_inputs(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sdf: torch.Tensor,
+        bt: Optional[torch.Tensor],
+        case_id: int,
+    ) -> torch.Tensor:
+        """Run the common transformed PINN velocity inference path."""
 
         case_ids = torch.full(
             (x.shape[0],),
@@ -491,29 +535,58 @@ class MetricsCollector:
             from airfoil_pinn.physics.fvm import BC_CODES
             inlet_code = BC_CODES['inlet']
             outlet_code = BC_CODES['outlet']
+            farfield_code = BC_CODES['farfield']
+            velocity_code = BC_CODES['velocity_dirichlet']
 
             case_metrics = {}
             with torch.no_grad():
-                bnd_node = fvm.bnd_node.to(self.device)
-                if bnd_node.numel() == 0:
+                if fvm.bnd_node.numel() == 0:
                     return None
                 bnd_area = fvm.bnd_S.to(self.device, dtype=self.dtype)
                 bnd_type = fvm.bnd_type.to(self.device)
-                inlet_mask = bnd_type == inlet_code
-                outlet_mask = bnd_type == outlet_code
+                inlet_mask = (
+                    (bnd_type == inlet_code)
+                    | (bnd_type == velocity_code)
+                )
+                outlet_mask = (
+                    (bnd_type == outlet_code)
+                    | (bnd_type == farfield_code)
+                )
                 flow_cases = getattr(
                     self.data_handler,
                     "flow_cases",
                     {0: None},
                 )
                 for case_id in sorted(flow_cases):
-                    velocity = self._predict_velocity_on_fvm_nodes(case_id)
-                    if velocity is None:
+                    boundary_velocity = (
+                        self._predict_velocity_on_fvm_boundary_quadrature(
+                            case_id
+                        )
+                    )
+                    if boundary_velocity is None:
                         return None
-                    flux = (velocity[bnd_node] * bnd_area).sum(dim=1)
+                    case_tensor = torch.full(
+                        (1,),
+                        int(case_id),
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    target_u, target_v = (
+                        self.loss_computer.get_freestream_targets(
+                            boundary_velocity[:1, :1],
+                            case_tensor,
+                        )
+                    )
+                    freestream = torch.cat((target_u, target_v), dim=1).reshape(2)
+                    boundary_velocity = fvm.apply_boundary_velocity(
+                        boundary_velocity,
+                        freestream_velocity=freestream,
+                    )
+                    flux = (boundary_velocity * bnd_area).sum(dim=1)
 
                     if self.loss_computer.flow_type == 'axisymmetric':
-                        x = self.data_handler.fvm_x.to(
+                        offset = int(self.data_handler.fvm_int_quad_count)
+                        x = self.data_handler.fvm_quad_x[offset:].to(
                             self.device,
                             dtype=self.dtype,
                         ).flatten()
@@ -525,7 +598,7 @@ class MetricsCollector:
                         flux = (
                             flux
                             * two_pi
-                            * torch.clamp(x[bnd_node], min=0.0)
+                            * torch.clamp(x, min=0.0)
                         )
 
                     q_in = (
@@ -548,12 +621,14 @@ class MetricsCollector:
                             else 0.0
                         ),
                     }
-                    values.update(
-                        self._compute_section_flow_metrics(
-                            velocity,
-                            reference_flux=q_in,
+                    node_velocity = self._predict_velocity_on_fvm_nodes(case_id)
+                    if node_velocity is not None:
+                        values.update(
+                            self._compute_section_flow_metrics(
+                                node_velocity,
+                                reference_flux=q_in,
+                            )
                         )
-                    )
                     case_metrics[int(case_id)] = values
         finally:
             if was_training:

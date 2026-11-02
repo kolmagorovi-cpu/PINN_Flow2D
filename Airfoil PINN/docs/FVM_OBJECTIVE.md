@@ -5,11 +5,22 @@ discrete divergence. For control volume `i`,
 
 \[
 R_i = \frac{\Phi_i}{V_i}
-    = \frac{1}{V_i}\sum_{f\in\partial V_i}\mathbf u_f\cdot\mathbf S_{if},
+    = \frac{1}{V_i}\sum_{q\in\partial V_i}\mathbf u_\theta(\mathbf x_q)\cdot\mathbf S_{iq},
 \qquad
 L_{\mathrm{FVM}} =
 \frac{\sum_i V_i R_i^2}{\sum_i V_i}.
 \]
+
+The velocity is evaluated by the PINN directly at the midpoint of every
+straight median-dual face segment.  An internal dual face normally contains
+two segments (cell centroid to primal-edge midpoint), so it has two network
+quadrature evaluations.  Nodal velocity averaging is not used by production
+training.  Each internal segment flux is scattered to its two control volumes
+with opposite signs.
+
+Boundary half-edges are evaluated at their own midpoints.  Prescribed inlet
+and velocity-Dirichlet values, and zero-normal-flux wall/symmetry conditions,
+still override the raw network value when assembling the physical flux.
 
 The production reduction retains the historical name
 `divergence_l2_volume`, but the optimized value is the squared L2 quantity
@@ -34,10 +45,16 @@ loss_weights:
   fvm:
     enabled: true
     weight: 25.0
+    forward_chunk_size: 32768
+    activation_checkpoint: true
     reduction: divergence_l2_volume
     schedule: every_optimizer_step
     batch_interval: 1
 ```
+
+The direct face forward is chunked and uses activation checkpointing by
+default.  These settings change memory/time only; they do not change the FVM
+operator or its checkpoint identity.
 
 `every_optimizer_step` performs one full-mesh FVM forward per optimizer update,
 including when several mini-batches form one update through gradient

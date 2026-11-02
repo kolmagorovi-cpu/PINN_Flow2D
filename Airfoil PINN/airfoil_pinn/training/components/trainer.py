@@ -191,6 +191,7 @@ class Trainer:
         self.compute_grad_cosine = self.diag_config.get('compute_grad_cosine', False)
         self.strict_autograd = bool(self.diag_config.get('strict_autograd', True))
         self._fvm_tensor_cache = None
+        self._fvm_quad_tensor_cache = None
         self.rar_manager = RARManager(self)
 
     def _grad(
@@ -484,44 +485,58 @@ class Trainer:
 
         needs_fvm_forward = (
             self.loss_computer.fvm is not None
-            and (
-                (add_fvm and self.loss_computer.fvm_weight > 0.0)
-                or (add_integral and self.loss_computer.integral_condition)
-            )
+            and add_fvm
+            and self.loss_computer.fvm_weight > 0.0
         )
-        fvm_case_outputs = []
-        x_fvm = None
-        if needs_fvm_forward:
-            if hasattr(self.data_handler, 'fvm_x'):
-                x_fvm, y_fvm, sdf_fvm, bt_fvm = self._get_fvm_tensors()
-                fvm_case_outputs = self._forward_fvm_cases(
-                    x_fvm,
-                    y_fvm,
-                    sdf_fvm,
-                    bt_fvm,
-                )
-            else:
-                if add_fvm and self.loss_computer.fvm_weight > 0.0:
-                    raise RuntimeError(
-                        "FVM is enabled, but its node tensors are unavailable"
-                    )
-                logger.warning(
-                    "Integral condition: FVM tensors are unavailable; "
-                    "using the boundary-point fallback."
-                )
+        needs_integral_forward = (
+            self.loss_computer.fvm is not None
+            and add_integral
+            and self.loss_computer.integral_condition
+        )
+        fvm_quad_case_outputs = []
+        fvm_internal_quad_count = 0
+        x_quad = None
+        if needs_fvm_forward or needs_integral_forward:
+            (
+                x_quad,
+                y_quad,
+                sdf_quad,
+                bt_quad,
+                fvm_internal_quad_count,
+            ) = self._get_fvm_quadrature_tensors()
+            fvm_quad_case_outputs = self._forward_fvm_cases(
+                x_quad,
+                y_quad,
+                sdf_quad,
+                bt_quad,
+                chunk_size=self.loss_computer.fvm_forward_chunk_size,
+                activation_checkpoint=(
+                    self.loss_computer.fvm_activation_checkpoint
+                ),
+            )
 
         if add_integral and self.loss_computer.integral_condition:
-            if fvm_case_outputs and self.loss_computer.fvm is not None:
-                case_integrals = [
-                    self.loss_computer.compute_mesh_integral_loss(
-                        output[:, :2],
-                        self.loss_computer.fvm.bnd_node,
-                        self.loss_computer.fvm.bnd_S,
-                        self.loss_computer.fvm.bnd_type,
-                        node_x=x_fvm,
+            if fvm_quad_case_outputs and self.loss_computer.fvm is not None:
+                case_integrals = []
+                boundary_x = x_quad[fvm_internal_quad_count:]
+                for _, output, freestream_velocity in fvm_quad_case_outputs:
+                    boundary_velocity = output[
+                        fvm_internal_quad_count:, :2
+                    ]
+                    boundary_velocity = (
+                        self.loss_computer.fvm.apply_boundary_velocity(
+                            boundary_velocity,
+                            freestream_velocity=freestream_velocity,
+                        )
                     )
-                    for _, output, _ in fvm_case_outputs
-                ]
+                    case_integrals.append(
+                        self.loss_computer.compute_boundary_quadrature_integral_loss(
+                            boundary_velocity,
+                            self.loss_computer.fvm.bnd_S,
+                            self.loss_computer.fvm.bnd_type,
+                            boundary_x=boundary_x,
+                        )
+                    )
                 integral_raw_t = torch.stack(case_integrals).mean()
             else:
                 integral_raw_t = self._compute_global_integral_loss_from_dataset()
@@ -529,15 +544,18 @@ class Trainer:
 
         if (
             add_fvm
-            and fvm_case_outputs
+            and fvm_quad_case_outputs
             and self.loss_computer.fvm_weight > 0.0
         ):
             case_fvm_metrics = [
                 self.loss_computer.compute_fvm_metrics(
-                    output[:, :2],
+                    output[:fvm_internal_quad_count, :2],
+                    u_boundary_fvm=output[
+                        fvm_internal_quad_count:, :2
+                    ],
                     freestream_velocity=freestream_velocity,
                 )
-                for _, output, freestream_velocity in fvm_case_outputs
+                for _, output, freestream_velocity in fvm_quad_case_outputs
             ]
             fvm_raw_t = torch.stack(
                 [metrics["raw"] for metrics in case_fvm_metrics]
@@ -1343,6 +1361,7 @@ class Trainer:
         self._rar_new_points_since_fvm = int(state.get('rar_new_points_since_fvm', self._rar_new_points_since_fvm))
         self._rar_step_counter = int(state.get('rar_step_counter', self._rar_step_counter))
         self._fvm_tensor_cache = None
+        self._fvm_quad_tensor_cache = None
 
     # ------------------------------------------------------------------
     # RAR с сохранением статистики и корректным расширением данных/весов
@@ -1720,6 +1739,7 @@ class Trainer:
             except Exception:
                 logger.debug("Adaptive RAR: velocity_dirichlet не задан для FVM.", exc_info=True)
             self._fvm_tensor_cache = None
+            self._fvm_quad_tensor_cache = None
             self._rar_new_points_since_fvm = 0
             self._save_rar_mesh_volume_plot(mesh)
             logger.info("Adaptive RAR: FVM-сетка перестроена.")
@@ -1778,12 +1798,59 @@ class Trainer:
         _, x_fvm, y_fvm, sdf_fvm, bt_fvm = self._fvm_tensor_cache
         return x_fvm, y_fvm, sdf_fvm, bt_fvm
 
+    def _get_fvm_quadrature_tensors(
+        self,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        int,
+    ]:
+        """Return cached direct-PINN face-quadrature inputs."""
+        dh = self.data_handler
+        required = ("fvm_quad_x", "fvm_quad_y", "fvm_quad_sdf")
+        missing = [name for name in required if not hasattr(dh, name)]
+        if missing:
+            raise RuntimeError(
+                "FVM face quadrature tensors are unavailable: "
+                + ", ".join(missing)
+            )
+        cache_key = (
+            id(dh.fvm_quad_x),
+            self.device.type,
+            self.device.index,
+            self.dtype,
+        )
+        if (
+            self._fvm_quad_tensor_cache is None
+            or self._fvm_quad_tensor_cache[0] != cache_key
+        ):
+            bt = (
+                dh.fvm_quad_bt.to(self.device, dtype=self.dtype)
+                if dh.fvm_quad_bt is not None
+                else None
+            )
+            self._fvm_quad_tensor_cache = (
+                cache_key,
+                dh.fvm_quad_x.to(self.device, dtype=self.dtype),
+                dh.fvm_quad_y.to(self.device, dtype=self.dtype),
+                dh.fvm_quad_sdf.to(self.device, dtype=self.dtype),
+                bt,
+                int(dh.fvm_int_quad_count),
+            )
+        _, x, y, sdf, bt, internal_count = self._fvm_quad_tensor_cache
+        return x, y, sdf, bt, internal_count
+
     def _forward_fvm_cases(
         self,
         x: torch.Tensor,
         y: torch.Tensor,
         sdf: torch.Tensor,
         boundary_types: Optional[torch.Tensor],
+        *,
+        chunk_size: Optional[int] = None,
+        activation_checkpoint: bool = False,
     ) -> List[Tuple[int, torch.Tensor, torch.Tensor]]:
         """Evaluate one shared FVM mesh independently for every flow case.
 
@@ -1807,7 +1874,30 @@ class Trainer:
                 sdf,
                 case_ids=case_ids,
             )
-            raw = self.model(inputs)
+            effective_chunk = (
+                max(1, int(chunk_size))
+                if chunk_size is not None
+                else len(inputs)
+            )
+            raw_chunks = []
+            for start in range(0, len(inputs), effective_chunk):
+                input_chunk = inputs[start:start + effective_chunk]
+                if (
+                    activation_checkpoint
+                    and torch.is_grad_enabled()
+                    and self.model.training
+                ):
+                    from torch.utils.checkpoint import checkpoint
+
+                    raw_chunk = checkpoint(
+                        self.model,
+                        input_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    raw_chunk = self.model(input_chunk)
+                raw_chunks.append(raw_chunk)
+            raw = torch.cat(raw_chunks, dim=0)
             if hasattr(self.loss_computer, "transform_outputs"):
                 u, v, p = self.loss_computer.transform_outputs(
                     raw[:, 0:1],
@@ -1947,8 +2037,8 @@ class Trainer:
             return 0.0
 
         dh = self.data_handler
-        if not hasattr(dh, 'fvm_x'):
-            logger.warning("FVM step: fvm-тензоры не подготовлены (load_mesh не вызывался?), пропускаю.")
+        if not hasattr(dh, 'fvm_quad_x'):
+            logger.warning("FVM step: face-quadrature tensors are unavailable; skipping.")
             return 0.0
 
         self.model.train()
@@ -1956,20 +2046,25 @@ class Trainer:
         # случайное накопление с остатками предыдущих батчей.
         self.optimizer.zero_grad()
 
-        # Используем координаты узлов сетки напрямую — не датасет.
-        # Это корректно даже если датасет и сетка имеют разный размер.
-        x_all, y_all, sdf_all, bt_all = self._get_fvm_tensors()
+        x_all, y_all, sdf_all, bt_all, internal_count = (
+            self._get_fvm_quadrature_tensors()
+        )
 
         case_outputs = self._forward_fvm_cases(
             x_all,
             y_all,
             sdf_all,
             bt_all,
+            chunk_size=self.loss_computer.fvm_forward_chunk_size,
+            activation_checkpoint=(
+                self.loss_computer.fvm_activation_checkpoint
+            ),
         )
         fvm_loss = torch.stack(
             [
                 self.loss_computer.compute_fvm_loss(
-                    output[:, :2],
+                    output[:internal_count, :2],
+                    u_boundary_fvm=output[internal_count:, :2],
                     freestream_velocity=freestream,
                 )
                 for _, output, freestream in case_outputs

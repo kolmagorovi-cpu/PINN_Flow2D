@@ -44,6 +44,8 @@ def _structured_cell_mesh(n: int) -> tuple[SimpleNamespace, np.ndarray]:
     edge_s: list[list[float]] = []
     bnd_node: list[int] = []
     bnd_s: list[list[float]] = []
+    int_quad_coords: list[list[float]] = []
+    bnd_quad_coords: list[list[float]] = []
 
     def node(i: int, j: int) -> int:
         return j * n + i
@@ -55,22 +57,28 @@ def _structured_cell_mesh(n: int) -> tuple[SimpleNamespace, np.ndarray]:
                 edge_i.append(current)
                 edge_j.append(node(i + 1, j))
                 edge_s.append([h, 0.0])
+                int_quad_coords.append([(i + 1.0) * h, (j + 0.5) * h])
             if j + 1 < n:
                 edge_i.append(current)
                 edge_j.append(node(i, j + 1))
                 edge_s.append([0.0, h])
+                int_quad_coords.append([(i + 0.5) * h, (j + 1.0) * h])
             if i == 0:
                 bnd_node.append(current)
                 bnd_s.append([-h, 0.0])
+                bnd_quad_coords.append([0.0, (j + 0.5) * h])
             if i == n - 1:
                 bnd_node.append(current)
                 bnd_s.append([h, 0.0])
+                bnd_quad_coords.append([1.0, (j + 0.5) * h])
             if j == 0:
                 bnd_node.append(current)
                 bnd_s.append([0.0, -h])
+                bnd_quad_coords.append([(i + 0.5) * h, 0.0])
             if j == n - 1:
                 bnd_node.append(current)
                 bnd_s.append([0.0, h])
+                bnd_quad_coords.append([(i + 0.5) * h, 1.0])
 
     mesh = SimpleNamespace(
         cv_volumes=np.full(n * n, h * h, dtype=np.float64),
@@ -80,6 +88,11 @@ def _structured_cell_mesh(n: int) -> tuple[SimpleNamespace, np.ndarray]:
         bnd_face_node=np.asarray(bnd_node, dtype=np.int64),
         bnd_face_area=np.asarray(bnd_s, dtype=np.float64).reshape(-1, 2),
         bnd_face_type=np.full(len(bnd_node), "outlet"),
+        int_quad_node_i=np.asarray(edge_i, dtype=np.int64),
+        int_quad_node_j=np.asarray(edge_j, dtype=np.int64),
+        int_quad_area=np.asarray(edge_s, dtype=np.float64).reshape(-1, 2),
+        int_quad_coords=np.asarray(int_quad_coords, dtype=np.float64),
+        bnd_quad_coords=np.asarray(bnd_quad_coords, dtype=np.float64),
     )
     return mesh, coordinates
 
@@ -195,6 +208,103 @@ class FVMObjectiveTests(unittest.TestCase):
         self.assertIsNotNone(scale.grad)
         self.assertTrue(torch.isfinite(scale.grad))
         self.assertGreater(abs(scale.grad.item()), 0.0)
+
+    def test_direct_face_predictions_reproduce_linear_divergence(self) -> None:
+        """Segment midpoint PINN values avoid all nodal interpolation."""
+        mesh, _ = _structured_cell_mesh(8)
+        fvm = FVMResiduals(mesh)
+        internal_velocity = torch.as_tensor(
+            mesh.int_quad_coords,
+            dtype=torch.float64,
+        )
+        boundary_velocity = torch.as_tensor(
+            mesh.bnd_quad_coords,
+            dtype=torch.float64,
+        )
+        residual = fvm.compute_residual_quadrature(
+            internal_velocity,
+            boundary_velocity,
+        )
+        torch.testing.assert_close(
+            residual,
+            torch.full_like(residual, 2.0),
+            atol=2e-14,
+            rtol=0.0,
+        )
+
+    def test_direct_face_fvm_preserves_parameter_gradients(self) -> None:
+        mesh, _ = _structured_cell_mesh(4)
+        fvm = FVMResiduals(mesh)
+        scale = torch.nn.Parameter(torch.tensor(1.25, dtype=torch.float64))
+        internal_velocity = scale * torch.as_tensor(
+            mesh.int_quad_coords,
+            dtype=torch.float64,
+        )
+        boundary_velocity = scale * torch.as_tensor(
+            mesh.bnd_quad_coords,
+            dtype=torch.float64,
+        )
+        loss = fvm.mass_loss_quadrature(
+            internal_velocity,
+            boundary_velocity,
+        )
+        loss.backward()
+        self.assertIsNotNone(scale.grad)
+        self.assertTrue(torch.isfinite(scale.grad))
+        self.assertGreater(abs(scale.grad.item()), 0.0)
+
+    def test_integral_balance_uses_boundary_midpoint_predictions(self) -> None:
+        mesh, _ = _structured_cell_mesh(4)
+        boundary_xy = mesh.bnd_quad_coords
+        mesh.bnd_face_type = np.where(
+            np.isclose(boundary_xy[:, 0], 0.0),
+            "inlet",
+            np.where(
+                np.isclose(boundary_xy[:, 0], 1.0),
+                "outlet",
+                "farfield",
+            ),
+        )
+        fvm = FVMResiduals(mesh)
+        loss_computer = LossComputer.__new__(LossComputer)
+        loss_computer.integral_condition = True
+        loss_computer.integral_target = 0.0
+        loss_computer.flow_type = "2d"
+        loss_computer.device = torch.device("cpu")
+        loss_computer.dtype = torch.float64
+        velocity = torch.zeros((fvm.B, 2), dtype=torch.float64)
+        velocity[:, 0] = 1.0
+        loss = loss_computer.compute_boundary_quadrature_integral_loss(
+            velocity,
+            fvm.bnd_S,
+            fvm.bnd_type,
+        )
+        torch.testing.assert_close(
+            loss,
+            torch.zeros_like(loss),
+            atol=2e-14,
+            rtol=0.0,
+        )
+
+        # The top farfield has unit length. A unit outward velocity there
+        # creates total signed flux 1 and therefore a unit squared loss.
+        velocity.zero_()
+        top_farfield = torch.as_tensor(
+            np.isclose(boundary_xy[:, 1], 1.0),
+            dtype=torch.bool,
+        )
+        velocity[top_farfield, 1] = 1.0
+        loss = loss_computer.compute_boundary_quadrature_integral_loss(
+            velocity,
+            fvm.bnd_S,
+            fvm.bnd_type,
+        )
+        torch.testing.assert_close(
+            loss,
+            torch.ones_like(loss),
+            atol=2e-14,
+            rtol=0.0,
+        )
 
     def test_raw_weighted_and_rms_metrics_are_separate(self) -> None:
         mesh, coordinates = _structured_cell_mesh(8)
@@ -396,6 +506,8 @@ class FVMConfigurationContractTests(unittest.TestCase):
             current.payload["fvm"],
             {
                 "enabled": True,
+                "velocity_sampling": "pinn_segment_midpoint",
+                "quadrature_rule": "midpoint_per_dual_segment",
                 "reduction": "divergence_l2_volume",
                 "weight": 25.0,
                 "schedule": "every_optimizer_step",
@@ -403,6 +515,8 @@ class FVMConfigurationContractTests(unittest.TestCase):
                 "inclusion_probability": 1.0,
                 "mesh_identifier": config["data"].get("mesh_file"),
                 "mesh_fingerprint": "mesh-a",
+                "internal_quadrature_points": None,
+                "boundary_quadrature_points": None,
                 "normalization": "face_vectors/c;control_volumes/c^2",
                 "geometry_is_dimensionless": True,
                 "geometry_length_scale": 1.0,

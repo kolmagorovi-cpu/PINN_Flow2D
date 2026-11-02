@@ -597,6 +597,16 @@ class PINNSolver:
                     "FVM node tensor count does not match the operator: "
                     f"operator={fvm.N}, tensors={mismatched}"
                 )
+            quadrature_lengths = {
+                "internal": int(self.data_handler.fvm_int_quad_count),
+                "boundary": int(self.data_handler.fvm_bnd_quad_count),
+            }
+            if quadrature_lengths != {"internal": fvm.Q, "boundary": fvm.B}:
+                raise ValueError(
+                    "FVM face quadrature count does not match the operator: "
+                    f"operator={{'internal': {fvm.Q}, 'boundary': {fvm.B}}}, "
+                    f"tensors={quadrature_lengths}"
+                )
             inlet_u = getattr(self.data_handler, 'inlet_u_norm', 1.0)
             inlet_v = getattr(self.data_handler, 'inlet_v_norm', 0.0)
             velocity_bc = torch.tensor([inlet_u, inlet_v], dtype=self.dtype, device=self.device)
@@ -605,7 +615,13 @@ class PINNSolver:
             if code is not None and bool((fvm.bnd_type == code).any()):
                 fvm.set_bc_velocity('velocity_dirichlet', velocity_bc)
             self.loss_computer.fvm = fvm
-            logger.info("FVMResiduals подключён: %d узлов", fvm.N)
+            logger.info(
+                "FVMResiduals connected: nodes=%d, internal quadrature=%d, "
+                "boundary quadrature=%d",
+                fvm.N,
+                fvm.Q,
+                fvm.B,
+            )
         except Exception as e:
             self.loss_computer.fvm = None
             if fvm_enabled:

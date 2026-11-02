@@ -12,6 +12,13 @@ from airfoil_pinn.sampling.mesh.core import (
     InternalFace,
     Mesh2D,
     MeshNode,
+    build_dual_face_quadrature,
 )
 
-__all__ = ["BoundaryFace", "InternalFace", "Mesh2D", "MeshNode"]
+__all__ = [
+    "BoundaryFace",
+    "InternalFace",
+    "Mesh2D",
+    "MeshNode",
+    "build_dual_face_quadrature",
+]

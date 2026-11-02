@@ -5,8 +5,9 @@ fvm_residuals.py — FVM-вычислитель невязки уравнени�
 
 Реализует класс FVMResiduals: дискретизация закона сохранения массы для
 несжимаемой жидкости методом FVM на медианной дуальной неструктурированной
-сетке (mesh2d.Mesh2D). На внутренних гранях используется центральная
-интерполяция скорости u_face = 0.5 * (u_i + u_j);
+сетке (mesh2d.Mesh2D). Production-обучение получает скорость прямым
+предсказанием PINN в midpoint каждой прямой части медианной дуальной грани;
+узловая центральная интерполяция сохранена только как legacy API;
 все операции векторизованы на PyTorch без Python-циклов по граням.
 
 Поддерживает два источника геометрии:
@@ -17,7 +18,7 @@ fvm_residuals.py — FVM-вычислитель невязки уравнени�
     >>> mesh = Mesh2D(points, domain_coords, airfoil_coords)
     >>> mesh.build()
     >>> fvm = FVMResiduals(mesh).to('cuda')
-    >>> loss = fvm.mass_loss(u_pred)   # u_pred: (N, 2)
+    >>> loss = fvm.mass_loss_quadrature(u_internal_q, u_boundary_q)
 
 Автор: Колмагоров И.Д.
 Дата: 2026-05-21
@@ -148,8 +149,62 @@ class FVMResiduals:
         )
         self.bnd_type = torch.tensor(bnd_codes, dtype=torch.long)
 
+        if self.M > 0:
+            quad_i, quad_j, quad_s, quad_xy, bnd_quad_xy = (
+                self._extract_quadrature(mesh)
+            )
+        else:
+            quad_i = np.empty(0, dtype=np.int64)
+            quad_j = np.empty(0, dtype=np.int64)
+            quad_s = np.empty((0, 2), dtype=np.float64)
+            quad_xy = np.empty((0, 2), dtype=np.float64)
+            bnd_quad_raw = getattr(mesh, "bnd_quad_coords", None)
+            bnd_quad_xy = (
+                np.asarray(bnd_quad_raw, dtype=np.float64).reshape(-1, 2)
+                if bnd_quad_raw is not None
+                else np.empty((0, 2), dtype=np.float64)
+            )
+        self._validate_quadrature_arrays(
+            quad_i,
+            quad_j,
+            quad_s,
+            edge_i_array,
+            edge_j_array,
+            edge_s_array,
+        )
+        if quad_xy.shape != (len(quad_i), 2):
+            raise ValueError(
+                "FVM internal quadrature coordinates do not match segment "
+                f"count: {quad_xy.shape} != ({len(quad_i)}, 2)"
+            )
+        if bnd_quad_xy.size and bnd_quad_xy.shape != (self.B, 2):
+            raise ValueError(
+                "FVM boundary quadrature coordinates do not match boundary "
+                f"face count: {bnd_quad_xy.shape} != ({self.B}, 2)"
+            )
+        if not np.isfinite(quad_xy).all() or not np.isfinite(bnd_quad_xy).all():
+            raise ValueError("FVM quadrature coordinates contain NaN or Inf")
+        self.Q = len(quad_i)
+        self.quad_i = torch.tensor(quad_i, dtype=torch.long)
+        self.quad_j = torch.tensor(quad_j, dtype=torch.long)
+        self.quad_S = torch.tensor(quad_s, dtype=self._dtype)
+        quadrature_digest = hashlib.sha256()
+        quadrature_digest.update(self._mesh_fingerprint.encode("ascii"))
+        for name, values, dtype in (
+            ("quad_i", quad_i, "<i8"),
+            ("quad_j", quad_j, "<i8"),
+            ("quad_s", quad_s, "<f8"),
+            ("quad_xy", quad_xy, "<f8"),
+            ("bnd_quad_xy", bnd_quad_xy, "<f8"),
+        ):
+            array = np.ascontiguousarray(values, dtype=np.dtype(dtype))
+            quadrature_digest.update(name.encode("ascii"))
+            quadrature_digest.update(array.tobytes())
+        self._mesh_fingerprint = quadrature_digest.hexdigest()
+
         # Предписанные скорости на гранях (hard BC).
-        # По умолчанию — мягкое условие (u_face = u_узла из нейросети).
+        # По умолчанию — мягкое условие: production использует прямое
+        # предсказание PINN в midpoint граничной полуграни.
         # Заполняются через set_bc_velocity() / set_inlet_velocity().
         self._u_prescribed    = torch.zeros(self.B, 2, dtype=self._dtype)
         self._prescribed_mask = torch.zeros(self.B, 1, dtype=torch.bool)
@@ -167,7 +222,78 @@ class FVMResiduals:
         else:
             self._zero_flux_mask = torch.zeros(0, 1, dtype=torch.bool)
 
-        logger.info("FVMResiduals: N=%d, M=%d, B=%d", self.N, self.M, self.B)
+        logger.info(
+            "FVMResiduals: N=%d, M=%d, Q=%d, B=%d",
+            self.N,
+            self.M,
+            self.Q,
+            self.B,
+        )
+
+    @staticmethod
+    def _validate_quadrature_arrays(
+        quad_i: np.ndarray,
+        quad_j: np.ndarray,
+        quad_s: np.ndarray,
+        edge_i: np.ndarray,
+        edge_j: np.ndarray,
+        edge_s: np.ndarray,
+    ) -> None:
+        """Validate direct-PINN segment quadrature and its face sums."""
+        if quad_i.ndim != 1 or quad_j.ndim != 1 or quad_i.shape != quad_j.shape:
+            raise ValueError("FVM quadrature indices must be equal 1-D arrays")
+        if quad_s.shape != (quad_i.size, 2):
+            raise ValueError(
+                "FVM quadrature area vectors must have shape "
+                f"({quad_i.size}, 2), received {quad_s.shape}"
+            )
+        if edge_i.size and quad_i.size == 0:
+            raise ValueError("FVM mesh must contain internal face quadrature")
+        if not np.isfinite(quad_s).all():
+            raise ValueError("FVM quadrature area vectors contain NaN or Inf")
+        if np.any(np.linalg.norm(quad_s, axis=1) <= 0.0):
+            raise ValueError("FVM quadrature area vectors must be non-zero")
+        n_nodes = (
+            int(max(edge_i.max(), edge_j.max())) + 1
+            if edge_i.size else 0
+        )
+        if (
+            np.any(quad_i < 0)
+            or np.any(quad_j < 0)
+            or np.any(quad_i >= n_nodes)
+            or np.any(quad_j >= n_nodes)
+        ):
+            raise ValueError("FVM quadrature node indices are out of range")
+
+        face_lookup = {
+            (int(i), int(j)): face_id
+            for face_id, (i, j) in enumerate(zip(edge_i, edge_j))
+        }
+        sums = np.zeros_like(edge_s)
+        counts = np.zeros(len(edge_i), dtype=np.int64)
+        for i, j, area in zip(quad_i, quad_j, quad_s):
+            face_id = face_lookup.get((int(i), int(j)))
+            if face_id is None:
+                raise ValueError(
+                    "FVM quadrature references an unknown oriented face "
+                    f"({int(i)}, {int(j)})"
+                )
+            sums[face_id] += area
+            counts[face_id] += 1
+        if np.any((counts < 1) | (counts > 2)):
+            raise ValueError(
+                "Every FVM internal face must contain one or two quadrature "
+                "segments"
+            )
+        if not edge_i.size:
+            return
+        scale = max(float(np.linalg.norm(edge_s, axis=1).max()), 1.0)
+        error = float(np.linalg.norm(sums - edge_s, axis=1).max())
+        if error > max(1.0e-12, 1.0e-9 * scale):
+            raise ValueError(
+                "FVM quadrature segment vectors do not reproduce aggregated "
+                f"faces: max error={error:.6e}"
+            )
 
     @staticmethod
     def _validate_geometry_arrays(
@@ -322,11 +448,13 @@ class FVMResiduals:
             raise ValueError("FVM control volumes must be strictly positive")
         if (
             not torch.isfinite(self.edge_S).all()
+            or not torch.isfinite(self.quad_S).all()
             or not torch.isfinite(self.bnd_S).all()
         ):
             raise ValueError("FVM area vectors contain NaN or Inf")
         if (
             (self.M > 0 and torch.any(self.edge_S.norm(dim=1) <= 0))
+            or (self.Q > 0 and torch.any(self.quad_S.norm(dim=1) <= 0))
             or (self.B > 0 and torch.any(self.bnd_S.norm(dim=1) <= 0))
         ):
             raise ValueError("FVM area vectors must be non-zero")
@@ -337,7 +465,7 @@ class FVMResiduals:
         apply_boundary_conditions: bool,
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Evaluate a finite-volume residual with optional case-local BC.
+        """Evaluate the legacy nodal finite-volume residual.
 
         ``freestream_velocity`` overrides stored values on ``inlet`` and
         ``velocity_dirichlet`` faces without mutating the FVM object.  Unlike
@@ -433,6 +561,68 @@ class FVMResiduals:
             list(md.bnd_face_type.astype(str)),
         )
 
+    @staticmethod
+    def _extract_quadrature(
+        mesh,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Extract or deterministically rebuild median-dual segment data."""
+        quad_i = getattr(mesh, "int_quad_node_i", None)
+        quad_j = getattr(mesh, "int_quad_node_j", None)
+        quad_s = getattr(mesh, "int_quad_area", None)
+        quad_xy = getattr(mesh, "int_quad_coords", None)
+        bnd_quad_xy = getattr(mesh, "bnd_quad_coords", None)
+        if (
+            quad_i is not None
+            and quad_j is not None
+            and quad_s is not None
+            and quad_xy is not None
+            and bnd_quad_xy is not None
+        ):
+            return (
+                np.asarray(quad_i, dtype=np.int64),
+                np.asarray(quad_j, dtype=np.int64),
+                np.asarray(quad_s, dtype=np.float64).reshape(-1, 2),
+                np.asarray(quad_xy, dtype=np.float64).reshape(-1, 2),
+                np.asarray(bnd_quad_xy, dtype=np.float64).reshape(-1, 2),
+            )
+
+        if not hasattr(mesh, "internal_faces"):
+            raise ValueError(
+                "FVM mesh does not contain direct-PINN face quadrature"
+            )
+
+        from airfoil_pinn.sampling.mesh.core import (
+            build_dual_face_quadrature,
+        )
+
+        faces = mesh.internal_faces
+        boundary_faces = mesh.boundary_faces
+        quadrature = build_dual_face_quadrature(
+            mesh.coords,
+            mesh.cells,
+            np.asarray([face.node_i for face in faces], dtype=np.int64),
+            np.asarray([face.node_j for face in faces], dtype=np.int64),
+            np.asarray(
+                [face.area_vector for face in faces],
+                dtype=np.float64,
+            ).reshape(-1, 2),
+            np.asarray(
+                [face.node for face in boundary_faces],
+                dtype=np.int64,
+            ),
+            np.asarray(
+                [face.neighbor_node for face in boundary_faces],
+                dtype=np.int64,
+            ),
+        )
+        return (
+            quadrature["int_quad_node_i"],
+            quadrature["int_quad_node_j"],
+            quadrature["int_quad_area"],
+            quadrature["int_quad_coords"],
+            quadrature["bnd_quad_coords"],
+        )
+
     # ── Основные методы ───────────────────────────────────────────────────────
 
     def compute_residual(
@@ -441,7 +631,7 @@ class FVMResiduals:
         freestream_velocity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Невязка уравнения неразрывности R_i = Φ_i / V_i для каждого КО.
+        Legacy-невязка по узловым скоростям R_i = Φ_i / V_i для каждого КО.
 
         Алгоритм:
           - Центральная схема на внутренних гранях: u_face = 0.5*(u_i + u_j).
@@ -464,6 +654,118 @@ class FVMResiduals:
             apply_boundary_conditions=True,
             freestream_velocity=freestream_velocity,
         )
+
+    def _validate_quadrature_velocity(
+        self,
+        internal_velocity: torch.Tensor,
+        boundary_velocity: torch.Tensor,
+    ) -> None:
+        """Validate velocities predicted directly at face quadrature points."""
+        for name, value, expected in (
+            ("internal", internal_velocity, (self.Q, 2)),
+            ("boundary", boundary_velocity, (self.B, 2)),
+        ):
+            if not torch.is_tensor(value):
+                raise TypeError(f"FVM {name} quadrature velocity must be a tensor")
+            if value.ndim != 2 or tuple(value.shape) != expected:
+                raise ValueError(
+                    f"FVM {name} quadrature velocity must have shape "
+                    f"{expected}, received {tuple(value.shape)}"
+                )
+            if value.device != self.V.device or value.dtype != self._dtype:
+                raise ValueError(
+                    f"FVM {name} quadrature velocity device/dtype does not "
+                    "match the operator; call fvm.to(device, dtype)"
+                )
+
+    def compute_residual_quadrature(
+        self,
+        internal_velocity: torch.Tensor,
+        boundary_velocity: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute divergence from direct PINN predictions on face segments.
+
+        No nodal interpolation is performed.  ``internal_velocity[q]`` is the
+        network value at the midpoint of one straight median-dual segment.
+        ``boundary_velocity[b]`` is the value at the midpoint of the physical
+        boundary half-edge represented by boundary face ``b``.
+        """
+        self._validate_quadrature_velocity(
+            internal_velocity,
+            boundary_velocity,
+        )
+        res = internal_velocity.new_zeros(self.N)
+
+        if self.Q > 0:
+            flux = (internal_velocity * self.quad_S).sum(dim=1)
+            res = res.index_add(0, self.quad_i, flux)
+            res = res.index_add(0, self.quad_j, -flux)
+
+        if self.B > 0:
+            u_face_b = self.apply_boundary_velocity(
+                boundary_velocity,
+                freestream_velocity=freestream_velocity,
+            )
+            boundary_flux = (u_face_b * self.bnd_S).sum(dim=1)
+            res = res.index_add(0, self.bnd_node, boundary_flux)
+
+        return res / self.V
+
+    def apply_boundary_velocity(
+        self,
+        predicted_velocity: torch.Tensor,
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply the exact boundary-flux policy to midpoint predictions."""
+        if predicted_velocity.shape != (self.B, 2):
+            raise ValueError(
+                "FVM boundary velocity must have shape "
+                f"({self.B}, 2), received {tuple(predicted_velocity.shape)}"
+            )
+        u_face_b = torch.where(
+            self._prescribed_mask,
+            self._u_prescribed,
+            predicted_velocity,
+        )
+        if freestream_velocity is not None:
+            velocity = torch.as_tensor(
+                freestream_velocity,
+                device=predicted_velocity.device,
+                dtype=predicted_velocity.dtype,
+            )
+            if velocity.shape == (2,):
+                velocity = velocity.view(1, 2)
+            if velocity.shape != (1, 2):
+                raise ValueError(
+                    "freestream_velocity must have shape (2,) or "
+                    f"(1, 2), received {tuple(velocity.shape)}"
+                )
+            freestream_mask = (
+                (self.bnd_type == BC_CODES["inlet"])
+                | (self.bnd_type == BC_CODES["velocity_dirichlet"])
+            ).view(-1, 1)
+            u_face_b = torch.where(
+                freestream_mask,
+                velocity.expand(self.B, 2),
+                u_face_b,
+            )
+        return u_face_b.masked_fill(self._zero_flux_mask, 0.0)
+
+    def mass_loss_quadrature(
+        self,
+        internal_velocity: torch.Tensor,
+        boundary_velocity: torch.Tensor,
+        reduction: str = "divergence_l2_volume",
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return the FVM loss using direct face-quadrature predictions."""
+        residual = self.compute_residual_quadrature(
+            internal_velocity,
+            boundary_velocity,
+            freestream_velocity=freestream_velocity,
+        )
+        return self._reduce_residual(residual, reduction)
 
     def mass_loss(
         self,
@@ -559,6 +861,26 @@ class FVMResiduals:
         )
         return raw, torch.sqrt(divergence_l2.clamp_min(0.0))
 
+    def loss_and_divergence_rms_quadrature(
+        self,
+        internal_velocity: torch.Tensor,
+        boundary_velocity: torch.Tensor,
+        reduction: str = "divergence_l2_volume",
+        freestream_velocity: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return direct-quadrature FVM MSE and physical divergence RMS."""
+        residual = self.compute_residual_quadrature(
+            internal_velocity,
+            boundary_velocity,
+            freestream_velocity=freestream_velocity,
+        )
+        raw = self._reduce_residual(residual, reduction)
+        divergence_l2 = self._reduce_residual(
+            residual,
+            "divergence_l2_volume",
+        )
+        return raw, torch.sqrt(divergence_l2.clamp_min(0.0))
+
     def divergence_rms(
         self,
         u: torch.Tensor,
@@ -583,9 +905,9 @@ class FVMResiduals:
         вокруг каждого CV равна нулю?
         """
         flux_sum = torch.zeros(self.N, 2, device=self._device, dtype=self._dtype)
-        if self.M > 0:
-            flux_sum = flux_sum.index_add(0, self.edge_i, self.edge_S)
-            flux_sum = flux_sum.index_add(0, self.edge_j, -self.edge_S)
+        if self.Q > 0:
+            flux_sum = flux_sum.index_add(0, self.quad_i, self.quad_S)
+            flux_sum = flux_sum.index_add(0, self.quad_j, -self.quad_S)
         if self.B > 0:
             flux_sum = flux_sum.index_add(0, self.bnd_node, self.bnd_S)
 
@@ -644,6 +966,7 @@ class FVMResiduals:
         return {
             'N': self.N,
             'M': self.M,
+            'Q': self.Q,
             'B': self.B,
             'mesh_fingerprint': self._mesh_fingerprint,
             'device': str(self._device),
@@ -654,6 +977,8 @@ class FVMResiduals:
             'cv_volume_mean': float(self.V.mean()),
             'edge_S_norm_min':  float(self.edge_S.norm(dim=1).min()) if self.M > 0 else 0.0,
             'edge_S_norm_max':  float(self.edge_S.norm(dim=1).max()) if self.M > 0 else 0.0,
+            'quad_S_norm_min':  float(self.quad_S.norm(dim=1).min()) if self.Q > 0 else 0.0,
+            'quad_S_norm_max':  float(self.quad_S.norm(dim=1).max()) if self.Q > 0 else 0.0,
             'bnd_S_norm_min':   float(self.bnd_S.norm(dim=1).min()) if self.B > 0 else 0.0,
             'bnd_S_norm_max':   float(self.bnd_S.norm(dim=1).max()) if self.B > 0 else 0.0,
             'bnd_type_counts':  {
@@ -744,7 +1069,8 @@ class FVMResiduals:
     ) -> "FVMResiduals":
         """
         Сбрасывает предписанные скорости: переходит к мягкому BC
-        (u_face = предсказание нейросети в граничном узле).
+        Production FVM продолжает получать скорость прямым предсказанием PINN
+        в midpoint граничной полуграни.
 
         Аргументы:
             boundary_type: None — сброс для всех типов;
@@ -783,9 +1109,9 @@ class FVMResiduals:
         target_device = torch.device(device)
         target_dtype = dtype if dtype is not None else self._dtype
 
-        for attr in ('V', 'edge_S', 'bnd_S', '_u_prescribed'):
+        for attr in ('V', 'edge_S', 'quad_S', 'bnd_S', '_u_prescribed'):
             setattr(self, attr, getattr(self, attr).to(device=target_device, dtype=target_dtype))
-        for attr in ('edge_i', 'edge_j', 'bnd_node', 'bnd_type'):
+        for attr in ('edge_i', 'edge_j', 'quad_i', 'quad_j', 'bnd_node', 'bnd_type'):
             setattr(self, attr, getattr(self, attr).to(device=target_device))
         for attr in ('_prescribed_mask', '_zero_flux_mask'):
             setattr(self, attr, getattr(self, attr).to(device=target_device))
@@ -827,6 +1153,7 @@ class FVMResiduals:
             return self
 
         self.edge_S.div_(scale)
+        self.quad_S.div_(scale)
         self.bnd_S.div_(scale)
         self.V.div_(scale ** 2)
         self._validate_tensor_geometry()
@@ -856,7 +1183,13 @@ class FVMResiduals:
         self._geometry_length_scale = 1.0
         if was_dimensionless:
             self.nondimensionalize_geometry(length_scale)
-        logger.info("FVMResiduals перестроен: N=%d, M=%d, B=%d", self.N, self.M, self.B)
+        logger.info(
+            "FVMResiduals перестроен: N=%d, M=%d, Q=%d, B=%d",
+            self.N,
+            self.M,
+            self.Q,
+            self.B,
+        )
 
     # ── Фабрики ───────────────────────────────────────────────────────────────
 
@@ -866,5 +1199,5 @@ class FVMResiduals:
         return cls(mesh_data)
 
     def __repr__(self) -> str:
-        return (f"FVMResiduals(N={self.N}, M={self.M}, B={self.B}, "
+        return (f"FVMResiduals(N={self.N}, M={self.M}, Q={self.Q}, B={self.B}, "
                 f"device={self._device})")

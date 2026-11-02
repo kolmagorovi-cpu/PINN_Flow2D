@@ -110,6 +110,10 @@ class MeshData:
         bnd_face_area:    (Fb, 2) векторы площадей граничных граней (outward)
         node_type:        (N,)    'interior' или 'boundary'
         node_bnd_type:    (N,)    строки типов ГУ узлов
+        int_quad_coords:  (Q, 2)  midpoint прямых сегментов дуальных граней
+        int_quad_area:    (Q, 2)  area vector каждого сегмента
+        int_quad_node_i/j:(Q,)    соседние контрольные объёмы сегмента
+        bnd_quad_coords:  (Fb, 2) midpoint граничных полуграней
     """
     coords: np.ndarray
     triangles: np.ndarray
@@ -126,6 +130,13 @@ class MeshData:
     cell_nodes: Optional[np.ndarray] = None
     cell_offsets: Optional[np.ndarray] = None
     quads: Optional[np.ndarray] = None
+    int_quad_coords: Optional[np.ndarray] = None
+    int_quad_area: Optional[np.ndarray] = None
+    int_quad_node_i: Optional[np.ndarray] = None
+    int_quad_node_j: Optional[np.ndarray] = None
+    int_quad_face: Optional[np.ndarray] = None
+    bnd_quad_coords: Optional[np.ndarray] = None
+    mesh_schema_version: int = 1
 
     @property
     def n_nodes(self) -> int:
@@ -143,6 +154,14 @@ class MeshData:
     def n_bnd_faces(self) -> int:
         return len(self.bnd_face_node)
 
+    @property
+    def n_int_quad_points(self) -> int:
+        return (
+            0
+            if self.int_quad_coords is None
+            else len(self.int_quad_coords)
+        )
+
     def to_torch(
         self,
         device: torch.device,
@@ -155,7 +174,7 @@ class MeshData:
             coords, cv_volumes, int_face_node_i, int_face_node_j,
             int_face_area, bnd_face_node, bnd_face_neighbor, bnd_face_area
         """
-        return {
+        tensors = {
             'coords': torch.tensor(self.coords, dtype=dtype, device=device),
             'cv_volumes': torch.tensor(self.cv_volumes, dtype=dtype, device=device),
             'int_face_node_i': torch.tensor(self.int_face_node_i, dtype=torch.long, device=device),
@@ -165,6 +184,35 @@ class MeshData:
             'bnd_face_neighbor': torch.tensor(self.bnd_face_neighbor, dtype=torch.long, device=device),
             'bnd_face_area': torch.tensor(self.bnd_face_area, dtype=dtype, device=device),
         }
+        if self.int_quad_coords is not None:
+            tensors.update({
+                'int_quad_coords': torch.tensor(
+                    self.int_quad_coords,
+                    dtype=dtype,
+                    device=device,
+                ),
+                'int_quad_area': torch.tensor(
+                    self.int_quad_area,
+                    dtype=dtype,
+                    device=device,
+                ),
+                'int_quad_node_i': torch.tensor(
+                    self.int_quad_node_i,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                'int_quad_node_j': torch.tensor(
+                    self.int_quad_node_j,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                'bnd_quad_coords': torch.tensor(
+                    self.bnd_quad_coords,
+                    dtype=dtype,
+                    device=device,
+                ),
+            })
+        return tensors
 
 
 class PINNDataset(Dataset):
@@ -1028,6 +1076,63 @@ class DataHandler:
             self.boundary_layer_model,
         )
 
+    @staticmethod
+    def _mesh_cells(mesh_data: MeshData) -> List[np.ndarray]:
+        """Return canonical polygon cells stored in a mesh artifact."""
+        if (
+            mesh_data.cell_nodes is not None
+            and mesh_data.cell_offsets is not None
+            and len(mesh_data.cell_offsets) >= 2
+        ):
+            nodes = np.asarray(mesh_data.cell_nodes, dtype=np.int64)
+            offsets = np.asarray(mesh_data.cell_offsets, dtype=np.int64)
+            return [
+                nodes[int(start):int(stop)]
+                for start, stop in zip(offsets[:-1], offsets[1:])
+            ]
+        return [
+            np.asarray(triangle, dtype=np.int64)
+            for triangle in np.asarray(mesh_data.triangles, dtype=np.int64)
+        ]
+
+    def _ensure_fvm_quadrature(self) -> None:
+        """Populate direct-PINN face quadrature, including legacy meshes."""
+        mesh = self.mesh_data
+        if mesh is None:
+            return
+        required = (
+            mesh.int_quad_coords,
+            mesh.int_quad_area,
+            mesh.int_quad_node_i,
+            mesh.int_quad_node_j,
+            mesh.bnd_quad_coords,
+        )
+        if all(value is not None for value in required):
+            return
+
+        from airfoil_pinn.sampling.mesh.core import (
+            build_dual_face_quadrature,
+        )
+
+        quadrature = build_dual_face_quadrature(
+            mesh.coords,
+            self._mesh_cells(mesh),
+            mesh.int_face_node_i,
+            mesh.int_face_node_j,
+            mesh.int_face_area,
+            mesh.bnd_face_node,
+            mesh.bnd_face_neighbor,
+        )
+        for name, values in quadrature.items():
+            setattr(mesh, name, values)
+        mesh.mesh_schema_version = 2
+        logger.info(
+            "FVM face quadrature reconstructed: internal segments=%d, "
+            "boundary segments=%d",
+            mesh.n_int_quad_points,
+            len(mesh.bnd_quad_coords),
+        )
+
     def load_mesh(self, mesh_file: str) -> None:
         """
         Загружает FVM-сетку из файла .npz (созданного mesh2d.Mesh2D.save()).
@@ -1069,7 +1174,36 @@ class DataHandler:
                     np.array(data['cell_offsets']) if 'cell_offsets' in data.files else None
                 ),
                 quads=np.array(data['quads']) if 'quads' in data.files else None,
+                int_quad_coords=(
+                    np.array(data['int_quad_coords'])
+                    if 'int_quad_coords' in data.files else None
+                ),
+                int_quad_area=(
+                    np.array(data['int_quad_area'])
+                    if 'int_quad_area' in data.files else None
+                ),
+                int_quad_node_i=(
+                    np.array(data['int_quad_node_i'])
+                    if 'int_quad_node_i' in data.files else None
+                ),
+                int_quad_node_j=(
+                    np.array(data['int_quad_node_j'])
+                    if 'int_quad_node_j' in data.files else None
+                ),
+                int_quad_face=(
+                    np.array(data['int_quad_face'])
+                    if 'int_quad_face' in data.files else None
+                ),
+                bnd_quad_coords=(
+                    np.array(data['bnd_quad_coords'])
+                    if 'bnd_quad_coords' in data.files else None
+                ),
+                mesh_schema_version=(
+                    int(np.asarray(data['mesh_schema_version']).item())
+                    if 'mesh_schema_version' in data.files else 1
+                ),
             )
+        self._ensure_fvm_quadrature()
         logger.info(
             "FVM-сетка загружена: %d узлов, %d треуг., %d вн. граней, %d гран. граней",
             self.mesh_data.n_nodes, self.mesh_data.n_triangles,
@@ -1106,6 +1240,7 @@ class DataHandler:
             )),
             quads=np.asarray(mesh.quads, dtype=np.int32),
         )
+        self._ensure_fvm_quadrature()
         self._prepare_fvm_tensors()
 
     def _dataset_boundary_type_strings(self) -> List[str]:
@@ -1170,14 +1305,16 @@ class DataHandler:
         """
         Подготавливает нормированные тензоры (x, y, sdf, boundary_types) для FVM-шага.
 
-        Координаты берутся из узлов сетки (mesh_data.coords / chord).
-        SDF вычисляется каноническим PolylineDistanceField по тем же
-        нормированным сегментам, что используются training и inference.
-        Типы границ строятся из mesh_data.node_bnd_type с тем же one-hot, что и датасет.
+        Подготавливаются как узловые координаты для интегральной диагностики,
+        так и midpoint-координаты прямых сегментов дуальных FVM-граней для
+        production FVM loss. SDF вычисляется каноническим
+        PolylineDistanceField по тем же нормированным сегментам, что
+        используются training и inference.
 
-        Результат: self.fvm_x, self.fvm_y и self.fvm_sdf готовы для входа
-        сети, а self.fvm_bt хранит служебную BC-разметку FVM-узлов.
+        ``fvm_quad_*`` используются для прямого PINN-предсказания гранных
+        скоростей без интерполяции узловых значений.
         """
+        self._ensure_fvm_quadrature()
         coords = self.mesh_data.coords          # (N, 2) физические
         N = len(coords)
 
@@ -1254,13 +1391,62 @@ class DataHandler:
         self.fvm_sdf = self.fvm_sdf_float64
         self.fvm_bt  = torch.tensor(bt_one_hot,  dtype=torch.float32) if bt_names else None
 
+        # Direct-PINN FVM quadrature.  Internal points are midpoints of the
+        # straight median-dual face segments; boundary points are midpoints of
+        # physical boundary half-edges.  They are evaluated by the network
+        # directly and are never reconstructed from nodal velocities.
+        int_quad = np.asarray(
+            self.mesh_data.int_quad_coords,
+            dtype=np.float64,
+        ).reshape(-1, 2)
+        bnd_quad = np.asarray(
+            self.mesh_data.bnd_quad_coords,
+            dtype=np.float64,
+        ).reshape(-1, 2)
+        quad_phys = np.vstack((int_quad, bnd_quad))
+        quad_norm = quad_phys / float(self.chord)
+        quad_sdf = distance_field.evaluate_numpy(
+            quad_norm,
+            point_chunk_size=2048,
+        )
+        self.fvm_int_quad_count = len(int_quad)
+        self.fvm_bnd_quad_count = len(bnd_quad)
+        self.fvm_quad_x = torch.from_numpy(
+            np.ascontiguousarray(quad_norm[:, 0])
+        ).view(-1, 1)
+        self.fvm_quad_y = torch.from_numpy(
+            np.ascontiguousarray(quad_norm[:, 1])
+        ).view(-1, 1)
+        self.fvm_quad_sdf = torch.from_numpy(
+            np.ascontiguousarray(quad_sdf)
+        ).view(-1, 1)
+
+        quad_bt = np.zeros((len(quad_norm), len(bt_names)), dtype=np.float32)
+        if bt_names:
+            offset = self.fvm_int_quad_count
+            for local_index, boundary_type in enumerate(
+                self.mesh_data.bnd_face_type
+            ):
+                type_index = type_to_idx.get(str(boundary_type).lower())
+                if type_index is not None:
+                    quad_bt[offset + local_index, type_index] = 1.0
+        self.fvm_quad_bt = (
+            torch.from_numpy(quad_bt) if bt_names else None
+        )
+
         if N != self.n_points:
             logger.warning(
                 "FVM-сетка (%d узлов) ≠ датасет (%d точек) — "
                 "Sampler пропустил %d узлов. FVM использует координаты сетки напрямую.",
                 N, self.n_points, abs(N - self.n_points),
             )
-        logger.info("FVM-тензоры подготовлены: %d узлов", N)
+        logger.info(
+            "FVM tensors prepared: nodes=%d, internal quadrature=%d, "
+            "boundary quadrature=%d",
+            N,
+            self.fvm_int_quad_count,
+            self.fvm_bnd_quad_count,
+        )
 
     def get_dataloader(self) -> DataLoader:
         """
@@ -1515,6 +1701,13 @@ class DataHandler:
                 'cell_nodes': self.mesh_data.cell_nodes,
                 'cell_offsets': self.mesh_data.cell_offsets,
                 'quads': self.mesh_data.quads,
+                'int_quad_coords': self.mesh_data.int_quad_coords,
+                'int_quad_area': self.mesh_data.int_quad_area,
+                'int_quad_node_i': self.mesh_data.int_quad_node_i,
+                'int_quad_node_j': self.mesh_data.int_quad_node_j,
+                'int_quad_face': self.mesh_data.int_quad_face,
+                'bnd_quad_coords': self.mesh_data.bnd_quad_coords,
+                'mesh_schema_version': self.mesh_data.mesh_schema_version,
             }
 
         return {
@@ -1590,6 +1783,12 @@ class DataHandler:
                 'fvm_sdf',
                 'fvm_sdf_float64',
                 'fvm_bt',
+                'fvm_quad_x',
+                'fvm_quad_y',
+                'fvm_quad_sdf',
+                'fvm_quad_bt',
+                'fvm_int_quad_count',
+                'fvm_bnd_quad_count',
                 'fvm_sdf_geometry_fingerprint',
             ):
                 if hasattr(self, attr):

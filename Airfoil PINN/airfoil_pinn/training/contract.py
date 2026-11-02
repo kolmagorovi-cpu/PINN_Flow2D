@@ -143,6 +143,8 @@ def build_training_contract(
         ),
         "fvm": {
             "enabled": fvm_enabled,
+            "velocity_sampling": "pinn_segment_midpoint",
+            "quadrature_rule": "midpoint_per_dual_segment",
             "reduction": fvm_reduction,
             "weight": fvm_weight,
             "schedule": fvm_schedule,
@@ -156,6 +158,16 @@ def build_training_contract(
             "mesh_fingerprint": getattr(
                 fvm_operator,
                 "mesh_fingerprint",
+                None,
+            ),
+            "internal_quadrature_points": getattr(
+                fvm_operator,
+                "Q",
+                None,
+            ),
+            "boundary_quadrature_points": getattr(
+                fvm_operator,
+                "B",
                 None,
             ),
             "normalization": "face_vectors/c;control_volumes/c^2",
