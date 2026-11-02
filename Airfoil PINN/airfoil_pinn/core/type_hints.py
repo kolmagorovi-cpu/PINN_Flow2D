@@ -552,6 +552,8 @@ class ProcessConfigDict(TypedDict, total=False):
     load_model_path: Optional[str]
     device: str
     num_gpus: int
+    cpu_threads: Union[int, str]
+    cpu_interop_threads: Union[int, str]
     dtype: str
     use_amp: bool
     torch_compile: bool

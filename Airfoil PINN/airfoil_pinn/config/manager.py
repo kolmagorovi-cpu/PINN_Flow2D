@@ -234,6 +234,11 @@ class ConfigManager:
                 'load_model_path': None,
                 'device': 'auto',
                 'num_gpus': 1,
+                # ``auto`` задействует все доступные логические CPU для
+                # вычислительных ядер PyTorch. Inter-op пул оставляем малым,
+                # чтобы избежать вложенной переподписки потоков.
+                'cpu_threads': 'auto',
+                'cpu_interop_threads': 1,
                 'dtype': 'float32',
                 'use_amp': False,
                 'torch_compile': False,
@@ -556,6 +561,8 @@ class ConfigManager:
         print("ПРОЦЕСС:")
         print(f"  device         : {proc['device']}")
         print(f"  num_gpus       : {proc['num_gpus']}")
+        print(f"  cpu_threads    : {proc.get('cpu_threads', 'auto')}")
+        print(f"  cpu_interop_threads: {proc.get('cpu_interop_threads', 1)}")
         print(f"  dtype          : {proc['dtype']}")
         print(f"  use_amp        : {proc['use_amp']}")
         print(f"  torch_compile  : {proc.get('torch_compile', False)}")

@@ -4,7 +4,7 @@
 Меню процесса обучения PINN.
 
 Этот экран управляет техническими параметрами запуска: загрузкой
-модели для дообучения, выбором устройства, числа GPU, dtype и AMP.
+модели для дообучения, выбором устройства, числа GPU/CPU, dtype и AMP.
 Основной CLI получает только готовую функцию ``process_settings``.
 """
 
@@ -25,6 +25,16 @@ CONFIG_DIR = ConfigManager.CONFIG_DIR
 __all__ = ["process_settings"]
 
 
+def _parse_thread_count(value: str) -> int | str:
+    """Parse an interactive ``auto``/positive-integer thread setting."""
+    if value.lower() == 'auto':
+        return 'auto'
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError
+    return parsed
+
+
 def process_settings(cfg: ConfigManager) -> None:
     """Меню настроек процесса обучения."""
     while True:
@@ -32,7 +42,7 @@ def process_settings(cfg: ConfigManager) -> None:
         print_submenu_header("Настройки процесса обучения")
         proc = cfg.config['process']
         print("1. Загрузить PINN и её конфигурацию для дообучения")
-        print("2. Выбор GPU/CPU и их количества")
+        print("2. Выбор GPU/CPU и количества потоков")
         print("3. Выбор типа данных")
         print("4. Показать настройки")
         print("0. Выход")
@@ -68,6 +78,17 @@ def process_settings(cfg: ConfigManager) -> None:
                 proc['num_gpus'] = int(input(f"Количество GPU [{proc['num_gpus']}]: ") or proc['num_gpus'])
             else:
                 proc['num_gpus'] = 0
+                current = proc.get('cpu_threads', 'auto')
+                value = input(
+                    "Количество потоков CPU (auto или целое >= 1) "
+                    f"[{current}]: "
+                ).strip()
+                if value:
+                    try:
+                        proc['cpu_threads'] = _parse_thread_count(value)
+                    except ValueError:
+                        print("Введите 'auto' или целое число не меньше 1.")
+                        input("Нажмите Enter...")
         elif sub == '3':
             proc['dtype'] = input(f"Тип данных (float32/float64/float16) [{proc['dtype']}]: ").strip() or proc['dtype']
             if proc['dtype'] == 'float32':
@@ -76,6 +97,11 @@ def process_settings(cfg: ConfigManager) -> None:
             print("\n--- ТЕКУЩИЕ НАСТРОЙКИ ПРОЦЕССА ---")
             print(f"Загруженная модель: {proc['load_model_path']}")
             print(f"Устройство: {proc['device']}, GPU: {proc['num_gpus']}")
+            print(
+                "Потоки CPU: "
+                f"intra-op={proc.get('cpu_threads', 'auto')}, "
+                f"inter-op={proc.get('cpu_interop_threads', 1)}"
+            )
             print(f"Тип данных: {proc['dtype']}, AMP: {proc['use_amp']}")
             print(f"Seed: {proc.get('seed', 42)}")
             input("Нажмите Enter...")

@@ -371,6 +371,13 @@ mesh routines используют собственные progress bars. `data.n
 На Windows используется воспроизводимый top-level worker initializer и
 обязателен `__main__` guard.
 
+При обучении на CPU `process.cpu_threads` управляет intra-op пулом PyTorch,
+который распараллеливает тензорные операции, forward/backward и оптимизатор.
+Значение `auto` использует все доступные логические CPU. Параметр
+`process.cpu_interop_threads` управляет отдельным пулом диспетчеризации
+операций; значение по умолчанию `1` предотвращает вложенную переподписку.
+Эффективные размеры обоих пулов записываются в `logs/run_manifest.json`.
+
 `training.full_epoch_optimizer_step=true` замораживает параметры Adam на весь
 проход по DataLoader, накапливает градиенты всех batch и выполняет ровно один
 `optimizer.step()` в конце эпохи. В этом режиме

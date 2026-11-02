@@ -46,6 +46,23 @@ def _positive_integer(
         errors.append(f"{name} must be a positive integer")
 
 
+def _nonnegative_integer(
+    value: Any,
+    name: str,
+    errors: list[str],
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        errors.append(f"{name} must be a non-negative integer")
+
+
+def _thread_count(value: Any, name: str, errors: list[str]) -> None:
+    """Validate a PyTorch thread count accepting the ``auto`` sentinel."""
+    if isinstance(value, str) and value.lower() == "auto":
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        errors.append(f"{name} must be 'auto' or a positive integer")
+
+
 def _finite_nonnegative(
     value: Any,
     name: str,
@@ -412,9 +429,19 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
             "process.dtype must be float32 or float64; direct float16 is "
             "unsafe for second-order PINN derivatives (use AMP instead)"
         )
-    _positive_integer(
+    _nonnegative_integer(
         process.get("num_gpus", 1),
         "process.num_gpus",
+        errors,
+    )
+    _thread_count(
+        process.get("cpu_threads", "auto"),
+        "process.cpu_threads",
+        errors,
+    )
+    _thread_count(
+        process.get("cpu_interop_threads", 1),
+        "process.cpu_interop_threads",
         errors,
     )
     grad_clip = training.get("grad_clip")

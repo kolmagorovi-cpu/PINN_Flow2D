@@ -59,6 +59,7 @@ from airfoil_pinn.training.reproducibility import (
     restore_rng_state,
 )
 from airfoil_pinn.training.telemetry import RunTelemetry
+from airfoil_pinn.training.cpu_runtime import configure_cpu_threading
 
 # Компоненты тренировочного процесса.
 from airfoil_pinn.training.components.optimizers import LocalMinimaDetector, CyclicLR
@@ -93,12 +94,17 @@ class PINNSolver:
         # Timestamp фиксируется один раз — используется во всех _get_*_dir()
         self._timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-        # Установка seed
+        # Устройство и CPU thread pools настраиваются до первых тензорных
+        # вычислений, как того требует PyTorch для inter-op пула.
+        self.device = self._init_device(config['process'])
+        self.cpu_thread_settings = configure_cpu_threading(
+            config['process'],
+            cpu_active=self.device.type == 'cpu',
+        )
+
+        # Установка seed и типа данных
         seed = config.get('process', {}).get('seed', 42)
         set_seed(seed)
-
-        # Устройство и тип данных
-        self.device = self._init_device(config['process'])
         self.dtype = self._init_dtype(config['process']['dtype'])
         requested_amp = bool(config['process'].get('use_amp', False))
         self.use_amp = requested_amp and self.device.type == 'cuda' and self.dtype == torch.float32
@@ -371,6 +377,7 @@ class PINNSolver:
                 "dtype": str(self.dtype),
                 "amp": self.use_amp,
                 "start_epoch": self.start_epoch,
+                "cpu_threading": self.cpu_thread_settings,
             },
             "model": {
                 "class": base_model.__class__.__name__,
