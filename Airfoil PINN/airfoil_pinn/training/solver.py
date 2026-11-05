@@ -116,6 +116,9 @@ class PINNSolver:
 
         # Загрузка данных
         data_cfg = config.get('data', {})
+        logger.info("Файл точек обучения: %s", resolve_project_path(data_cfg['points_file']))
+        if data_cfg.get('mesh_file'):
+            logger.info("FVM-сетка обучения: %s", resolve_project_path(data_cfg['mesh_file']))
         pin_memory = data_cfg.get('pin_memory')
         if pin_memory is None:
             pin_memory = self.device.type == 'cuda'
@@ -152,6 +155,11 @@ class PINNSolver:
         self.x_max = self.data_handler.dataset.x.max().item()
         self.y_min = self.data_handler.dataset.y.min().item()
         self.y_max = self.data_handler.dataset.y.max().item()
+
+        logger.info(
+            "Диапазоны координат обучения: x/c=[%.6g, %.6g], y/c=[%.6g, %.6g]",
+            self.x_min, self.x_max, self.y_min, self.y_max,
+        )
 
         self.loss_computer = LossComputer(
             config=config,
@@ -1266,6 +1274,7 @@ class PINNSolver:
 
         try:
             for epoch in epoch_progress:
+                self.trainer.begin_gradient_report(epoch)
                 start_time = time.time()
                 if previous_epoch_started_at is not None:
                     epoch_duration_window.append(
@@ -1328,6 +1337,11 @@ class PINNSolver:
                     extra_diag['ntk_condition'] = self.trainer.compute_ntk_condition(
                         sample_batch,
                         max_samples=self.ntk_sample_size
+                    )
+                    print(
+                        f"[NTK] Эпоха {epoch}: "
+                        f"ntk_condition={extra_diag['ntk_condition']:.6e} | "
+                        f"точек={min(self.ntk_sample_size, sample_batch[1].shape[0])}"
                     )
 
                 # Средние скорости на inlet/outlet для мониторинга баланса масс
@@ -1434,7 +1448,7 @@ class PINNSolver:
                     loss_change_epochs,
                     loss_window_start,
                     loss_window_end,
-                ) = self.metrics.get_recent_loss_change(max_epochs=100)
+                ) = self.metrics.get_recent_loss_change()
                 pde_max_abs = {
                     name: float(np.sqrt(max(value, 0.0)))
                     for name, value in pde_max.items()
@@ -1528,6 +1542,9 @@ class PINNSolver:
                         "mass_balance_error"
                     ],
                 )
+                if self.trainer._capture_gradient_report:
+                    from airfoil_pinn.training.gradient_report import print_gradient_report
+                    print_gradient_report(self.trainer.gradient_report, epoch)
                 line2 = (
                     f"   avg u_inlet = {avg_u_in:.4f} (норм.), "
                     f"avg u_outlet = {avg_u_out:.4f} (норм.), "

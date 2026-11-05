@@ -1131,7 +1131,7 @@ class MetricsCollector:
     # ------------------------------------------------------------------
     def get_recent_loss_change(
         self,
-        max_epochs: int = 100,
+        max_epochs: int = 25,
     ) -> Tuple[Optional[float], int, Optional[float], Optional[float]]:
         """Return total-loss change over the latest available epoch window.
 
@@ -1342,7 +1342,7 @@ class MetricsCollector:
             loss_change_epochs,
             loss_window_start,
             loss_window_end,
-        ) = self.get_recent_loss_change(max_epochs=100)
+        ) = self.get_recent_loss_change()
         if loss_change_percent is None:
             print(
                 f"Loss change (last {loss_change_epochs} epoch): n/a"
@@ -1559,17 +1559,14 @@ class MetricsCollector:
         )
         if clip_enabled:
             clip_limit = float(grad_clip)
-            clipping_status = (
-                "YES" if float(grad_norm) > clip_limit else "no"
-            )
             print(
-                f"Gradient norm (pre-clip): {grad_norm:.3e} {bullet} "
+                f"Mean step gradient norm (pre-clip, Adam): {grad_norm:.3e} {bullet} "
                 f"clip limit: {clip_limit:.3e} {bullet} "
-                f"clipping: {clipping_status}"
+                "clipping: see per-group gradient report"
             )
         else:
             print(
-                f"Gradient norm (pre-clip): {grad_norm:.3e} {bullet} "
+                f"Mean step gradient norm (pre-clip, Adam): {grad_norm:.3e} {bullet} "
                 "clipping: disabled"
             )
         print(

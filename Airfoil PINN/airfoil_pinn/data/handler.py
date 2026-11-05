@@ -1150,6 +1150,8 @@ class DataHandler:
         if not os.path.exists(mesh_file):
             raise FileNotFoundError(f"Файл сетки не найден: {mesh_file}")
         with np.load(mesh_file, allow_pickle=True) as data:
+            mesh_coords = np.asarray(data['coords'], dtype=np.float64)
+            self._validate_mesh_coordinate_bounds(mesh_coords, mesh_file)
             if 'domain_coords' in data.files and len(data['domain_coords']) >= 2:
                 self.mesh_domain_coords = np.asarray(data['domain_coords'], dtype=np.float64)
             if 'airfoil_coords' in data.files and len(data['airfoil_coords']) >= 2:
@@ -1210,6 +1212,24 @@ class DataHandler:
             self.mesh_data.n_int_faces, self.mesh_data.n_bnd_faces,
         )
         self._prepare_fvm_tensors()
+
+    def _validate_mesh_coordinate_bounds(self, coords, mesh_file: str) -> None:
+        """Reject a stale mesh extending beyond the selected training domain."""
+        normalized = np.asarray(coords, dtype=np.float64) / float(self.chord)
+        lower = np.array([self.dataset.x.min().item(), self.dataset.y.min().item()])
+        upper = np.array([self.dataset.x.max().item(), self.dataset.y.max().item()])
+        mesh_lower, mesh_upper = normalized.min(axis=0), normalized.max(axis=0)
+        tolerance = 1e-6 * max(1.0, float(np.max(np.abs([lower, upper]))))
+        if np.any(mesh_lower < lower - tolerance) or np.any(mesh_upper > upper + tolerance):
+            raise ValueError(
+                f"FVM-сетка {mesh_file} выходит за область датасета {self.points_file}. "
+                f"Датасет: x/c=[{lower[0]:.6g}, {upper[0]:.6g}], "
+                f"y/c=[{lower[1]:.6g}, {upper[1]:.6g}]; "
+                f"сетка: x/c=[{mesh_lower[0]:.6g}, {mesh_upper[0]:.6g}], "
+                f"y/c=[{mesh_lower[1]:.6g}, {mesh_upper[1]:.6g}]. "
+                "Выберите согласованные data.points_file и data.mesh_file "
+                "или пересоздайте сетку и начальные поля для одной области."
+            )
 
     def set_mesh_from_mesh2d(self, mesh) -> None:
         """Обновляет MeshData и FVM-тензоры из уже построенного Mesh2D."""

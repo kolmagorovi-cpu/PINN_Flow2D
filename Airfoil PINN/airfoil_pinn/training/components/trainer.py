@@ -972,6 +972,14 @@ class Trainer:
     # ------------------------------------------------------------------
     # Вычисление градиентов PDE и BC отдельно
     # ------------------------------------------------------------------
+    def begin_gradient_report(self, epoch: int) -> None:
+        """Enable snapshots only on configured reporting epochs."""
+        interval = self.diag_config.get('gradient_report_interval', 50)
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 0:
+            raise ValueError("diagnostics.gradient_report_interval must be an integer >= 0")
+        self._capture_gradient_report = interval > 0 and epoch % interval == 0
+        self.gradient_report = None
+
     def compute_grad_norms_separately(self, batch: Tuple) -> Dict[str, float]:
         """
         Вычисляет нормы градиентов от PDE loss и BC loss, а также косинус угла между ними.
@@ -2218,6 +2226,10 @@ class Trainer:
                 stage="Adam backward",
             )
             grad_norm = gradient_health.l2_norm
+            capture_report = getattr(self, '_capture_gradient_report', False)
+            if capture_report:
+                from airfoil_pinn.training.gradient_report import collect_gradients
+                report_before = collect_gradients(named_parameters)
             if self.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
@@ -2228,6 +2240,12 @@ class Trainer:
                         self.sa_weights.parameters(),
                         self.grad_clip,
                     )
+
+            if capture_report:
+                self.gradient_report = (
+                    report_before, collect_gradients(named_parameters),
+                    "Adam: last optimizer step", self.grad_clip,
+                )
 
             if self.use_amp and self.scaler is not None:
                 self.scaler.step(self.optimizer)
@@ -2624,6 +2642,10 @@ class Trainer:
                 self.model.named_parameters(),
                 stage="L-BFGS backward",
             )
+            if getattr(self, '_capture_gradient_report', False):
+                from airfoil_pinn.training.gradient_report import collect_gradients
+                rows = collect_gradients(self.model.named_parameters())
+                self.gradient_report = (rows, rows, "L-BFGS: last closure evaluation", None)
             return total_loss
 
         loss = self.optimizer.step(closure)

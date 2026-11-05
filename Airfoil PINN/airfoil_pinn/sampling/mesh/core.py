@@ -323,50 +323,47 @@ def _point_in_tri(p: np.ndarray, pa: np.ndarray,
 
 def _triangulate_polygon_delaunay(polygon: List[int],
                                    coords: np.ndarray) -> List[Tuple[int, int, int]]:
+    """Triangulate a cavity in boundary order, preserving collinear vertices.
+
+    Ear clipping avoids zero-area cells along normal columns. The caller's
+    Lawson pass restores the constrained Delaunay property afterwards.
     """
-    Делоне-триангуляция простого многоугольника polygon (список глобальных индексов),
-    где первый и последний элемент — вершины ограниченного ребра.
-    Рекурсивный алгоритм: выбирает вершину k ∈ polygon[1:-1], для которой
-    никакая другая вершина не лежит внутри описанной окружности (v0, vk, vn).
-    """
-    n = len(polygon)
-    if n < 3:
+    if len(polygon) < 3:
         return []
-    if n == 3:
-        tri = _ensure_ccw((polygon[0], polygon[1], polygon[2]), coords)
-        return [tri]
-
-    v0, vn = polygon[0], polygon[-1]
-    best_k = 1
-    min_violations = n + 1  # любое значение > возможного максимума
-    for k in range(1, n - 1):
-        vk = polygon[k]
-        pa = coords[v0]
-        pb = coords[vk]
-        pc = coords[vn]
-        if _cross2d(pa, pb, pc) < 0:
-            pa, pc = pc, pa
-        violations = 0
-        for j in range(1, n - 1):
-            if j == k:
+    remaining = list(polygon)
+    xy = coords[remaining] - coords[remaining[0]]
+    signed_area = np.sum(xy[:, 0] * np.roll(xy[:, 1], -1)
+                         - xy[:, 1] * np.roll(xy[:, 0], -1))
+    if signed_area < 0:
+        remaining.reverse()
+    scale = float(np.max(np.ptp(xy, axis=0)))
+    tolerance = 16 * np.finfo(np.float64).eps * scale * scale
+    result = []
+    while len(remaining) > 3:
+        for index, vertex in enumerate(remaining):
+            previous = remaining[index - 1]
+            following = remaining[(index + 1) % len(remaining)]
+            pa, pb, pc = coords[[previous, vertex, following]]
+            if _cross2d(pa, pb, pc) <= tolerance:
                 continue
-            if _in_circumcircle(pa, pb, pc, coords[polygon[j]]):
-                violations += 1
-        if violations == 0:
-            best_k = k
+            # Include points on an ear's edges: removing such an ear would
+            # strand a boundary vertex and produce a degenerate final cell.
+            occupied = any(
+                _cross2d(pa, pb, coords[v]) >= -tolerance
+                and _cross2d(pb, pc, coords[v]) >= -tolerance
+                and _cross2d(pc, pa, coords[v]) >= -tolerance
+                for v in remaining if v not in (previous, vertex, following)
+            )
+            if occupied:
+                continue
+            result.append((previous, vertex, following))
+            remaining.pop(index)
             break
-        if violations < min_violations:
-            min_violations = violations
-            best_k = k
-
-    vk = polygon[best_k]
-    tri = _ensure_ccw((v0, vk, vn), coords)
-    result = [tri]
-
-    left = polygon[:best_k + 1]   # [v0, ..., vk]
-    right = polygon[best_k:]      # [vk, ..., vn]
-    result.extend(_triangulate_polygon_delaunay(left, coords))
-    result.extend(_triangulate_polygon_delaunay(right, coords))
+        else:
+            raise ValueError("Cannot triangulate a non-simple or degenerate CDT cavity")
+    if _cross2d(*coords[remaining]) <= tolerance:
+        raise ValueError("Degenerate final triangle in CDT cavity")
+    result.append(tuple(remaining))
     return result
 
 
@@ -429,7 +426,7 @@ def _insert_constrained_edge(
         c1 = dp[0] * d[1] - dp[1] * d[0]   # dp × d
         c2 = dq[0] * d[1] - dq[1] * d[0]   # dq × d
 
-        if c1 >= -1e-12 and c2 <= 1e-12:    # d попадает в угловой сектор
+        if c1 >= 0.0 and c2 <= 0.0:    # d попадает в угловой сектор
             start_tid = tid
             break
 
@@ -478,12 +475,8 @@ def _insert_constrained_edge(
         # Глобальный fallback: все пересечённые треугольники уже собраны.
         crossed_ids = _direct_crossed
     else:
-        # ── Фаза 1б: Выход из start_tid — start_tid НЕ входит в crossed_ids ──
-        # start_tid содержит вершину s. Удалять его нельзя: это создаёт замещающие
-        # треугольники (s,p,t)/(s,q,t) с вершинами p,q у которых _param<0
-        # («позади» s). При граничном exit-ребре corridor обрывается, giant-
-        # треугольники перекрывают существующие → V_i=0 → зажим 1e-30 → R_i≈10³⁰.
-        # Используем start_tid только чтобы найти first_exit_edge коридора.
+        # Both endpoint triangles belong to the replacement cavity. Keeping
+        # either one leaves overlapping old/new cells and non-manifold edges.
         a, b, c = tris[start_tid]
         first_exit_edge: Optional[Tuple[int, int]] = None
         for u, v in ((a, b), (b, c), (c, a)):
@@ -506,7 +499,7 @@ def _insert_constrained_edge(
         # Тест строгого пересечения (ps,pt) с ребром (u,v):
         #   d1 = cross2d(ps,pt, coords[u]),  d2 = cross2d(ps,pt, coords[v])
         #   d1·d2 < 0  ↔  u и v лежат по разные стороны прямой s→t.
-        crossed_ids = set()
+        crossed_ids = {start_tid}
         current_tid = next(iter(first_nbrs))
         entry_edge: Optional[Tuple[int, int]] = first_exit_edge
         max_steps = len(tris) + 10
@@ -514,10 +507,11 @@ def _insert_constrained_edge(
         for _ in range(max_steps):
             a, b, c = tris[current_tid]
 
-            if t in (a, b, c):
-                break   # достигли треугольника, содержащего вершину t
-
+            if current_tid in crossed_ids:
+                raise ValueError("CDT corridor revisited a triangle")
             crossed_ids.add(current_tid)
+            if t in (a, b, c):
+                break   # Include the endpoint triangle in the cavity.
 
             exit_edge: Optional[Tuple[int, int]] = None
             for u, v in ((a, b), (b, c), (c, a)):
@@ -585,11 +579,34 @@ def _insert_constrained_edge(
         # Триангуляция НЕ изменялась — возвращаем коллинеарные вершины caller-у.
         return next_id, collinear
 
-    def _param(v: int) -> float:
-        return float(np.dot(coords[v] - ps, pt - ps))
-
-    upper.sort(key=_param)
-    lower.sort(key=_param)
+    # Recover the actual cavity boundary. Projection sorting is not a polygon
+    # traversal: near normal layers a chain can double back past an endpoint.
+    # Sorting such vertices creates overlapping and zero-area triangles.
+    cavity_edges: Dict[Tuple[int, int], int] = {}
+    for tid in crossed_ids:
+        a, b, c = tris[tid]
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (min(u, v), max(u, v))
+            cavity_edges[key] = cavity_edges.get(key, 0) + 1
+    boundary: Dict[int, List[int]] = {}
+    for (u, v), count in cavity_edges.items():
+        if count == 1:
+            boundary.setdefault(u, []).append(v)
+            boundary.setdefault(v, []).append(u)
+    if s not in boundary or t not in boundary or any(len(v) != 2 for v in boundary.values()):
+        raise ValueError(f"Invalid CDT cavity for edge ({s}, {t})")
+    polygons = []
+    for neighbor in boundary[s]:
+        polygon = [s]
+        previous, current = s, neighbor
+        while current != t:
+            if current in polygon:
+                raise ValueError(f"Disconnected CDT cavity for edge ({s}, {t})")
+            polygon.append(current)
+            following = next(v for v in boundary[current] if v != previous)
+            previous, current = current, following
+        polygon.append(t)
+        polygons.append(polygon)
 
     # ── Фаза 4: Инкрементальное обновление структур ──────────────────────────
     # 4а — удалить пересечённые треугольники из tris, edge_map, vertex_to_tris
@@ -607,8 +624,7 @@ def _insert_constrained_edge(
         del tris[tid]
 
     # 4б — триангуляция полостей (алгоритм Sloan 1993, без изменений)
-    upper_poly = [s] + upper + [t]
-    lower_poly = [s] + lower + [t]
+    upper_poly, lower_poly = polygons
     new_triangles = (
         _triangulate_polygon_delaunay(upper_poly, coords)
         + _triangulate_polygon_delaunay(lower_poly, coords)
@@ -977,12 +993,14 @@ class Mesh2D:
                 bar_format="{desc}: {n_fmt}/{total_fmt} [{bar}] {percentage:3.0f}%"
                            "  {elapsed}<{remaining}  {postfix}",
             )
-            for i, (name, fn) in enumerate(zip(step_names, step_fns)):
-                bar.set_postfix_str(f"{name}…")
-                fn()
-                bar.set_postfix_str(f"{name} → {_step_result(i)}")
-                bar.update(1)
-            bar.close()
+            try:
+                for i, (name, fn) in enumerate(zip(step_names, step_fns)):
+                    bar.set_postfix_str(f"{name}…")
+                    fn()
+                    bar.set_postfix_str(f"{name} → {_step_result(i)}")
+                    bar.update(1)
+            finally:
+                bar.close()
         else:
             for fn in step_fns:
                 fn()

@@ -1,0 +1,285 @@
+project_name: fvm3
+input_params:
+  coordinates: true
+  sdf: true
+  inlet_velocity: false
+  viscosity: false
+  density: false
+  fluid_file: null
+architecture:
+  hidden_layers:
+  - 258
+  - 258
+  activation: siren
+  siren_first_omega_0: 30.0
+  siren_hidden_omega_0: 30.0
+  output_dim: 3
+  output_bias:
+  - 1.0
+  - 0.0
+  - 0.0
+  coordinate_scaling:
+    enabled: true
+    scale_factor: 1.0
+    input_min: -6.0
+    input_max: 6.0
+pde:
+  system: incompressible_navier_stokes
+  flow_type: 2d
+  pde_on_boundary: false
+sdf:
+  segment_chunk_size: 256
+  absolute_tie_tolerance: 1.0e-12
+  relative_tie_tolerance: 1.0e-10
+  float64_consistency_tolerance: 1.0e-12
+boundary_conditions:
+  wall:
+    kind: no_slip
+    enforcement: soft
+    distance_scale: 0.02
+  inlet:
+    kind: freestream
+    enforcement: soft
+  farfield:
+    kind: freestream
+    enforcement: soft
+  outlet:
+    kind: pressure_outlet
+    enforcement: soft
+  velocity_dirichlet:
+    kind: freestream
+    enforcement: soft
+  slip_wall:
+    kind: slip_wall
+    enforcement: soft
+  symmetry:
+    kind: symmetry
+    enforcement: soft
+  axis_symmetry:
+    kind: axis_symmetry
+    enforcement: soft
+loss_weights:
+  pde_weights:
+    cont: 1.0
+    mom_x: 1.0
+    mom_y: 1.0
+    mom_r: 1.0
+    mom_z: 1.0
+  bc_weights:
+    inlet: 1.0
+    outlet: 1.0
+    outlet_grad: 1.0
+    farfield: 1.0
+    slip_wall: 1.0
+    velocity_dirichlet: 1.0
+    wall: 1.0
+    symmetry: 1.0
+    axis_symmetry: 1.0
+    symmetry_grad: 1.0
+    axis_symmetry_grad: 1.0
+  adaptive_bc: false
+  use_sa_weights: false
+  sa_apply_to_bc: false
+  pressure_gauge_weight: 1.0
+  integral_condition: true
+  integral_weight: 1.0
+  fvm:
+    enabled: true
+    weight: 25.0
+    batch_interval: 1
+    reduction: divergence_l2_volume
+    schedule: every_optimizer_step
+training:
+  two_stage: false
+  stage1_epochs: 100
+  stage2_pde_weight_start: 1.0
+  stage2_pde_weight_end: 100000.0
+  stage2_ramp_epochs: 500
+  lr_schedule: constant
+  lr_cyclic_period: 100
+  lr_cyclic_amplitude: 0.5
+  lr_detector_factor: 2.0
+  lr_detector_patience: 10
+  lr_detector_recovery: 50
+  reset_interval: 0
+  reset_noise: 0.01
+  grad_clip: 1.0
+  rar_enable: false
+  rar_mode: adaptive
+  rar_score_mode: total_loss
+  rar_interval: 100
+  rar_num_points: 200
+  rar_error_quantile: 0.75
+  rar_residual_power: 1.0
+  rar_candidate_multiplier: 12
+  rar_jitter_scale: 0.85
+  rar_min_distance_factor: 0.35
+  rar_min_boundary_distance_factor: 0.05
+  flow_rar:
+    enabled: true
+    num_points: null
+    exclude_sdf_delta: null
+  boundary_rar:
+    enabled: false
+    num_points: null
+    fraction: 0.4
+    delta_mode: estimated
+    delta_max: 5.0
+    eta_levels:
+    - 0.02
+    - 0.05
+    - 0.1
+    - 0.2
+    - 0.35
+    - 0.5
+    - 0.75
+    - 1.0
+    - 1.5
+    - 2.0
+    - 3.0
+    - 5.0
+    contour_samples: 400
+    alpha: 1.5
+    uniform_contour_weight: 0.5
+    min_distance_factor: 0.02
+    score_batch_size: 2048
+    error_weights:
+      cont: 1.0
+      mom_x: 3.0
+      mom_y: 3.0
+      mom_r: 3.0
+      mom_z: 3.0
+  rar_rebuild_fvm: true
+  rar_fvm_rebuild_every: 1
+  rar_fvm_min_new_points: 1
+  rar_save_mesh_volume_plot: true
+  rar_mesh_plot_dpi: 150
+  switch_to_lbfgs_epoch: 0
+  lbfgs_max_iter: 20
+  lbfgs_history_size: 100
+  batch_size: 5000
+  gradient_accumulation_steps: 2
+  epochs: 500
+  early_stopping:
+    enabled: false
+    patience: 100
+    min_delta: 1.0e-06
+    restore_best: true
+output:
+  console_only: true
+  progress_bar: false
+  progress_bar_force: false
+  progress_mininterval: 0.5
+  graphical_window:
+    loss: true
+    pde: true
+    bc: false
+  plot_frequency: 10
+checkpoint:
+  interval: 500
+  load_mode: resume
+  strict_contract: true
+  allow_legacy_without_contract: true
+  name_pattern: '{project_name}_{timestamp}'
+  model_name_pattern: '{project_name}_{timestamp}'
+  save_flow_images: true
+  save_flow_npy: false
+  flow_plot_physical: false
+  flow_plot_subdir: flow
+process:
+  load_model_path: null
+  device: cuda
+  num_gpus: 1
+  dtype: float64
+  use_amp: false
+  torch_compile: false
+  torch_compile_mode: null
+  torch_compile_fullgraph: false
+  torch_compile_dynamic: null
+  seed: 42
+data:
+  points_file: workspace/initial/fields/initial.npy
+  mesh_file: workspace/sampling/mesh/mesh2d.npz
+  num_workers: 0
+  pin_memory: null
+  persistent_workers: null
+  prefetch_factor: 2
+reference:
+  path: null
+diagnostics:
+  interval: 50
+  plot_residual_map: true
+  plot_rar_error_map: true
+  plot_profiles: true
+  profile_sections:
+  - -1.0
+  - 1.001
+  - 5.0
+  plot_spectrum: false
+  spectrum_section_x: 0.5
+  plot_2d_spectrum: false
+  spectrum_2d_resolution: 256
+  compute_grad_cosine: false
+  compute_ntk_condition: false
+  strict_autograd: true
+  save_rar_history: true
+  mass_metrics_interval: 1
+  section_flow:
+    enabled: true
+    sections:
+    - -5.0
+    - -1.0
+    - 1.001
+    - 1.2
+    - 1.5
+    - 2.0
+    - 3.0
+    - 5.0
+    - 10.0
+  boundary_layer:
+    enabled: false
+    interval: 50
+    sections:
+    - 0.05
+    - 0.1
+    - 0.2
+    - 0.4
+    - 0.6
+    - 0.8
+    - 0.95
+    sides:
+    - upper
+    - lower
+    profile_step_fraction: 0.01
+    first_layer_height_fraction: 1.0e-05
+    layer_count: 80
+    growth_ratio: 1.12
+    max_normal_distance_fraction: 0.08
+    edge_threshold: 0.99
+    fit_points: 8
+    x_min_c: 0.02
+    x_max_c: 0.98
+    max_surface_points_per_side: 120
+    unresolved_threshold: 0.8
+    eval_batch_size: 8192
+    save_profiles_npz: true
+    save_metrics_csv: true
+    plot_profiles: true
+    plot_cp: true
+    plot_cf: true
+    plot_delta99: true
+    plot_deficit: true
+enable_key_listener: true
+checkpoint_dir: workspace/experiments
+input_features:
+  angle_of_attack:
+    enabled: false
+  coordinates:
+    enabled: true
+  reynolds:
+    enabled: false
+    range:
+    - 1000.0
+    - 10000000.0
+  sdf:
+    enabled: true

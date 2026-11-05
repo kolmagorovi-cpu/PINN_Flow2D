@@ -11,6 +11,8 @@
 import os
 
 from airfoil_pinn.config.manager import ConfigManager, warn_activation, yes_no
+from airfoil_pinn.app.paths import resolve_project_path
+from airfoil_pinn.data.coordinate_bounds import read_coordinate_bounds
 from airfoil_pinn.training.menus.common import (
     print_submenu_footer,
     print_submenu_header,
@@ -93,6 +95,20 @@ def _configure_hidden_layers(cfg: ConfigManager) -> None:
         arch['hidden_layers'] = [int(x) for x in layers_str.split(',')]
 
 
+def _selected_coordinate_bounds(cfg: ConfigManager):
+    """Report the selected dataset, never substitute legacy scaling hints."""
+    points_file = cfg.config.get('data', {}).get('points_file')
+    if not points_file:
+        print("Файл точек не выбран; диапазоны координат пока неизвестны.")
+        return None
+    print(f"Файл точек: {resolve_project_path(points_file)}")
+    try:
+        return read_coordinate_bounds(points_file)
+    except (OSError, ValueError, EOFError) as exc:
+        print(f"Не удалось определить диапазоны координат: {exc}")
+        return None
+
+
 def _configure_activation(cfg: ConfigManager) -> None:
     """Выбор функции активации."""
     arch = cfg.config['architecture']
@@ -118,16 +134,15 @@ def _configure_activation(cfg: ConfigManager) -> None:
         idx = int(choice) - 1
         if 0 <= idx < len(activations):
             selected_activation = activations[idx]
-            x_min = arch.get('coordinate_scaling', {}).get('input_min', -6.0)
-            x_max = arch.get('coordinate_scaling', {}).get('input_max', 6.0)
-            enabled, scale_factor = warn_activation(selected_activation, x_min, x_max)
+            bounds = _selected_coordinate_bounds(cfg)
+            enabled, scale_factor = warn_activation(
+                selected_activation, *(bounds or (None, None, None, None))
+            )
 
             arch['activation'] = selected_activation
             scaling = arch.setdefault('coordinate_scaling', {})
             scaling['enabled'] = enabled
             scaling['scale_factor'] = scale_factor
-            scaling['input_min'] = x_min
-            scaling['input_max'] = x_max
             if selected_activation == 'siren':
                 # Dataset min/max are resolved by Solver at runtime. Only the
                 # coordinates entering the MLP change; PDE coordinates do not.
@@ -164,13 +179,18 @@ def _configure_coordinate_scaling(cfg: ConfigManager) -> None:
         print(f"Активация: {arch.get('activation', 'tanh')}")
         print(f"Включено: {scaling.get('enabled', False)}")
         print(f"Режим: {mode}")
+        bounds = _selected_coordinate_bounds(cfg)
+        if bounds is not None:
+            x_min, x_max, y_min, y_max = bounds
+            print(f"Диапазон x/c: [{x_min:.6g}, {x_max:.6g}]")
+            print(f"Диапазон y/c: [{y_min:.6g}, {y_max:.6g}]")
         if mode == 'dataset_minmax':
             print("Преобразование в сети: x,y -> [-1, 1] по границам датасета")
             if arch.get('activation') == 'siren':
                 print("Рекомендовано для SIREN: частотный масштаб становится предсказуемым.")
         else:
             print(f"scale_factor: {scaling.get('scale_factor', 1.0):.4f}")
-            print(f"Диапазон координат: [{scaling.get('input_min', -6.0):.2f}, {scaling.get('input_max', 6.0):.2f}]")
+            print(f"Ручная подсказка для multiply: [{scaling.get('input_min', -6.0):.2f}, {scaling.get('input_max', 6.0):.2f}]")
         print("\n1. Включить/выключить масштабирование")
         print("2. Выбрать режим масштабирования")
         print("3. Изменить scale_factor (режим multiply)")

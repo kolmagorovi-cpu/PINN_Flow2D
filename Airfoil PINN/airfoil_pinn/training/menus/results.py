@@ -101,10 +101,11 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
         print("8. Построение 2D спектра")
         print("9. Разрешение 2D спектра")
         print("10. Вычисление раздельных градиентов")
-        print("11. Вычисление NTK")
+        print("11. Вычисление NTK и вывод в консоль")
         print("12. Сохранение истории RAR")
         print("13. Интервал inlet/outlet метрик")
         print("14. Показать текущие настройки")
+        print(f"15. Подробные градиенты: каждые {diag.get('gradient_report_interval', 50)} эпох (0 — отключено)")
         print("0. Выход")
         sub = input("Выберите пункт: ").strip()
 
@@ -135,7 +136,21 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
         elif sub == '10':
             diag['compute_grad_cosine'] = yes_no("Вычислять раздельные градиенты", diag.get('compute_grad_cosine', False))
         elif sub == '11':
-            diag['compute_ntk_condition'] = yes_no("Вычислять NTK", diag.get('compute_ntk_condition', False))
+            print("\nNTK (Neural Tangent Kernel) — матрица сходства градиентов")
+            print("выходов сети по её параметрам: характеризует локальную динамику обучения.")
+            print("Здесь используется сумма выходов сети на малом подбатче.")
+            print("ntk_condition = lambda_max / lambda_min среди собственных значений > 1e-12.")
+            print("Ближе к 1 — более равномерный спектр; большое значение указывает")
+            print("на разные скорости обучения направлений и возможное замедление сходимости.")
+            print("Нулевые значения спектра исключаются: это не проверка полного ранга NTK.")
+            print("inf — нет собственных значений выше порога; 0 — недостаточно точек (< 2).")
+            print("Это оценка, а не ошибка решения; сравнивайте при одинаковых данных и масштабе.")
+            print("Расчёт и вывод выполняются с интервалом диагностики, кроме этапа L-BFGS.")
+            print("Расчёт NTK требует дополнительных времени и памяти.")
+            diag['compute_ntk_condition'] = yes_no(
+                "Вычислять NTK и выводить в консоль",
+                diag.get('compute_ntk_condition', False),
+            )
         elif sub == '12':
             diag['save_rar_history'] = yes_no("Сохранять историю RAR", diag.get('save_rar_history', True))
         elif sub == '13':
@@ -144,7 +159,18 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
                 or diag.get('mass_metrics_interval', 1)
             )
             diag['mass_metrics_interval'] = max(1, diag['mass_metrics_interval'])
+        elif sub == '15':
+            current = diag.get('gradient_report_interval', 50)
+            try:
+                value = int(input(f"Интервал вывода градиентов в эпохах (0 — отключить) [{current}]: ") or current)
+                if value < 0:
+                    raise ValueError
+                diag['gradient_report_interval'] = value
+            except ValueError:
+                print("Введите целое число >= 0. Текущее значение сохранено.")
+                input("Нажмите Enter...")
         elif sub == '14':
+            print(f"Интервал подробного вывода градиентов: {diag.get('gradient_report_interval', 50)} (0 — отключено)")
             print("\n--- ТЕКУЩИЕ НАСТРОЙКИ ДИАГНОСТИКИ ---")
             print(f"Интервал: {diag.get('interval', 50)}")
             print(f"Карта невязки: {diag.get('plot_residual_map', True)}")
@@ -156,7 +182,7 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
             print(f"2D спектр: {diag.get('plot_2d_spectrum', False)}")
             print(f"Разрешение 2D спектра: {diag.get('spectrum_2d_resolution', 256)}")
             print(f"Раздельные градиенты: {diag.get('compute_grad_cosine', False)}")
-            print(f"NTK: {diag.get('compute_ntk_condition', False)}")
+            print(f"NTK (расчёт и вывод в консоль): {diag.get('compute_ntk_condition', False)}")
             print(f"История RAR: {diag.get('save_rar_history', True)}")
             print(f"Интервал inlet/outlet метрик: {diag.get('mass_metrics_interval', 1)}")
             input("Нажмите Enter...")

@@ -472,13 +472,24 @@ def _build_offsets(config: NormalLayerConfig, chord: float) -> Tuple[np.ndarray,
     if growth_mode == "boundary_layer_estimate":
         if delta is None:
             delta = estimate_boundary_layer_thickness(chord, config.re_chord, config.cf_model)
-        if delta is not None and delta > first and n_layers > 1:
-            ratio = float((delta / first) ** (1.0 / (n_layers - 1)))
-            ratio = float(np.clip(ratio, 1.01, 1.8))
+        if delta is not None and delta > first * n_layers and n_layers > 1:
+            # Fit the total thickness, not the last term of the progression.
+            # Preserve the automatic growth cap; unreachable targets use the
+            # nearest bound without changing the requested first cell height.
+            lower, upper = 1.0, 1.8
+            powers = np.arange(n_layers, dtype=np.float64)
+            for _ in range(64):
+                midpoint = (lower + upper) / 2.0
+                if first * np.sum(midpoint ** powers) < delta:
+                    lower = midpoint
+                else:
+                    upper = midpoint
+            ratio = (lower + upper) / 2.0
         else:
             ratio = 1.0
     ratio = max(float(ratio), 1.0)
-    offsets = first * (ratio ** np.arange(n_layers, dtype=np.float64))
+    heights = first * (ratio ** np.arange(n_layers, dtype=np.float64))
+    offsets = np.cumsum(heights)
     stats.update({
         "spacing_mode": "geometric",
         "first_layer_height": float(first),

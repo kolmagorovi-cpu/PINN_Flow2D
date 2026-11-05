@@ -273,6 +273,7 @@ class ConfigManager:
                 'strict_autograd': True,
                 'save_rar_history': True,
                 'mass_metrics_interval': 1,
+                'gradient_report_interval': 50,
                 'section_flow': {
                     'enabled': True,
                     'sections': [0.2, 0.5, 0.8],
@@ -351,6 +352,9 @@ class ConfigManager:
             loaded = {}
 
         # Рекурсивно обновляем словарь
+        # Each selected file starts from defaults, not the previously opened
+        # experiment (whose data paths and settings may be entirely different).
+        self.config = self._default_config()
         self._deep_update(self.config, loaded)
         self._remove_deprecated_boundary_input()
 
@@ -589,6 +593,7 @@ class ConfigManager:
         print(f"  compute_ntk_condition    : {diag.get('compute_ntk_condition', False)}")
         print(f"  strict_autograd          : {diag.get('strict_autograd', True)}")
         print(f"  save_rar_history         : {diag.get('save_rar_history', True)}")
+        print(f"  gradient_report_interval : {diag.get('gradient_report_interval', 50)}")
         print(f"  mass_metrics_interval    : {diag.get('mass_metrics_interval', 1)}")
         print("=" * 70)
 
@@ -708,7 +713,13 @@ ACTIVATION_WARNINGS = {
 }
 
 
-def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.0) -> tuple[bool, float]:
+def warn_activation(
+    activation_name: str,
+    x_min: Optional[float] = None,
+    x_max: Optional[float] = None,
+    y_min: Optional[float] = None,
+    y_max: Optional[float] = None,
+) -> tuple[bool, float]:
     """
     Выводит предупреждение о выбранной функции активации.
 
@@ -716,6 +727,8 @@ def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.
         activation_name: название функции активации
         x_min: минимальное значение координат
         x_max: максимальное значение координат
+        y_min: минимальное значение y/c
+        y_max: максимальное значение y/c
 
     Returns:
         tuple[bool, float]: (пользователь согласен, scale_factor)
@@ -733,9 +746,26 @@ def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.
     print(f"\n{'='*70}")
     print(f"{icon} ПРЕДУПРЕЖДЕНИЕ: Функция активации '{activation_name}'")
     print(f"{'='*70}")
-    print(f"   Диапазон координат: [{x_min:.2f}, {x_max:.2f}]")
+    for axis, lower, upper in [('x', x_min, x_max), ('y', y_min, y_max)]:
+        if lower is None or upper is None:
+            print(f"   Диапазон {axis}/c: неизвестен (нужен файл точек)")
+        else:
+            print(f"   Диапазон {axis}/c: [{lower:.6g}, {upper:.6g}]")
     print(f"   {warning['message']}")
     print(f"   💡 Рекомендация: {warning['recommendation']}")
+
+    if warning['level'] == 'info':
+        print("\n   ✅ Для SIREN будет доступно внутреннее масштабирование x,y к [-1, 1].")
+        input("   Нажмите Enter для продолжения...")
+        return True, 1.0
+
+    if x_min is None or x_max is None:
+        print("   Автоматический scale_factor недоступен без координат датасета.")
+        input("   Нажмите Enter для продолжения...")
+        return False, 1.0
+    # One multiplier applies to both coordinate axes.
+    if y_min is not None and y_max is not None:
+        x_min, x_max = min(x_min, y_min), max(x_max, y_max)
 
     # Вычисляем рекомендуемый scale_factor
     scale_factor: float
@@ -753,11 +783,6 @@ def warn_activation(activation_name: str, x_min: float = -6.0, x_max: float = 6.
         scale_factor = 5.0 / max_abs if max_abs > 0 else 1.0
     else:  # siren
         scale_factor = 1.0
-
-    if warning['level'] == 'info':
-        print("\n   ✅ Для SIREN будет доступно внутреннее масштабирование x,y к [-1, 1].")
-        input("   Нажмите Enter для продолжения...")
-        return True, scale_factor
 
     print(f"\n   Рекомендуемый scale_factor: {scale_factor:.4f}")
     print(f"   {'='*70}")

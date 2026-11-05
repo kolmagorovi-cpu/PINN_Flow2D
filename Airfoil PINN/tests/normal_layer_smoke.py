@@ -76,6 +76,58 @@ def test_open_profile_uses_both_valid_sides() -> None:
     assert np.all(MplPath(domain).contains_points(result.points))
 
 
+def test_normal_cell_heights_grow_from_wall() -> None:
+    for ratio in (1.0, 1.25, 1.5):
+        cfg = NormalLayerConfig(
+            first_layer_height=1e-4,
+            layer_count=4,
+            growth_ratio=ratio,
+            open_profile_sides="upper",
+        )
+        result = generate_normal_layer_points(_rect_domain(), _open_plate(), cfg)
+        column = np.vstack([result.column_surface_points[0], result.points_by_column[0]])
+        heights = np.linalg.norm(np.diff(column, axis=0), axis=1)
+        np.testing.assert_allclose(heights[0], cfg.first_layer_height)
+        np.testing.assert_allclose(heights[1:] / heights[:-1], ratio)
+        assert np.all(result.valid_mask)
+
+
+def test_automatic_growth_matches_total_thickness() -> None:
+    # Includes a target requiring growth below the former 1.01 lower bound.
+    for expected_ratio in (1.0, 1.005, 1.25, 1.8):
+        first = 1e-4
+        count = 6
+        delta = first * sum(expected_ratio ** i for i in range(count))
+        cfg = NormalLayerConfig(
+            first_layer_height=first,
+            layer_count=count,
+            growth_mode="boundary_layer_estimate",
+            delta_mode="manual",
+            delta=delta,
+        )
+        result = generate_normal_layer_points(_rect_domain(), _open_plate(), cfg)
+        heights = np.diff(np.r_[0.0, result.offsets])
+        np.testing.assert_allclose(heights[0], first)
+        np.testing.assert_allclose(heights[1:] / heights[:-1], expected_ratio)
+        np.testing.assert_allclose(result.offsets[-1], delta)
+
+
+def test_automatic_growth_unreachable_targets_preserve_first_height() -> None:
+    for count, delta, expected_ratio in ((4, 1e-5, 1.0), (4, 1.0, 1.8), (1, 0.1, 1.0)):
+        cfg = NormalLayerConfig(
+            first_layer_height=1e-4,
+            layer_count=count,
+            growth_mode="boundary_layer_estimate",
+            delta_mode="manual",
+            delta=delta,
+        )
+        result = generate_normal_layer_points(_rect_domain(), _open_plate(), cfg)
+        heights = np.diff(np.r_[0.0, result.offsets])
+        np.testing.assert_allclose(heights[0], cfg.first_layer_height)
+        np.testing.assert_allclose(result.stats["growth_ratio"], expected_ratio)
+        assert np.all(heights > 0.0)
+
+
 def test_hybrid_transition_fills_sharp_trailing_edge_wake() -> None:
     """The background must not inherit an isotropic outer-layer hole at the TE."""
     domain = np.array(
@@ -134,6 +186,9 @@ def test_hybrid_transition_fills_sharp_trailing_edge_wake() -> None:
 
 
 if __name__ == "__main__":
+    test_normal_cell_heights_grow_from_wall()
+    test_automatic_growth_matches_total_thickness()
+    test_automatic_growth_unreachable_targets_preserve_first_height()
     test_closed_profile_points_are_in_flow()
     test_open_profile_uses_both_valid_sides()
     test_hybrid_transition_fills_sharp_trailing_edge_wake()

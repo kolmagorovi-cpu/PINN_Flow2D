@@ -88,6 +88,12 @@ def _raise_errors(errors: Sequence[str]) -> None:
 def validate_static_config(config: Mapping[str, Any]) -> None:
     """Validate configuration values that do not require loaded data."""
     errors: list[str] = []
+    diagnostics = _mapping(config, "diagnostics", errors)
+    gradient_interval = diagnostics.get("gradient_report_interval", 50)
+    if (isinstance(gradient_interval, bool)
+            or not isinstance(gradient_interval, int)
+            or gradient_interval < 0):
+        errors.append("diagnostics.gradient_report_interval must be an integer >= 0")
     input_params = _mapping(config, "input_params", errors)
     architecture = _mapping(config, "architecture", errors)
     pde = _mapping(config, "pde", errors)

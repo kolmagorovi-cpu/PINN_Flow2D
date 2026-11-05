@@ -1,0 +1,502 @@
+{
+  "report_date": "2026-10-23",
+  "python": "3.14.2 (tags/v3.14.2:df79316, Dec  5 2025, 17:18:21) [MSC v.1944 64 bit (AMD64)]",
+  "packages": {
+    "torch": "2.11.0+cu128",
+    "numpy": "2.4.3",
+    "scipy": "1.17.1",
+    "matplotlib": "3.10.8",
+    "PyYAML": "6.0.3",
+    "shapely": "2.1.2",
+    "typing_extensions": "4.15.0",
+    "tqdm": "4.67.3",
+    "psutil": "7.2.2",
+    "Markdown": "3.10.2"
+  },
+  "cuda_available": true,
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "points": 17327,
+  "initial_dtype": [
+    [
+      "id",
+      "<i4"
+    ],
+    [
+      "case_id",
+      "<i4"
+    ],
+    [
+      "x_norm",
+      "<f8"
+    ],
+    [
+      "y_norm",
+      "<f8"
+    ],
+    [
+      "sdf_norm",
+      "<f8"
+    ],
+    [
+      "boundary_type",
+      "<U20"
+    ],
+    [
+      "on_boundary",
+      "|b1"
+    ],
+    [
+      "on_airfoil",
+      "|b1"
+    ],
+    [
+      "segment_id",
+      "<i4"
+    ],
+    [
+      "normal_x",
+      "<f8"
+    ],
+    [
+      "normal_y",
+      "<f8"
+    ],
+    [
+      "p_norm",
+      "<f8"
+    ],
+    [
+      "u_norm",
+      "<f8"
+    ],
+    [
+      "v_norm",
+      "<f8"
+    ]
+  ],
+  "boundary_counts": {
+    "farfield": 279,
+    "inlet": 41,
+    "interior": 16191,
+    "wall": 816
+  },
+  "mesh": {
+    "N": 17325,
+    "M": 50839,
+    "B": 2272,
+    "mesh_fingerprint": "6ea6a0a8ace39aabb146645b32c8f81b42258f02b9e84199b5b18cacfa198faf",
+    "device": "cpu",
+    "geometry_is_dimensionless": true,
+    "geometry_length_scale": 1.0,
+    "cv_volume_min": 5.358643006655112e-08,
+    "cv_volume_max": 0.012664439695442987,
+    "cv_volume_mean": 0.0006879278300845539,
+    "edge_S_norm_min": 3.859014000941573e-05,
+    "edge_S_norm_max": 0.08349367249441271,
+    "bnd_S_norm_min": 0.00017923708703566804,
+    "bnd_S_norm_max": 0.025000000000000355,
+    "bnd_type_counts": {
+      "wall": 1632,
+      "inlet": 82,
+      "farfield": 558
+    },
+    "prescribed_bc_types": []
+  },
+  "model_parameters": 68631,
+  "uniform_velocity_integral_loss": 4.0,
+  "geometry_closes": true,
+  "checkpoint_epoch": null,
+  "completed_log_epochs": 59,
+  "first_epoch": {
+    "boundary": {
+      "farfield": 0.0058665422533309775,
+      "inlet": 0.010450747843940532,
+      "interior": 0.0,
+      "wall": 1.0242080968962088
+    },
+    "boundary_mse": {
+      "farfield": 0.0058665422533309775,
+      "inlet": 0.010450747843940532,
+      "interior": 0.0,
+      "wall": 1.0242080968962088
+    },
+    "boundary_rms": {
+      "farfield": 0.07659335645688194,
+      "inlet": 0.10222889926014332,
+      "interior": 0.0,
+      "wall": 1.0120316679314976
+    },
+    "diagnostics": {
+      "avg_u_in": 0.882651304506919,
+      "avg_u_out": 0.0,
+      "fvm_evaluations": 2,
+      "fvm_loss": 3676.649904450447,
+      "fvm_mse": 147.06599617801788,
+      "fvm_raw_loss": 147.06599617801788,
+      "fvm_rms": 12.127076984088864,
+      "fvm_weighted_loss": 3676.649904450447,
+      "mass_balance_error": 0.9999999999994333,
+      "mass_balance_error_case_0": 0.9999999999994333,
+      "mass_flux_in": 1.7650518455624113,
+      "mass_flux_in_case_0": 1.7650518455624113,
+      "mass_flux_out": 0.0,
+      "mass_flux_out_case_0": 0.0,
+      "pressure_gauge_loss": 7.14337206382471e-06,
+      "pressure_gauge_mse": 7.14337206382471e-06,
+      "section_volume_flux": {
+        "-1": 1.7649947202023935,
+        "1.001": 1.7983179247360468,
+        "1.2": 1.8033148621875983,
+        "1.5": 1.7575147640313553,
+        "2": 1.7813580462513785,
+        "3": 1.7580040686214637,
+        "5": 1.7776132589388587
+      },
+      "section_volume_flux_case_0": {
+        "-1": 1.7649947202023935,
+        "1.001": 1.7983179247360468,
+        "1.2": 1.8033148621875983,
+        "1.5": 1.7575147640313553,
+        "2": 1.7813580462513785,
+        "3": 1.7580040686214637,
+        "5": 1.7776132589388587
+      },
+      "section_volume_flux_max_relative_error": 0.0216781261815985,
+      "section_volume_flux_max_relative_error_case_0": 0.0216781261815985,
+      "section_volume_flux_normalization": "Q/(U_inf*c)=integral((u/U_inf), d(y/c))",
+      "section_volume_flux_relative_deviation": {
+        "-1": -3.236469238084106e-05,
+        "1.001": 0.01884708330650581,
+        "1.2": 0.0216781261815985,
+        "1.5": -0.00427017571750147,
+        "2": 0.009238369246747057,
+        "3": -0.003992957463919665,
+        "5": 0.007116739039717945
+      },
+      "section_volume_flux_relative_deviation_case_0": {
+        "-1": -3.236469238084106e-05,
+        "1.001": 0.01884708330650581,
+        "1.2": 0.0216781261815985,
+        "1.5": -0.00427017571750147,
+        "2": 0.009238369246747057,
+        "3": -0.003992957463919665,
+        "5": 0.007116739039717945
+      },
+      "section_volume_flux_relative_error": {
+        "-1": 3.236469238084106e-05,
+        "1.001": 0.01884708330650581,
+        "1.2": 0.0216781261815985,
+        "1.5": 0.00427017571750147,
+        "2": 0.009238369246747057,
+        "3": 0.003992957463919665,
+        "5": 0.007116739039717945
+      },
+      "section_volume_flux_relative_error_case_0": {
+        "-1": 3.236469238084106e-05,
+        "1.001": 0.01884708330650581,
+        "1.2": 0.0216781261815985,
+        "1.5": 0.00427017571750147,
+        "2": 0.009238369246747057,
+        "3": 0.003992957463919665,
+        "5": 0.007116739039717945
+      },
+      "section_volume_flux_relative_spread": 0.025948301899099968,
+      "section_volume_flux_relative_spread_case_0": 0.025948301899099968,
+      "section_volume_flux_unavailable": [
+        "-5",
+        "10"
+      ],
+      "section_volume_flux_unavailable_case_0": [
+        "-5",
+        "10"
+      ]
+    },
+    "elapsed_seconds": 3.05332088470459,
+    "epoch": 1,
+    "epoch_seconds": 3.0533127784729004,
+    "estimated_remaining_seconds": 1523.6030764579773,
+    "fvm_evaluations": 2,
+    "fvm_loss": 3676.649904450447,
+    "fvm_mse": 147.06599617801788,
+    "fvm_raw_loss": 147.06599617801788,
+    "fvm_rms": 12.127076984088864,
+    "fvm_weighted_loss": 3676.649904450447,
+    "gradient_l2_norm": 139012.77016997462,
+    "integral_loss": 3.333744101177418,
+    "integral_mse": 3.333744101177418,
+    "integral_rms": 1.825854348292168,
+    "learning_rate": 0.001,
+    "loss": 3680.6313786138035,
+    "optimizer": "adam",
+    "pde": {
+      "cont": 0.5015011574986781,
+      "mom_x": 0.3585269503137267,
+      "mom_y": 0.27116168171358
+    },
+    "pde_max": {
+      "cont": 10.511586098025148,
+      "mom_x": 10.114646609583593,
+      "mom_y": 4.106020756536987
+    },
+    "pde_max_abs": {
+      "cont": 3.242157630039778,
+      "mom_x": 3.1803532208834278,
+      "mom_y": 2.0263318475849377
+    },
+    "pde_mse": {
+      "cont": 0.5015011574986781,
+      "mom_x": 0.3585269503137267,
+      "mom_y": 0.27116168171358
+    },
+    "pde_multiplier": 1.0,
+    "pde_rms": {
+      "cont": 0.7081674643039442,
+      "mom_x": 0.5987712003041953,
+      "mom_y": 0.5207318712289272
+    },
+    "pressure_gauge_loss": 7.14337206382471e-06,
+    "pressure_gauge_mse": 7.14337206382471e-06,
+    "pressure_gauge_rms": 0.002672708750280268,
+    "wall_speed": 1.0091689996115023
+  },
+  "last_epoch": {
+    "boundary": {
+      "farfield": 0.024770252587665374,
+      "inlet": 0.0010144758294348564,
+      "interior": 0.0,
+      "wall": 0.2460317361966602
+    },
+    "boundary_mse": {
+      "farfield": 0.024770252587665374,
+      "inlet": 0.0010144758294348564,
+      "interior": 0.0,
+      "wall": 0.2460317361966602
+    },
+    "boundary_rms": {
+      "farfield": 0.15738568101217268,
+      "inlet": 0.031850837185776706,
+      "interior": 0.0,
+      "wall": 0.49601586284781274
+    },
+    "diagnostics": {
+      "avg_u_in": 0.9833584014679904,
+      "avg_u_out": 0.0,
+      "fvm_evaluations": 2,
+      "fvm_loss": 3.90789013359525,
+      "fvm_mse": 0.15631560534381,
+      "fvm_raw_loss": 0.15631560534381,
+      "fvm_rms": 0.3953676837373155,
+      "fvm_weighted_loss": 3.90789013359525,
+      "mass_balance_error": 0.9999999999994917,
+      "mass_balance_error_case_0": 0.9999999999994917,
+      "mass_flux_in": 1.967770935904095,
+      "mass_flux_in_case_0": 1.967770935904095,
+      "mass_flux_out": 0.0,
+      "mass_flux_out_case_0": 0.0,
+      "pressure_gauge_loss": 0.0027304468152094816,
+      "pressure_gauge_mse": 0.0027304468152094816,
+      "section_volume_flux": {
+        "-1": 1.9672077769717031,
+        "1.001": 1.6066908345783402,
+        "1.2": 1.6132173500198086,
+        "1.5": 1.6152731882577664,
+        "2": 1.6133011114088278,
+        "3": 1.5911098578367433,
+        "5": 1.59274506904675
+      },
+      "section_volume_flux_case_0": {
+        "-1": 1.9672077769717031,
+        "1.001": 1.6066908345783402,
+        "1.2": 1.6132173500198086,
+        "1.5": 1.6152731882577664,
+        "2": 1.6133011114088278,
+        "3": 1.5911098578367433,
+        "5": 1.59274506904675
+      },
+      "section_volume_flux_max_relative_error": 0.19141510385918103,
+      "section_volume_flux_max_relative_error_case_0": 0.19141510385918103,
+      "section_volume_flux_normalization": "Q/(U_inf*c)=integral((u/U_inf), d(y/c))",
+      "section_volume_flux_relative_deviation": {
+        "-1": -0.00028619130515450603,
+        "1.001": -0.18349701926036047,
+        "1.2": -0.18018031439274512,
+        "1.5": -0.17913555953818058,
+        "2": -0.18013774775681668,
+        "3": -0.19141510385918103,
+        "5": -0.19058410713076634
+      },
+      "section_volume_flux_relative_deviation_case_0": {
+        "-1": -0.00028619130515450603,
+        "1.001": -0.18349701926036047,
+        "1.2": -0.18018031439274512,
+        "1.5": -0.17913555953818058,
+        "2": -0.18013774775681668,
+        "3": -0.19141510385918103,
+        "5": -0.19058410713076634
+      },
+      "section_volume_flux_relative_error": {
+        "-1": 0.00028619130515450603,
+        "1.001": 0.18349701926036047,
+        "1.2": 0.18018031439274512,
+        "1.5": 0.17913555953818058,
+        "2": 0.18013774775681668,
+        "3": 0.19141510385918103,
+        "5": 0.19058410713076634
+      },
+      "section_volume_flux_relative_error_case_0": {
+        "-1": 0.00028619130515450603,
+        "1.001": 0.18349701926036047,
+        "1.2": 0.18018031439274512,
+        "1.5": 0.17913555953818058,
+        "2": 0.18013774775681668,
+        "3": 0.19141510385918103,
+        "5": 0.19058410713076634
+      },
+      "section_volume_flux_relative_spread": 0.19112891255402653,
+      "section_volume_flux_relative_spread_case_0": 0.19112891255402653,
+      "section_volume_flux_unavailable": [
+        "-5",
+        "10"
+      ],
+      "section_volume_flux_unavailable_case_0": [
+        "-5",
+        "10"
+      ]
+    },
+    "elapsed_seconds": 146.24363660812378,
+    "epoch": 59,
+    "epoch_seconds": 2.3716635704040527,
+    "estimated_remaining_seconds": 1130.1099245667458,
+    "fvm_evaluations": 2,
+    "fvm_loss": 3.90789013359525,
+    "fvm_mse": 0.15631560534381,
+    "fvm_raw_loss": 0.15631560534381,
+    "fvm_rms": 0.3953676837373155,
+    "fvm_weighted_loss": 3.90789013359525,
+    "gradient_l2_norm": 3599.403753969061,
+    "integral_loss": 3.883040891949014,
+    "integral_mse": 3.883040891949014,
+    "integral_rms": 1.9705432986740012,
+    "learning_rate": 0.001,
+    "loss": 6.7161007461381175,
+    "optimizer": "adam",
+    "pde": {
+      "cont": 0.4409597737751468,
+      "mom_x": 0.07743966717778439,
+      "mom_y": 0.07135165497895135
+    },
+    "pde_max": {
+      "cont": 17.987020133524783,
+      "mom_x": 8.499443584366196,
+      "mom_y": 9.747728097301769
+    },
+    "pde_max_abs": {
+      "cont": 4.241110719319266,
+      "mom_x": 2.915380521367013,
+      "mom_y": 3.12213518241952
+    },
+    "pde_mse": {
+      "cont": 0.4409597737751468,
+      "mom_x": 0.07743966717778439,
+      "mom_y": 0.07135165497895135
+    },
+    "pde_multiplier": 1.0,
+    "pde_rms": {
+      "cont": 0.6640480206846089,
+      "mom_x": 0.2782798360963014,
+      "mom_y": 0.2671173056523133
+    },
+    "pressure_gauge_loss": 0.0027304468152094816,
+    "pressure_gauge_mse": 0.0027304468152094816,
+    "pressure_gauge_rms": 0.052253677528088696,
+    "wall_speed": 0.4487925140353453
+  },
+  "sha256": {
+    "workspace/configs/fvm3.yaml": "78ec474e517680aa52e796df8220332f989b2ed4feaae93eb373ebbbca39a80d",
+    "workspace/initial/fields/initial.npy": "73a4fd80005b29fd98969c2b85411d64ae9014f976d007ece3e8a819423d2a96",
+    "workspace/initial/fields/initial_metadata.npy": "2723d80967164e4408b0b13460dda37db0a11bf0699166e7bb5e5d3ea3ec33fa",
+    "workspace/sampling/mesh/mesh2d.npz": "6c0a3e39eaea6c773fd093f2d058fc024e02005c398b7350fa648244bde43e5c",
+    "workspace/sampling/collocation/collocation_points.npy": "ee075e1aa059ef6bae9fab88dae2ca9354b92915427d3386915a408e4dbee16b",
+    "workspace/sampling/collocation/collocation_points_metadata.npy": "2bf47fe02097cd855d3b3b73387171f65a7e74ef68c554dd066f02a00693ce62",
+    "workspace/geometry/metadata/NACA 0012 (толщина 12%)_foil.npy": "6b525f7b7a73132827e57bd90ab6cd8df7aa43d4c1e6108eb8d0d027fffe044a",
+    "workspace/geometry/metadata/NACA 0012 (толщина 12%)_metadata.npy": "ad961ae184e6a4e2a47d9d0aabd8e80f7bdfb0df8f69580099440ce90848f24f",
+    "workspace/geometry/domains/NACA 0012 (толщина 12%)_domain.npy": "6d6fcc90dbb29a2f09e41dcc16ef7b7ebbf41e94c699289f4685f9295e8a0350",
+    "airfoil_pinn/__init__.py": "56548020ae7b10d2c348e32f1373fedf7f244dc7cede46edb220261e3125b69e",
+    "airfoil_pinn/__main__.py": "5c7ce05ce54197c0a777782fed70d21276914461d13e6f14003a8884c2687151",
+    "airfoil_pinn/app/cli.py": "370390d8181e542c4a825e6aab27b8ee00910951c86cd74ac44072f892bdbee4",
+    "airfoil_pinn/app/module_registry.py": "5344033caec3e0677bb7d1b2a02f4901d8ba7635a14599d589a722b8ae352ecc",
+    "airfoil_pinn/app/paths.py": "5c8fdddea534411cce5dedcd416f6336063a4e238e13aabc886aecab82874b3b",
+    "airfoil_pinn/app/runtime.py": "85e1759649367d816eda6327a0ad4677a8b9fa35120e0ad95da6681a83b1dfd9",
+    "airfoil_pinn/app/__init__.py": "f16ca287a117efe4f5bff265c15ad63783964e4184b920f0f48c65d2c06c45a2",
+    "airfoil_pinn/config/manager.py": "07496f56ef80488412168b3bae68c7cd503a52a922072cf89f00c89d6fc74b47",
+    "airfoil_pinn/config/validation.py": "0ece4d5806efbf5f0b73e3bd4356d12155f942daaf29d84641114f88e56a44a7",
+    "airfoil_pinn/config/__init__.py": "68e8c3dfddf1edef8ca056fc6ef421ac66ac5143b31374f305b6df47ba7844dd",
+    "airfoil_pinn/core/constants.py": "192cde0eb113ca4dd5d1826b86872997bb8f254736fa8105a5cdcba09705da37",
+    "airfoil_pinn/core/type_hints.py": "5cdb64f61aaf9755d4733d0b0b404f55251acfe69526a833fcb34fe20be72929",
+    "airfoil_pinn/core/__init__.py": "cfbe14aa91c090b34ca858976c0e48e9bf86a442c773aa151633a2688a3c6556",
+    "airfoil_pinn/data/batch.py": "1534ea151f40ac76990499406228a7c24272bcd53010be15df0e402f56ce542a",
+    "airfoil_pinn/data/flow.py": "aa7ec2c97fb6e96c763b44bafdcb331989d9283d069fe533347891ed41751202",
+    "airfoil_pinn/data/handler.py": "70a56e4bff6441453dabb569adf8d546ba2f619a6aef8b4a57365727cff43a79",
+    "airfoil_pinn/data/initializer.py": "08ec174e0acf4eefff1ad285cfc0642a0ec8577f7404559dd6a3b57132071b91",
+    "airfoil_pinn/data/initializer_cli.py": "82d9c58c666c68ded0bc587847e40c69fba96933600dde4ecd199d8d0cdb4358",
+    "airfoil_pinn/data/normalization.py": "f66d042bd6a75e0ea35922b7c9780560d187ac6d8261986d5c518f96fdd88040",
+    "airfoil_pinn/data/sdf_diagnostics.py": "f4ad7bc3f0d7ab29d979e5e85aedd51d8f20acd917e253313ca99a1afa2b824f",
+    "airfoil_pinn/data/__init__.py": "33d52f7ab43ca92f3e43f150be816579f97f4ad8f3b625fd9e0303d0c0d2c457",
+    "airfoil_pinn/geometry/cli.py": "887b99fa6e8a9392eed0603177a6a8c8f3129a7c9d486990eb696ac8aae28cc5",
+    "airfoil_pinn/geometry/core.py": "42f47ff6a7c118cd70cd791716c5faec281fcb3f7330627ec295a8c46bccc408",
+    "airfoil_pinn/geometry/sdf.py": "561cd70abd3920d2b15be79e8fc2cdc74b52e4f3b69b42d177cc5be2f48ecb0d",
+    "airfoil_pinn/geometry/__init__.py": "661887ac03b4f751871c6bc823de29c772960009cce802e4833e7effb97711bb",
+    "airfoil_pinn/physics/conditions.py": "9928e36920ace66dbb0d077f001fcc95de9470b36bacdeb57fe18fb0cffe72ab",
+    "airfoil_pinn/physics/conditions_cli.py": "fc32208304ea1dc405aa5da1eec0fa0ddf0bbf5d32d6aa139cf9d4a69d33a511",
+    "airfoil_pinn/physics/fluids.py": "1ea76fc46f0cafceb0b5100c06b077aad8e33f3ffc85dc7666f9a794cf32f309",
+    "airfoil_pinn/physics/fluids_cli.py": "f45565ce9a8108db7f9528376005d5259e15c355e8a931a7ca612fddf38726e5",
+    "airfoil_pinn/physics/fvm.py": "e9f4a6e0b086f752e117ac023a1e27dedac21f054ec7341b9639183c95a23998",
+    "airfoil_pinn/physics/pde.py": "1035e396386b7b735900aa1a0a4bda0af7de65a7254d4dfa32d8c469e82c91ec",
+    "airfoil_pinn/physics/__init__.py": "529bb78adcf40e95893e2b11cd7102037f2d0c0b45acb6ee598adc3ff0b7beaf",
+    "airfoil_pinn/sampling/cli.py": "6861d32b5721d7650e001dded0a98f35de1939ef8f71d47486bb474bf4bd8584",
+    "airfoil_pinn/sampling/core.py": "d973a016f57e1ce8a916fd33a6ae3d82b1b1659ecb709391fb2b9141deaf37ed",
+    "airfoil_pinn/sampling/normal_layer.py": "65ac473b45b6cfee3319dfc675f4154a73a8a8119bd8277bb7d8bb5cb96c5af4",
+    "airfoil_pinn/sampling/__init__.py": "f00ffe3f911ff695f3f29e7b3ece69ecf197ff6aa505fea8a5f26630288cca38",
+    "airfoil_pinn/training/batch.py": "9f7a39f853f75ca2c113bed731cf336d49d77b87ba5a3a902f39ba50caa56659",
+    "airfoil_pinn/training/boundary.py": "bc9179937cac74d1391b1f729774a039694db1f15a056aedc940a669989a5ada",
+    "airfoil_pinn/training/boundary_layer_diagnostics.py": "7f11aa7701af721c24481c659855a7d86cd8eb1659a54360910af24ff056d67c",
+    "airfoil_pinn/training/checkpoint.py": "397c70c726f79a3226ebf8fba5ddf98db4d79b5078dfe34076df316352e19aed",
+    "airfoil_pinn/training/contract.py": "a96776a00646b5e88b0f22f49ec88bc4f31c8ad3355e3d8b018de40b754969f7",
+    "airfoil_pinn/training/input_features.py": "a7b7ba994fdf376a371dd067dc26bee5b18d3be33cf1a03fb3286d621bdfa83f",
+    "airfoil_pinn/training/key_listener.py": "a2484951af1b6ddd73f3d7cde08b6729f3c70946d5fc9c5d269c1e374176b094",
+    "airfoil_pinn/training/learning_cli.py": "c7bdf2023866df35bdb498dd60c29e81dd9946b1c1ba95e3d2a71a82cf4a6d34",
+    "airfoil_pinn/training/models.py": "28d6fa47fa3c1fd19dac15a5733b29582b2f7ab47c0583fc15fafcde167f334a",
+    "airfoil_pinn/training/network_diagram.py": "50a8b6e11c28d6544a6c2c7a47db31881fa3c414ce5c86c426014dc5ce172af8",
+    "airfoil_pinn/training/numerics.py": "66494d47193b5a5b0c9b637a3a7485d4eb45450d1077e2ba453f1a27d89e405f",
+    "airfoil_pinn/training/progress.py": "40cf89b052afc14f12c60fdb2b16877789592ac1ce89372a7092ef741105cad3",
+    "airfoil_pinn/training/reference.py": "04a61c9aac71aa30b028be41423c7ab17da4710cb4e73519e1306b4e6444d6a3",
+    "airfoil_pinn/training/reproducibility.py": "905604edd51e18435d6420b1540b01f33ddac401b78e123125285b1e5c650ce0",
+    "airfoil_pinn/training/runner.py": "2d86bbeecfa889873979d5a3e1cd65da1d9d53ec1b491bf448a36bce6ea728aa",
+    "airfoil_pinn/training/solver.py": "feefb145ca9e04efd345858b5da4f002cd1dab1b01676f50ab7bbbcb7b6368ff",
+    "airfoil_pinn/training/telemetry.py": "2aaadbb4c181cc9469652584f4c80db375a9c8d2e69d0a8d56396f72aed6a5ae",
+    "airfoil_pinn/training/visualizer.py": "b9d30f11257061cdce80236df70b2cb6a4c581015f96d369e2653550a52ffdcb",
+    "airfoil_pinn/training/__init__.py": "5714b5b3cc5952fbdac38f53137c1d414285424e7b8ac9aa67260c72a1575707",
+    "airfoil_pinn/utils/auxiliary_utils.py": "99bff13f89d4882bc9278a758808dea82812c4c95aa8d15ef1697c033d8820eb",
+    "airfoil_pinn/utils/io_utils.py": "8c2a5931338b1bbe3273a656d5e636294101022a04fe9c1aaa88f4d9a68016f4",
+    "airfoil_pinn/utils/ui_utils.py": "1661371c97f0aa57417b2c6cea30fdf42ee5b650293e2e7c9ed685f83fedb507",
+    "airfoil_pinn/utils/__init__.py": "7100b228a0f4647efda62854bc651dd0e4a88b246079faf6e6d3ffaf24fad6a4",
+    "airfoil_pinn/training/components/interactive.py": "c65df5b808a5639b60f423daf306e419f402edc101397501ad0d7a258204d286",
+    "airfoil_pinn/training/components/loss_computer.py": "3e1856692afb0a9b9c6f944cc8284da78c368ac684d9c6a54e9eb51152de39b4",
+    "airfoil_pinn/training/components/metrics.py": "5b5e3b42599c93df433353da8eebd4d3755781b9c258145dda0d25b85403c4b9",
+    "airfoil_pinn/training/components/optimizers.py": "8f1219be35c795bc04c5afc098c365a94ee7869c0be6dc15132167e3251735b2",
+    "airfoil_pinn/training/components/rar.py": "3110a14214c152c77bef1ebafbea71b1c34f8f4f878a59fe8ba75ad43c661bcc",
+    "airfoil_pinn/training/components/trainer.py": "81af6a3ccf66ed4ae6c48de8c63040114ae6cafcb7522d5d3a7f59b5e34f04f1",
+    "airfoil_pinn/training/components/utils.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "airfoil_pinn/training/components/__init__.py": "d8ef4342425198b677b358dc1ee358b5825e005ff26b2385c3f7ea867f225474",
+    "airfoil_pinn/training/menus/architecture.py": "15871b3451ea3f4e9a3ba3f1dd45cfe6f8554bf28f82fba9b3ec2882a5441839",
+    "airfoil_pinn/training/menus/common.py": "e623948f2a11b9eab267d4a0be673a5c2330681a9cd34ae4e00f2d2011914c6b",
+    "airfoil_pinn/training/menus/configuration.py": "26bdf7dfd018767153288ad877727a42c28f80e5e42239f9fb0e58a6841df743",
+    "airfoil_pinn/training/menus/loss.py": "3d7d4b86161e90ea19b9aa39570203f7e3895ff2a884e69be18bf4e396c50541",
+    "airfoil_pinn/training/menus/process.py": "4e182cbc623a02cf37322130776142c27063aedec40e306d1f454608ed73c380",
+    "airfoil_pinn/training/menus/results.py": "f07cd2415e5c0431df1ebaaa61205094a9fc12d94fae937c5620f951564dc645",
+    "airfoil_pinn/training/menus/strategy.py": "60c52ce7998785d1caee3893e82c58c0d2d084bab3d92db582780b9710af31d0",
+    "airfoil_pinn/training/menus/__init__.py": "195fcbbd3c967170fdbdbf08f0f07e6cb3124167f1462722d4e738449fdfe0ab",
+    "airfoil_pinn/sampling/mesh/core.py": "cf419c5911db53bf9d987a8233e1790b732bc552d7fa9759570e9ba46bce1b74",
+    "airfoil_pinn/sampling/mesh/__init__.py": "9464ae522b4297db5f8530f567e48b79b498173cda41a8d74bb607e7380d6292"
+  }
+}

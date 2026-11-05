@@ -24,11 +24,23 @@ from pathlib import Path
 # корректного разрешения относительных путей из workspace-конфигов.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PYTHON_ENV_DIR = Path("D:/Python/BaseEnv")
-PYTHON_ENV_DIR = Path(
-    os.environ.get("AIRFOIL_PINN_PYTHON_ENV", str(DEFAULT_PYTHON_ENV_DIR))
-).expanduser()
-# Compatibility name for callers written before the shared environment was
-# introduced. It no longer points inside the project.
+
+
+def _select_python_environment() -> Path:
+    """Prefer an explicit override, then D:/Python/BaseEnv, then local venv."""
+    override = os.environ.get("AIRFOIL_PINN_PYTHON_ENV")
+    if override:
+        return Path(override).expanduser()
+    executable = DEFAULT_PYTHON_ENV_DIR / (
+        "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
+    )
+    if executable.is_file():
+        return DEFAULT_PYTHON_ENV_DIR
+    return PROJECT_ROOT / "venv"
+
+
+PYTHON_ENV_DIR = _select_python_environment()
+# Compatibility name for existing callers.
 VENV_DIR = PYTHON_ENV_DIR
 
 REQUIRED_PACKAGES: tuple[tuple[str, str], ...] = (
@@ -107,14 +119,22 @@ def _restart_inside_venv() -> None:
 
 def ensure_virtual_environment() -> None:
     """
-    Проверяет общее окружение ``D:\\Python\\BaseEnv`` и зависимости.
+    Использует общее окружение или подготавливает локальный venv.
 
-    Эта функция не импортирует тяжелые расчетные библиотеки напрямую. Она
-    проверяет наличие модулей через ``importlib.util.find_spec``. Проект
-    принципиально не создаёт окружение и не вызывает pip: отсутствующие
-    зависимости должны быть подготовлены владельцем общего окружения.
+    В локальном venv автоматически устанавливаются отсутствующие зависимости.
+    Общее и явно указанные внешние окружения автоматически не изменяются.
     """
     venv_python = _venv_python()
+    is_local = PYTHON_ENV_DIR.resolve() == (PROJECT_ROOT / "venv").resolve()
+    if not venv_python.is_file() and is_local:
+        print(f"  Создание локального окружения: {PYTHON_ENV_DIR}", flush=True)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(PYTHON_ENV_DIR)], check=True
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"  Не удалось создать venv: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
     in_our_venv = (
         venv_python.exists()
         and Path(sys.executable).resolve() == venv_python.resolve()
@@ -138,6 +158,18 @@ def ensure_virtual_environment() -> None:
         if importlib.util.find_spec(import_name) is None
     ]
     if not missing_pip:
+        return
+
+    if is_local:
+        print(f"  Установка зависимостей в venv: {', '.join(missing_pip)}", flush=True)
+        try:
+            subprocess.run(
+                [str(venv_python), "-m", "pip", "install", *missing_pip], check=True
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"  Не удалось установить зависимости: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        _restart_inside_venv()
         return
 
     print(

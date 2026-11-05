@@ -129,11 +129,11 @@ class LossMetricLoggingTests(unittest.TestCase):
             table,
         )
 
-        self.assertIn("Gradient norm (pre-clip): 2.500e-01", table)
+        self.assertIn("Mean step gradient norm (pre-clip, Adam): 2.500e-01", table)
         self.assertIn("clip limit: 1.000e-01", table)
-        self.assertIn("clipping: YES", table)
+        self.assertIn("clipping: see per-group gradient report", table)
 
-    def test_recent_loss_change_uses_at_most_100_epochs(self) -> None:
+    def test_recent_loss_change_uses_at_most_25_epochs(self) -> None:
         metrics = MetricsCollector.__new__(MetricsCollector)
         metrics.history = {"loss": [200.0, 150.0, 100.0]}
 
@@ -147,10 +147,10 @@ class LossMetricLoggingTests(unittest.TestCase):
         metrics.history["loss"] = [float(value) for value in range(101, 0, -1)]
         change, epochs, start, end = metrics.get_recent_loss_change()
 
-        self.assertEqual(epochs, 100)
-        self.assertEqual(start, 100.0)
+        self.assertEqual(epochs, 25)
+        self.assertEqual(start, 25.0)
         self.assertEqual(end, 1.0)
-        self.assertAlmostEqual(change, -99.0)
+        self.assertAlmostEqual(change, -96.0)
 
     def test_epoch_table_prints_recent_loss_change(self) -> None:
         metrics = MetricsCollector.__new__(MetricsCollector)
