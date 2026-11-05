@@ -110,6 +110,7 @@ class StaticRobustnessValidationTests(unittest.TestCase):
         config = copy.deepcopy(ConfigManager().config)
         config["architecture"]["activation"] = "relu"
         config["pde"]["system"] = "euler"
+        config["boundary_conditions"]["wall"]["kind"] = "slip_wall"
         validate_static_config(config)
 
     def test_direct_float16_is_rejected(self) -> None:

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from airfoil_pinn.config.boundary import normalize_wall_condition
 from airfoil_pinn.geometry.sdf import PolylineDistanceField
 from airfoil_pinn.training.boundary import (
     BoundaryOutputTransform,
@@ -67,6 +68,7 @@ class LossComputer:
             device: устройство для вычислений
             dtype: тип данных
         """
+        normalize_wall_condition(config)
         self.config = config
         self.data_handler = data_handler
         self.rho_norm = rho_norm
@@ -735,6 +737,15 @@ class LossComputer:
     # ------------------------------------------------------------------
     # Граничные условия (только для soft)
     # ------------------------------------------------------------------
+    def is_hard_boundary(self, boundary_name: str) -> bool:
+        """Whether the resolved condition is enforced by an output transform."""
+        return (
+            self.boundary_conditions.get(boundary_name, {}).get(
+                "enforcement", "soft"
+            )
+            == "hard"
+        )
+
     def _freestream_velocity_loss(
         self,
         u: torch.Tensor,
@@ -886,11 +897,11 @@ class LossComputer:
         The exact unsigned SDF has two opposite gradients at the surface.
         ``PolylineDistanceField.surface_normals`` evaluates either one-sided
         limit from the nearest segment.  The orientation is immaterial for the
-        squared Euler impermeability residual.
+        squared slip-wall impermeability residual.
         """
         if self.sdf_module is None:
             raise RuntimeError(
-                "Euler wall boundary conditions require an ordered airfoil "
+                "Slip wall boundary conditions require an ordered airfoil "
                 "polyline for SDF-based surface normals."
             )
         if x.shape != y.shape or x.shape != mask.shape:
@@ -910,19 +921,25 @@ class LossComputer:
         y: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the PDE-appropriate wall residual squared per point."""
-        if self.pde_system == 'incompressible_navier_stokes':
-            return u.square() + v.square()
-        if self.pde_system == 'euler':
+        """Return squared residuals of the resolved wall condition.
+
+        Configuration normalization binds wall.kind to the PDE. All BC loss
+        paths use that effective condition: no-slip penalizes both velocity
+        components, while slip penalizes only penetration. Non-wall entries
+        are zero; hard enforcement is excluded by the loss caller.
+        """
+        wall_kind = self.boundary_conditions['wall']['kind']
+        point_loss = torch.zeros_like(u)
+        if wall_kind == 'no_slip':
+            point_loss[mask] = u[mask].square() + v[mask].square()
+        elif wall_kind == 'slip_wall':
             nx, ny = self.compute_wall_normals(x, y, mask)
-            point_loss = torch.zeros_like(u)
             point_loss[mask] = (
                 u[mask] * nx + v[mask] * ny
             ).square()
-            return point_loss
-        raise ValueError(
-            f"Unsupported PDE system for wall BC: {self.pde_system}"
-        )
+        else:
+            raise ValueError(f"Unsupported wall boundary kind: {wall_kind}")
+        return point_loss
 
     def compute_bc_loss(
         self,
@@ -961,11 +978,7 @@ class LossComputer:
         target_u, target_v = self.get_freestream_targets(x, case_ids)
 
         for idx, name in enumerate(self.data_handler.boundary_type_names):
-            boundary_config = self.boundary_conditions.get(
-                name,
-                {"enforcement": "soft"},
-            )
-            if boundary_config.get("enforcement", "soft") == "hard":
+            if self.is_hard_boundary(name):
                 # The supported hard value constraint is already enforced by
                 # BoundaryOutputTransform. Other boundaries remain soft.
                 continue

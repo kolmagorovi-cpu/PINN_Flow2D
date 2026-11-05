@@ -320,6 +320,50 @@ class PolylineDistanceField(nn.Module):
         """
         original_shape = self._validate_points(points)
         flat = points.reshape(-1, 2)
+        nearest_indices = self._nearest_segment_indices(flat)
+        tangents = self.segment_vectors[nearest_indices].to(dtype=flat.dtype)
+        tangent_norm = torch.linalg.vector_norm(
+            tangents, dim=1, keepdim=True,
+        )
+        normals = torch.stack((-tangents[:, 1], tangents[:, 0]), dim=1)
+        return (normals / tangent_norm).reshape(*original_shape, 2)
+
+    def wall_normal_extension(self, points: torch.Tensor) -> torch.Tensor:
+        """Differentiable unit normal field for hard impermeability.
+
+        On segment interiors use the one-sided surface normal. Beyond an
+        endpoint use the radial distance gradient, retaining its coordinate
+        derivatives. Thus adjacent segments sharing the closest vertex give
+        the same normal projector, without a spurious jump in that region.
+        At an exact corner the nearest segment selects a one-sided normal;
+        genuine medial-axis ties remain excluded by the existing PDE mask.
+        """
+        original_shape = self._validate_points(points)
+        flat = points.reshape(-1, 2)
+        indices = self._nearest_segment_indices(flat)
+        starts = self.segment_starts[indices].to(dtype=flat.dtype)
+        vectors = self.segment_vectors[indices].to(dtype=flat.dtype)
+        lengths_squared = self.segment_squared_lengths[indices].to(dtype=flat.dtype)
+        parameter = ((flat - starts) * vectors).sum(dim=1) / lengths_squared
+        closest = starts + parameter.clamp(0.0, 1.0)[:, None] * vectors
+        delta = flat - closest
+        squared_distance = delta.square().sum(dim=1, keepdim=True)
+        endpoint = ((parameter < 0.0) | (parameter > 1.0))[:, None]
+        endpoint = endpoint & (squared_distance > 0.0)
+        # Never evaluate sqrt(0) in an inactive branch: its backward can
+        # otherwise contaminate wall gradients even through torch.where.
+        radial_distance = torch.sqrt(torch.where(
+            endpoint, squared_distance, torch.ones_like(squared_distance)
+        ))
+        radial_normal = delta / radial_distance
+        segment_normal = torch.stack((-vectors[:, 1], vectors[:, 0]), dim=1)
+        segment_normal = segment_normal / torch.sqrt(lengths_squared)[:, None]
+        normals = torch.where(endpoint, radial_normal, segment_normal)
+        return normals.reshape(*original_shape, 2)
+
+    @torch.no_grad()
+    def _nearest_segment_indices(self, flat: torch.Tensor) -> torch.Tensor:
+        """Select a geometry branch without retaining the all-segment graph."""
         minimum_squared = torch.full(
             (flat.shape[0],),
             float("inf"),
@@ -348,15 +392,7 @@ class PolylineDistanceField(nn.Module):
                 nearest_indices,
             )
 
-        tangents = self.segment_vectors[nearest_indices].to(dtype=flat.dtype)
-        tangent_norm = torch.linalg.vector_norm(
-            tangents,
-            dim=1,
-            keepdim=True,
-        )
-        normals = torch.stack((-tangents[:, 1], tangents[:, 0]), dim=1)
-        normals = normals / tangent_norm
-        return normals.reshape(*original_shape, 2)
+        return nearest_indices
 
     def tie_mask(
         self,

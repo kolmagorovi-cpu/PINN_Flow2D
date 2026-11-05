@@ -398,11 +398,7 @@ class Trainer:
             for boundary_index, boundary_name in enumerate(
                 self.data_handler.boundary_type_names
             ):
-                boundary_config = self.loss_computer.boundary_conditions.get(
-                    boundary_name,
-                    {"enforcement": "soft"},
-                )
-                if boundary_config.get("enforcement", "soft") == "hard":
+                if self.loss_computer.is_hard_boundary(boundary_name):
                     bc_counts[boundary_name] = 0
                     continue
                 boundary_mask = (
@@ -695,6 +691,8 @@ class Trainer:
         for i, name in enumerate(self.data_handler.boundary_type_names):
             if i >= boundary_types.shape[1] or i >= w_bc.shape[1]:
                 continue
+            if self.loss_computer.is_hard_boundary(name):
+                continue
             if self.loss_computer.loss_weights.get(name, 0.0) <= 0.0:
                 continue
 
@@ -868,6 +866,8 @@ class Trainer:
 
         for i, name in enumerate(self.data_handler.boundary_type_names):
             if i >= boundary_types.shape[1]:
+                continue
+            if self.loss_computer.is_hard_boundary(name):
                 continue
             mask = (boundary_types[:, i].view(-1, 1) > 0.5)
             if not bool(mask.any()):

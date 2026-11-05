@@ -1,4 +1,4 @@
-"""Tests for the distance-based hard no-slip wall implementation."""
+"""Tests for distance-based hard no-slip and impermeability operators."""
 
 from __future__ import annotations
 
@@ -219,24 +219,23 @@ class BoundaryOutputTransformTests(unittest.TestCase):
 
 
 class BoundaryConfigurationTests(unittest.TestCase):
-    """Validate the deliberately narrow first hard-wall implementation."""
+    """Validate both equation-dependent hard wall operators."""
 
     def test_supported_hard_wall_configuration_is_valid(self) -> None:
         config = copy.deepcopy(ConfigManager().config)
         config["boundary_conditions"]["wall"]["enforcement"] = "hard"
         validate_static_config(config)
 
-    def test_euler_and_non_no_slip_hard_wall_are_rejected(self) -> None:
-        config = copy.deepcopy(ConfigManager().config)
+    def test_euler_overrides_stale_hard_wall_configuration(self) -> None:
+        manager = ConfigManager()
+        config = manager.config
         config["pde"]["system"] = "euler"
         config["boundary_conditions"]["wall"].update(
             {"kind": "inviscid_wall", "enforcement": "hard"}
         )
-        with self.assertRaisesRegex(
-            ConfigurationError,
-            "only for incompressible Navier-Stokes",
-        ):
-            validate_static_config(config)
+        manager.validate()
+        self.assertEqual(config["boundary_conditions"]["wall"]["kind"], "slip_wall")
+        self.assertEqual(config["boundary_conditions"]["wall"]["enforcement"], "hard")
 
     def test_global_hard_configuration_is_rejected(self) -> None:
         config = copy.deepcopy(ConfigManager().config)

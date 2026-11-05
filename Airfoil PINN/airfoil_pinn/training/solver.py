@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from airfoil_pinn.app.paths import PATHS, project_relative, resolve_project_path
+from airfoil_pinn.config.boundary import normalize_wall_condition
 from airfoil_pinn.config.validation import (
     validate_runtime_contract,
     validate_static_config,
@@ -86,6 +87,7 @@ class PINNSolver:
             experiment_dir: директория для сохранения результатов эксперимента
                            (если None, создаётся уникальная папка в workspace/experiments)
         """
+        normalize_wall_condition(config)
         validate_static_config(config)
         self.config = config
         self.config_name = config.get('project_name', 'unnamed')

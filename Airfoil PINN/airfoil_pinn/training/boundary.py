@@ -7,6 +7,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 import torch
 from torch import nn
 
+from airfoil_pinn.config.boundary import resolve_wall_condition
+
 
 _BOUNDARY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "wall": {"kind": "no_slip", "enforcement": "soft"},
@@ -49,6 +51,10 @@ def resolve_boundary_conditions(
             {"kind": str(name), "enforcement": "soft"},
         )
         current.update(dict(value))
+    resolved["wall"] = resolve_wall_condition(
+        config.get("pde", {}).get("system", "incompressible_navier_stokes"),
+        resolved["wall"],
+    )
     # Boundary labels from existing point files may still be named ``slip``.
     # They use the canonical slip-wall rule without creating another physical
     # boundary condition.
@@ -71,9 +77,9 @@ def distance_mask(
 class BoundaryOutputTransform(nn.Module):
     """Transform raw network outputs into fields satisfying supported hard BC.
 
-    The first implementation intentionally supports only a stationary no-slip
-    wall.  Pressure remains unconstrained.  ``wall_distance`` is expected to
-    accept an ``(N, 2)`` coordinate tensor and return an ``(N, 1)`` distance.
+    No-slip scales both velocity components by a wall-distance mask. Slip
+    scales only the normal component, preserving tangential velocity.
+    Pressure remains unconstrained.
     """
 
     def __init__(
@@ -89,9 +95,9 @@ class BoundaryOutputTransform(nn.Module):
             raise ValueError(
                 f"Unknown wall enforcement: {wall_enforcement}"
             )
-        if wall_enforcement == "hard" and wall_kind != "no_slip":
+        if wall_enforcement == "hard" and wall_kind not in {"no_slip", "slip_wall"}:
             raise ValueError(
-                "Hard wall output transform supports only kind=no_slip"
+                "Hard wall output transform requires kind=no_slip or slip_wall"
             )
         if distance_scale <= 0.0:
             raise ValueError("distance_scale must be positive")
@@ -133,7 +139,7 @@ class BoundaryOutputTransform(nn.Module):
         sdf: Optional[torch.Tensor] = None,
         flow: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply the stationary no-slip ansatz inside the autograd graph."""
+        """Apply no-slip or impermeability inside the autograd graph."""
         del flow  # Reserved for a future moving-wall lifting.
         if self.wall_enforcement == "soft":
             return raw_u, raw_v, raw_p
@@ -144,6 +150,17 @@ class BoundaryOutputTransform(nn.Module):
                 "wall distance and network outputs must have identical shapes"
             )
         mask = distance_mask(phi_wall, self.distance_scale)
+
+        if self.wall_kind == "slip_wall":
+            if self.geometry is None or not hasattr(self.geometry, "wall_normal_extension"):
+                raise RuntimeError("Hard slip wall requires a geometry normal field")
+            # The normal extension is differentiated along with the fields.
+            # Only the discrete nearest-segment lookup is outside autograd.
+            normal = self.geometry.wall_normal_extension(torch.cat((x, y), dim=1))
+            nx, ny = normal[:, 0:1], normal[:, 1:2]
+            raw_normal = raw_u * nx + raw_v * ny
+            correction = (1.0 - mask) * raw_normal
+            return raw_u - correction * nx, raw_v - correction * ny, raw_p
 
         wall_lifting_u = torch.zeros_like(raw_u)
         wall_lifting_v = torch.zeros_like(raw_v)
@@ -160,8 +177,14 @@ class BoundaryOutputTransform(nn.Module):
         if self.enabled:
             wall.update(
                 {
-                    "transform": "normalized_distance",
+                    "transform": (
+                        "normalized_distance_normal_projection"
+                        if self.wall_kind == "slip_wall"
+                        else "normalized_distance"
+                    ),
                     "distance_scale": self.distance_scale,
                 }
             )
+            if self.wall_kind == "slip_wall":
+                wall["normal_field"] = "closest_segment_or_endpoint"
         return {"wall": wall}

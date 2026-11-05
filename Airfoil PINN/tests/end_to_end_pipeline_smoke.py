@@ -256,6 +256,63 @@ class EndToEndResumeTests(unittest.TestCase):
             self.assertEqual(restored.start_epoch, 0)
             self.assertFalse(restored.optimizer.state)
 
+    def test_hard_euler_trains_and_resumes_with_impermeable_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _small_solver_config()
+            config["pde"]["system"] = "euler"
+            config["process"]["dtype"] = "float64"
+            config["boundary_conditions"]["wall"]["enforcement"] = "hard"
+            source_dir = Path(directory, "hard_euler")
+            solver = PINNSolver(config, experiment_dir=str(source_dir))
+            batch = next(iter(solver.data_handler.get_dataloader()))
+            result = solver.trainer.train_batch_adam(batch, accum_step=True)
+            self.assertTrue(np.isfinite(result["total"]))
+            self.assertGreater(result["grad_norm"], 0.0)
+            self.assertEqual(result["bc_comp"]["wall"], 0.0)
+
+            field = solver.loss_computer.sdf_module
+            points = field.segment_starts[::31] + 0.371 * field.segment_vectors[::31]
+            x, y = points[:, 0:1], points[:, 1:2]
+            normals = field.surface_normals(points)
+            tangents = torch.stack((-normals[:, 1], normals[:, 0]), dim=1)
+
+            def predict(active_solver):
+                loss = active_solver.loss_computer
+                phi = loss.boundary_transform.wall_distance(x, y)
+                raw = active_solver.model(loss.build_input_tensor(x, y, phi))
+                u, v, p = loss.transform_outputs(
+                    raw[:, 0:1], raw[:, 1:2], raw[:, 2:3], x, y
+                )
+                velocity = torch.cat((u, v), dim=1)
+                torch.testing.assert_close(
+                    (velocity * normals).sum(dim=1),
+                    torch.zeros(points.shape[0], dtype=solver.dtype),
+                    atol=1e-10, rtol=0.0,
+                )
+                torch.testing.assert_close(
+                    (velocity * tangents).sum(dim=1),
+                    (raw[:, :2] * tangents).sum(dim=1),
+                )
+                self.assertGreater(float(velocity.detach().abs().max()), 1e-5)
+                torch.testing.assert_close(p, raw[:, 2:3])
+                return torch.cat((u, v, p), dim=1).detach()
+
+            expected = predict(solver)
+            solver._save_checkpoint(1)
+            resumed_config = copy.deepcopy(config)
+            resumed_config["process"]["load_model_path"] = str(
+                source_dir / "checkpoints" / "pinn_1.pt"
+            )
+            resumed = PINNSolver(
+                resumed_config, experiment_dir=str(Path(directory, "resumed_euler"))
+            )
+            self.assertEqual(resumed.start_epoch, 1)
+            self.assertEqual(
+                resumed.loss_computer.boundary_enforcement_contract["wall"]["transform"],
+                "normalized_distance_normal_projection",
+            )
+            torch.testing.assert_close(predict(resumed), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

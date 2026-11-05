@@ -14,6 +14,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from airfoil_pinn.config.boundary import resolve_wall_condition
+
 __all__ = [
     "ConfigurationError",
     "validate_runtime_contract",
@@ -252,6 +254,10 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
                 f"boundary_conditions.{boundary_name} must be a mapping"
             )
             continue
+        if boundary_name == "wall":
+            boundary_value = resolve_wall_condition(
+                pde.get("system"), boundary_value
+            )
         enforcement = boundary_value.get("enforcement", "soft")
         if enforcement not in {"soft", "hard"}:
             errors.append(
@@ -267,18 +273,9 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
     wall = boundary.get("wall", {})
     if not isinstance(wall, Mapping):
         wall = {}
+    wall = resolve_wall_condition(pde.get("system"), wall)
     wall_enforcement = wall.get("enforcement", "soft")
-    wall_kind = wall.get("kind", "no_slip")
     if wall_enforcement == "hard":
-        if pde.get("system") != "incompressible_navier_stokes":
-            errors.append(
-                "Hard wall is currently supported only for incompressible "
-                "Navier-Stokes."
-            )
-        if wall_kind != "no_slip":
-            errors.append(
-                "Hard wall currently supports only the no-slip condition."
-            )
         if not bool(sdf):
             errors.append("Hard wall requires differentiable SDF.")
         try:
@@ -293,14 +290,6 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
                     "boundary_conditions.wall.distance_scale must be finite "
                     "and positive"
                 )
-    if (
-        pde.get("system") == "euler"
-        and legacy_boundary_type == "hard"
-    ):
-        errors.append(
-            "Euler wall impermeability couples u and v through the surface "
-            "normal and currently requires boundary_conditions.type=soft"
-        )
     if checkpoint.get("load_mode", "resume") not in {
         "resume",
         "finetune",

@@ -1635,6 +1635,8 @@ class MainWindow(QMainWindow):
         return command, run_dir
 
     def _write_backend_yaml_config(self, ui_config: dict[str, Any], path: Path) -> None:
+        from airfoil_pinn.config.boundary import normalize_wall_condition
+
         try:
             import yaml
         except ImportError as exc:
@@ -1689,6 +1691,7 @@ class MainWindow(QMainWindow):
             ui_config["profile"]["preset"].replace(" ", "_").lower()
         )
         config["ui"] = ui_config
+        normalize_wall_condition(config)
         self._validate_backend_data_paths(config, ui_config["loss_weights"]["use_fvm"])
 
         path.parent.mkdir(parents=True, exist_ok=True)

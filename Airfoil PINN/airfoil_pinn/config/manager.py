@@ -18,6 +18,7 @@ from typing import Dict, Any, Optional
 import yaml
 
 from airfoil_pinn.app.paths import PATHS, project_relative
+from airfoil_pinn.config.boundary import normalize_wall_condition
 from airfoil_pinn.config.validation import validate_static_config
 
 logger = logging.getLogger(__name__)
@@ -365,7 +366,8 @@ class ConfigManager:
         self.validate()
 
     def validate(self) -> None:
-        """Raise a consolidated error for incompatible configuration values."""
+        """Apply equation-dependent settings and validate the configuration."""
+        normalize_wall_condition(self.config)
         validate_static_config(self.config)
 
     def save(self, name: Optional[str] = None) -> None:
@@ -407,6 +409,7 @@ class ConfigManager:
 
     def show(self) -> None:
         """Подробный вывод текущей конфигурации в столбик (читаемый формат)."""
+        normalize_wall_condition(self.config)
         print("\n" + "=" * 70)
         print(f"КОНФИГУРАЦИЯ: {self.config.get('project_name', 'unnamed')}".center(70))
         print("=" * 70)

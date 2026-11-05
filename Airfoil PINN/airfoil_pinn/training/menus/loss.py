@@ -9,6 +9,7 @@
 """
 
 from airfoil_pinn.config.manager import ConfigManager
+from airfoil_pinn.config.boundary import normalize_wall_condition
 from airfoil_pinn.training.menus.common import (
     print_submenu_footer,
     print_submenu_header,
@@ -19,6 +20,7 @@ from airfoil_pinn.utils import clear_screen
 def loss_function_menu(cfg: ConfigManager) -> None:
     """Меню настройки функции потерь."""
     while True:
+        normalize_wall_condition(cfg.config)
         clear_screen()
         print_submenu_header("Настройка функции потерь")
         print("1. Выбор системы ДУ")
