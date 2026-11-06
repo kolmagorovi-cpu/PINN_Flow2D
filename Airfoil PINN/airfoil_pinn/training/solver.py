@@ -268,6 +268,18 @@ class PINNSolver:
         )
         self.telemetry = RunTelemetry(self._get_logs_dir())
 
+        # Initialize before loading a checkpoint so resume preserves patience.
+        early_cfg = config['training'].get('early_stopping', {})
+        self.early_stopping_enabled = bool(early_cfg.get('enabled', False))
+        self.early_stopping_patience = int(early_cfg.get('patience', 100))
+        self.early_stopping_min_delta = float(early_cfg.get('min_delta', 1e-6))
+        self.early_stopping_restore_best = bool(early_cfg.get('restore_best', True))
+        self._early_best_loss = float('inf')
+        self._early_best_epoch = 0
+        self._early_bad_epochs = 0
+        self._early_best_model_state = None
+        self._early_best_sa_state = None
+
         # Загрузка чекпоинта — после MetricsCollector, т.к. восстанавливает history
         self._load_checkpoint_if_needed()
         self._write_run_manifest()
@@ -313,18 +325,6 @@ class PINNSolver:
         self.stage2_ramp_epochs = config['training']['stage2_ramp_epochs']
         self.use_lbfgs = config['training']['switch_to_lbfgs_epoch'] > 0
         self.adam_epochs = config['training']['switch_to_lbfgs_epoch']
-
-        # Early stopping
-        early_cfg = config['training'].get('early_stopping', {})
-        self.early_stopping_enabled = bool(early_cfg.get('enabled', False))
-        self.early_stopping_patience = int(early_cfg.get('patience', 100))
-        self.early_stopping_min_delta = float(early_cfg.get('min_delta', 1e-6))
-        self.early_stopping_restore_best = bool(early_cfg.get('restore_best', True))
-        self._early_best_loss = float('inf')
-        self._early_best_epoch = 0
-        self._early_bad_epochs = 0
-        self._early_best_model_state = None
-        self._early_best_sa_state = None
 
         # Детектор локальных минимумов
         self.minima_detector = None
@@ -663,7 +663,7 @@ class PINNSolver:
             params.append(
                 {
                     'params': self.sa_weights.parameters(),
-                    'lr': self.config.get('sa_lr', 0.001),
+                    'lr': lr,
                     'weight_decay': 0.0,
                 }
             )
@@ -694,6 +694,8 @@ class PINNSolver:
         self.scheduler = self._init_scheduler()
         self.trainer.sa_weights = self.sa_weights
         self.trainer.optimizer = self.optimizer
+        if hasattr(self, 'interactive'):
+            self.interactive.sa_weights = self.sa_weights
         logger.info(
             "SA-веса пересозданы под чекпоинт: %s -> %s",
             current_shape,
@@ -881,6 +883,13 @@ class PINNSolver:
             # Загрузка истории и эпохи
             if 'history' in checkpoint:
                 self.metrics.history = checkpoint['history']
+            early_state = checkpoint.get('early_stopping_state', {})
+            if early_state.get('metric') == 'unweighted_pde_bc_mse':
+                self._early_best_loss = early_state['best_loss']
+                self._early_best_epoch = early_state['best_epoch']
+                self._early_bad_epochs = early_state['bad_epochs']
+                self._early_best_model_state = early_state['model_state']
+                self._early_best_sa_state = early_state['sa_state']
             if 'epoch' in checkpoint and checkpoint['epoch'] is not None:
                 self.start_epoch = checkpoint['epoch']
             restore_rng_state(checkpoint.get("rng_state"))
@@ -939,6 +948,14 @@ class PINNSolver:
                 'trainer_state': self.trainer.get_state(),
                 'using_lbfgs': self.using_lbfgs,
                 'rng_state': capture_rng_state(),
+                'early_stopping_state': {
+                    'metric': 'unweighted_pde_bc_mse',
+                    'best_loss': self._early_best_loss,
+                    'best_epoch': self._early_best_epoch,
+                    'bad_epochs': self._early_bad_epochs,
+                    'model_state': self._early_best_model_state,
+                    'sa_state': self._early_best_sa_state,
+                },
             }
         )
 
@@ -1307,6 +1324,8 @@ class PINNSolver:
                     loss, pde_raw, bc_comp, extra_grad, integral_loss, wall_speed, pde_max, pde_rate, grad_norm = \
                         self.trainer.train_epoch_adam(pde_mult)
 
+                convergence_loss = self.metrics.convergence_metric(pde_raw, bc_comp)
+
                 # Сбор дополнительных метрик для диагностики (если нужно)
                 extra_diag = {
                     'fvm_loss': self.trainer._last_fvm_loss,
@@ -1315,17 +1334,26 @@ class PINNSolver:
                     'fvm_weighted_loss': self.trainer._last_fvm_loss,
                     'fvm_rms': self.trainer._last_fvm_rms,
                     'fvm_evaluations': self.trainer._last_fvm_evaluations,
-                    'pressure_gauge_mse': (
-                        self.trainer._last_pressure_gauge_mse
-                    ),
-                    'pressure_gauge_loss': (
-                        self.trainer._last_pressure_gauge_loss
-                    ),
                 }
                 sample_batch = None
                 if self.sa_weights is not None:
                     with torch.no_grad():
                         extra_diag['sa_weights_mean'] = self.sa_weights().mean().item()
+                    if epoch % self.diagnostics_interval == 0:
+                        sa_report = self.trainer.compute_sa_diagnostics()
+                        extra_diag['sa_diagnostics'] = {'epoch': epoch, 'components': sa_report}
+                        for name, stats in sa_report.items():
+                            if not stats['count']:
+                                text = f"SA {name}: inactive (0 points)"
+                            else:
+                                text = (
+                                    f"SA {name}: n={stats['count']}, mean={stats['mean']:.3e}, "
+                                    f"min={stats['min']:.3e}, max={stats['max']:.3e}, "
+                                    f"q05/q25/q50/q75/q95={stats['quantiles']}, "
+                                    f"histogram={stats['histogram']}"
+                                )
+                            print(text)
+                            self.metrics.save_log(text)
                 if self.compute_grad_cosine and not self.using_lbfgs and epoch % self.diagnostics_interval == 0:
                     # Берём один батч
                     sample_batch = next(iter(self.data_handler.get_dataloader()))
@@ -1336,15 +1364,18 @@ class PINNSolver:
                 if self.compute_ntk_condition and not self.using_lbfgs and epoch % self.diagnostics_interval == 0:
                     if sample_batch is None:
                         sample_batch = next(iter(self.data_handler.get_dataloader()))
-                    extra_diag['ntk_condition'] = self.trainer.compute_ntk_condition(
-                        sample_batch,
-                        max_samples=self.ntk_sample_size
+                    from airfoil_pinn.training.ntk import format_ntk_diagnostics
+
+                    ntk_report = self.trainer.compute_ntk_diagnostics(
+                        sample_batch, max_samples=self.ntk_sample_size,
                     )
-                    print(
-                        f"[NTK] Эпоха {epoch}: "
-                        f"ntk_condition={extra_diag['ntk_condition']:.6e} | "
-                        f"точек={min(self.ntk_sample_size, sample_batch[1].shape[0])}"
-                    )
+                    ntk_report['epoch'] = epoch
+                    extra_diag['ntk_diagnostics'] = ntk_report
+                    condition = ntk_report['blocks']['pde']['cutoffs'][0]['condition']
+                    extra_diag['ntk_condition'] = condition
+                    ntk_text = format_ntk_diagnostics(ntk_report, epoch)
+                    print(ntk_text)
+                    self.metrics.save_log(ntk_text)
 
                 # Средние скорости на inlet/outlet для мониторинга баланса масс
                 avg_u_in, avg_u_out = self.metrics.get_boundary_avg_velocities(
@@ -1386,15 +1417,9 @@ class PINNSolver:
                     added_rar_points = self.trainer.apply_rar()
                     if added_rar_points:
                         self.metrics.invalidate_boundary_cache()
-                    if (
-                        added_rar_points
-                        or (hasattr(self.trainer, 'sa_weights_changed') and self.trainer.sa_weights_changed)
-                    ):
-                        self._recreate_optimizer()
-                        self.trainer.sa_weights_changed = False
 
                 # Детектор локальных минимумов
-                if self.minima_detector is not None and self.minima_detector.update(loss):
+                if self.minima_detector is not None and self.minima_detector.update(convergence_loss):
                     logger.info("Обнаружено плато, увеличиваю learning rate")
                     for _ in range(self.lr_recovery_epochs):
                         for param_group in self.optimizer.param_groups:
@@ -1414,7 +1439,7 @@ class PINNSolver:
                 # Шаг планировщика (если используется и не L-BFGS)
                 if self.scheduler is not None and not self.using_lbfgs:
                     if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        self.scheduler.step(loss)
+                        self.scheduler.step(convergence_loss)
                     elif isinstance(self.scheduler, CyclicLR):
                         self.scheduler.step()
                     # Другие типы планировщиков (например, StepLR) должны быть обработаны аналогично
@@ -1455,6 +1480,9 @@ class PINNSolver:
                     name: float(np.sqrt(max(value, 0.0)))
                     for name, value in pde_max.items()
                 }
+                contribution_report = self.trainer.gradient_contributions_report
+                if contribution_report is not None:
+                    extra_diag['gradient_contributions'] = contribution_report
                 self.telemetry.append_epoch(
                     {
                         "epoch": epoch,
@@ -1464,6 +1492,9 @@ class PINNSolver:
                         "learning_rate": learning_rate,
                         "pde_multiplier": pde_mult,
                         "loss": loss,
+                        "convergence_loss": convergence_loss,
+                        "convergence_metric": "unweighted_pde_bc_mse",
+                        "sa_diagnostics": extra_diag.get('sa_diagnostics'),
                         "loss_change_percent": loss_change_percent,
                         "loss_change_window_epochs": loss_change_epochs,
                         "loss_change_window_start": loss_window_start,
@@ -1481,20 +1512,6 @@ class PINNSolver:
                         "integral_mse": integral_loss,
                         "integral_rms": float(
                             np.sqrt(max(integral_loss, 0.0))
-                        ),
-                        "pressure_gauge_mse": (
-                            self.trainer._last_pressure_gauge_mse
-                        ),
-                        "pressure_gauge_rms": float(
-                            np.sqrt(
-                                max(
-                                    self.trainer._last_pressure_gauge_mse,
-                                    0.0,
-                                )
-                            )
-                        ),
-                        "pressure_gauge_loss": (
-                            self.trainer._last_pressure_gauge_loss
                         ),
                         "fvm_loss": self.trainer._last_fvm_loss,
                         "fvm_raw_loss": self.trainer._last_fvm_raw_loss,
@@ -1526,12 +1543,6 @@ class PINNSolver:
                     fvm_loss=self.trainer._last_fvm_loss,
                     fvm_raw_loss=self.trainer._last_fvm_raw_loss,
                     fvm_rms=self.trainer._last_fvm_rms,
-                    pressure_gauge_mse=(
-                        self.trainer._last_pressure_gauge_mse
-                    ),
-                    pressure_gauge_loss=(
-                        self.trainer._last_pressure_gauge_loss
-                    ),
                     optimizer_name=optimizer_name,
                     learning_rate=learning_rate,
                     grad_norm=grad_norm,
@@ -1547,6 +1558,11 @@ class PINNSolver:
                 if self.trainer._capture_gradient_report:
                     from airfoil_pinn.training.gradient_report import print_gradient_report
                     print_gradient_report(self.trainer.gradient_report, epoch)
+                if contribution_report is not None:
+                    from airfoil_pinn.training.gradient_contributions import format_gradient_contributions
+                    contribution_text = format_gradient_contributions(contribution_report, epoch)
+                    print(contribution_text)
+                    self.metrics.save_log(contribution_text)
                 line2 = (
                     f"   avg u_inlet = {avg_u_in:.4f} (норм.), "
                     f"avg u_outlet = {avg_u_out:.4f} (норм.), "
@@ -1583,6 +1599,7 @@ class PINNSolver:
                     )
                 self.metrics.save_log(
                     f"Epoch {epoch}: loss={loss:.2e}, "
+                    f"convergence_mse={convergence_loss:.2e}, "
                     f"{loss_change_text}; "
                     f"pde_mse: {mse_text}; pde_rms: {rms_text}; "
                     f"bc_mse: {bc_mse_text}; bc_rms: {bc_rms_text}; "
@@ -1608,6 +1625,8 @@ class PINNSolver:
                 if section_line is not None:
                     self.metrics.save_log(section_line)
 
+                should_stop = self._update_early_stopping(epoch, convergence_loss)
+
                 # Сохранение чекпоинта
                 checkpoint_interval = self.config['checkpoint']['interval']
                 if checkpoint_interval > 0 and epoch % checkpoint_interval == 0:
@@ -1619,7 +1638,7 @@ class PINNSolver:
                 if epoch % self.diagnostics_interval == 0:
                     self._run_diagnostics(epoch)
 
-                if self._update_early_stopping(epoch, loss):
+                if should_stop:
                     break
 
                 # Очистка кэша CUDA (редко, чтобы не замедлять)
@@ -1696,7 +1715,15 @@ class PINNSolver:
         base_model = self._unwrap_model_for_state(self.model)
         base_model.load_state_dict({k: v.to(self.device) for k, v in model_state.items()})
         if self.sa_weights is not None and sa_state is not None:
-            self.sa_weights.load_state_dict({k: v.to(self.device) for k, v in sa_state.items()})
+            # A best epoch can precede RAR. Keep the current dataset shape and
+            # initialize attention for points absent from the saved best state.
+            saved = sa_state['log_weights'].to(self.device)
+            current = self.sa_weights.log_weights
+            if saved.shape[1:] != current.shape[1:] or saved.shape[0] > current.shape[0]:
+                raise ValueError("Best SA state is incompatible with the current dataset")
+            with torch.no_grad():
+                current.fill_(self.sa_weights.initial_raw_value)
+                current[:saved.shape[0]].copy_(saved)
 
     def _update_early_stopping(self, epoch: int, loss: float) -> bool:
         if not self.early_stopping_enabled:

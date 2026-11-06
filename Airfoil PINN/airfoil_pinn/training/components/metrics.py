@@ -108,9 +108,6 @@ class MetricsCollector:
             'fvm_weighted_loss': [],
             'fvm_rms': [],
             'fvm_evaluations': [],
-            'pressure_gauge_mse': [],
-            'pressure_gauge_rms': [],
-            'pressure_gauge_loss': [],
             # Новые поля для диагностики
             'grad_norm_pde': [],
             'grad_norm_bc': [],
@@ -123,6 +120,7 @@ class MetricsCollector:
             'avg_u_in': [],
             'wall_gradient': [],
             'ntk_condition': [],
+            'ntk_diagnostics': [],
         }
 
         # Для кэширования средних скоростей на границах (нормированные)
@@ -172,6 +170,9 @@ class MetricsCollector:
         """
         self._ensure_history_schema()
         self.history['loss'].append(loss)
+        self.history['convergence_loss'].append(self.convergence_metric(pde_raw, bc_comp))
+        if extra_diag and 'sa_diagnostics' in extra_diag:
+            self.history['sa_diagnostics'].append(extra_diag['sa_diagnostics'])
         for k, v in pde_raw.items():
             self.history['pde'][k].append(v)
             self.history['pde_mse'][k].append(v)
@@ -232,16 +233,6 @@ class MetricsCollector:
                 self.history['fvm_evaluations'].append(
                     extra_diag['fvm_evaluations']
                 )
-            if 'pressure_gauge_mse' in extra_diag:
-                gauge_mse = float(extra_diag['pressure_gauge_mse'])
-                self.history['pressure_gauge_mse'].append(gauge_mse)
-                self.history['pressure_gauge_rms'].append(
-                    float(np.sqrt(max(gauge_mse, 0.0)))
-                )
-            if 'pressure_gauge_loss' in extra_diag:
-                self.history['pressure_gauge_loss'].append(
-                    extra_diag['pressure_gauge_loss']
-                )
             if 'grad_norm_pde' in extra_diag:
                 self.history['grad_norm_pde'].append(extra_diag['grad_norm_pde'])
             if 'grad_norm_bc' in extra_diag:
@@ -264,19 +255,39 @@ class MetricsCollector:
                 self.history['wall_gradient'].append(extra_diag['wall_gradient'])
             if 'ntk_condition' in extra_diag:
                 self.history['ntk_condition'].append(extra_diag['ntk_condition'])
+            if 'ntk_diagnostics' in extra_diag:
+                self.history['ntk_diagnostics'].append(extra_diag['ntk_diagnostics'])
+
+    @staticmethod
+    def convergence_metric(pde_mse: Dict[str, float], bc_mse: Dict[str, float]) -> float:
+        """Sum point-count-normalized physical MSEs without loss weights.
+
+        Auxiliary integral/FVM objectives are excluded: their intermittent
+        evaluation must not change the convergence criterion between epochs.
+        """
+        return float(sum(pde_mse.values()) + sum(bc_mse.values()))
 
     def _ensure_history_schema(self) -> None:
         """Добавляет новые ключи при resume из старых чекпоинтов."""
+        if 'convergence_loss' not in self.history:
+            # Old histories already contain unweighted component MSEs.
+            components = [
+                values for group in ('pde', 'bc')
+                for values in (self.history.get(group) or {}).values()
+            ]
+            self.history['convergence_loss'] = [
+                sum(values[index] for values in components if index < len(values))
+                if components else float('nan')
+                for index in range(len(self.history.get('loss', [])))
+            ]
         defaults = {
+            'sa_diagnostics': [],
             'fvm_loss': [],
             'fvm_raw_loss': [],
             'fvm_mse': [],
             'fvm_weighted_loss': [],
             'fvm_rms': [],
             'fvm_evaluations': [],
-            'pressure_gauge_mse': [],
-            'pressure_gauge_rms': [],
-            'pressure_gauge_loss': [],
             'grad_norm_pde': [],
             'grad_norm_bc': [],
             'grad_cosine': [],
@@ -288,6 +299,7 @@ class MetricsCollector:
             'avg_u_in': [],
             'wall_gradient': [],
             'ntk_condition': [],
+            'ntk_diagnostics': [],
             'grad_norm': [],
             'total_pde': [],
             'max_res': {c: [] for c in self.loss_computer.pde_components},
@@ -1176,8 +1188,6 @@ class MetricsCollector:
         fvm_loss: float = 0.0,
         fvm_raw_loss: Optional[float] = None,
         fvm_rms: Optional[float] = None,
-        pressure_gauge_mse: float = 0.0,
-        pressure_gauge_loss: Optional[float] = None,
         optimizer_name: str = "Adam",
         learning_rate: float = 0.0,
         grad_norm: float = 0.0,
@@ -1419,26 +1429,6 @@ class MetricsCollector:
             )
 
         auxiliary_rows = []
-        gauge_weight = float(
-            getattr(self.loss_computer, "pressure_gauge_weight", 0.0)
-        )
-        if gauge_weight > 0.0:
-            gauge_weighted = (
-                float(pressure_gauge_loss)
-                if pressure_gauge_loss is not None
-                else pressure_gauge_mse * gauge_weight
-            )
-            auxiliary_rows.append(
-                (
-                    "Pressure Gauge",
-                    pressure_gauge_mse,
-                    float(np.sqrt(max(pressure_gauge_mse, 0.0))),
-                    gauge_weight,
-                    gauge_weighted,
-                    history_values("pressure_gauge_mse"),
-                )
-            )
-
         if self.loss_computer.integral_condition:
             integral_weight = float(self.loss_computer.integral_weight)
             auxiliary_rows.append(
@@ -1712,8 +1702,10 @@ class MetricsCollector:
         mass_balance_error = mass_metrics['mass_balance_error']
 
         # Лучшая эпоха
-        best_epoch = np.argmin(self.history['loss']) + 1 if self.history['loss'] else 0
-        best_loss = min(self.history['loss']) if self.history['loss'] else float('inf')
+        self._ensure_history_schema()
+        convergence = self.history['convergence_loss']
+        candidates = [(value, index + 1) for index, value in enumerate(convergence) if np.isfinite(value)]
+        best_loss, best_epoch = min(candidates) if candidates else (float('inf'), 0)
 
         # Финальная норма градиентов
         final_grad_norm = self.history['grad_norm'][-1] if self.history['grad_norm'] else 0.0
@@ -1752,6 +1744,7 @@ class MetricsCollector:
             'final_fvm_rms': final_fvm_rms,
             'best_epoch': best_epoch,
             'best_loss': best_loss,
+            'best_loss_metric': 'unweighted_pde_bc_mse',
             'final_gradient_norm': final_grad_norm,
             'relative_l2_error': 'N/A',
         }

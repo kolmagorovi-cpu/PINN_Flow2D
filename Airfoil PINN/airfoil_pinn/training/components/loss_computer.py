@@ -95,17 +95,6 @@ class LossComputer:
         # Веса потерь
         lw = config['loss_weights']
         self.loss_weights = lw['pde_weights'].copy()
-        self.pressure_gauge_weight = float(
-            lw.get('pressure_gauge_weight', 1.0)
-        )
-        if (
-            not np.isfinite(self.pressure_gauge_weight)
-            or self.pressure_gauge_weight <= 0.0
-        ):
-            raise ValueError(
-                "loss_weights.pressure_gauge_weight must be finite and "
-                "strictly positive"
-            )
         # A hard wall does not disable unrelated soft boundary operators.
         self.loss_weights.update(lw['bc_weights'])
         if 'slip_wall' in self.loss_weights:
@@ -534,60 +523,6 @@ class LossComputer:
 
         return result, valid_mask
 
-    def compute_pressure_gauge_loss(
-        self,
-        pressure: torch.Tensor,
-        case_ids: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Anchor the additive pressure constant independently for each case.
-
-        Incompressible PDE residuals contain only pressure gradients.  Without
-        this term, adding an arbitrary constant to one case leaves the PDE loss
-        unchanged.  The gauge chooses zero mean dimensionless pressure
-        coefficient for every ``case_id`` represented in the batch.
-        """
-        if pressure.ndim != 2 or pressure.shape[1] != 1:
-            raise ValueError("pressure must have shape (N, 1)")
-        if case_ids is None:
-            ids = torch.zeros(
-                pressure.shape[0],
-                device=pressure.device,
-                dtype=torch.long,
-            )
-        else:
-            if case_ids.numel() != pressure.shape[0]:
-                raise ValueError(
-                    "case_ids must contain exactly one identifier per pressure"
-                )
-            ids = case_ids.to(
-                device=pressure.device,
-                dtype=torch.long,
-            ).reshape(-1)
-
-        if mask is None:
-            selected = torch.ones(
-                pressure.shape[0],
-                device=pressure.device,
-                dtype=torch.bool,
-            )
-        else:
-            if mask.shape != pressure.shape:
-                raise ValueError("pressure gauge mask must match pressure shape")
-            selected = mask.to(
-                device=pressure.device,
-                dtype=torch.bool,
-            ).reshape(-1)
-
-        terms = []
-        flat_pressure = pressure.reshape(-1)
-        for case_id in torch.unique(ids[selected], sorted=True):
-            case_mask = selected & (ids == case_id)
-            terms.append(flat_pressure[case_mask].mean().square())
-        if not terms:
-            return pressure.sum() * 0.0
-        return torch.stack(terms).mean()
-
     def _grad(
         self,
         y: torch.Tensor,
@@ -689,6 +624,8 @@ class LossComputer:
         x: torch.Tensor,
         y: torch.Tensor,
         case_ids: Optional[torch.Tensor] = None,
+        *,
+        squared: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Вычисляет невязки PDE (квадраты) для заданных полей.
@@ -697,6 +634,7 @@ class LossComputer:
             u, v, p: поля скорости и давления (тензоры с requires_grad)
             x, y: координаты (тензоры с requires_grad)
             case_ids: идентификатор режима для каждой точки
+            squared: False возвращает знаковые невязки для диагностики NTK
 
         Returns:
             словарь с ключами, соответствующими self.pde_components,
@@ -705,10 +643,10 @@ class LossComputer:
         if self.pde_system == 'euler':
             if self.flow_type == 'axisymmetric':
                 return PDEResiduals.compute_residuals_euler_axisymmetric(
-                    u, v, p, x, y, self._grad, self.eps_axi
+                    u, v, p, x, y, self._grad, self.eps_axi, squared=squared
                 )
             return PDEResiduals.compute_residuals_euler_2d(
-                u, v, p, x, y, self._grad
+                u, v, p, x, y, self._grad, squared=squared
             )
 
         flow = self.get_flow_case_batch(x, case_ids)
@@ -723,6 +661,7 @@ class LossComputer:
                 inverse_reynolds,
                 self._grad,
                 self.eps_axi,
+                squared=squared,
             )
         return PDEResiduals.compute_residuals_2d(
             u,
@@ -732,6 +671,7 @@ class LossComputer:
             y,
             inverse_reynolds,
             self._grad,
+            squared=squared,
         )
 
     # ------------------------------------------------------------------
@@ -955,6 +895,8 @@ class LossComputer:
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Вычисляет потери на границах для soft boundary conditions.
+        Давление Cp=0 задаётся только на outlet/farfield через mean(Cp²).
+        Штрафа за среднее давление в области или на inlet нет.
         Возвращает словарь потерь по каждому типу границы и дополнительную
         потерю от градиентов на симметрии (symmetry_grad, axis_symmetry_grad).
 
@@ -1003,6 +945,9 @@ class LossComputer:
                     target_u,
                     target_v,
                 )
+                if name == 'farfield':
+                    # Pressure is anchored only on the external boundary.
+                    bc_comp[name] += p[mask].square().mean()
 
             elif name == 'outlet':
                 p_out = p[mask]

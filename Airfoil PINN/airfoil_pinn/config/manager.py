@@ -123,7 +123,6 @@ class ConfigManager:
                 'adaptive_bc': False,
                 'use_sa_weights': False,
                 'sa_apply_to_bc': False,
-                'pressure_gauge_weight': 1.0,
                 'integral_condition': False,
                 'integral_weight': 0.0,
                 'fvm': {
@@ -271,10 +270,14 @@ class ConfigManager:
                 'spectrum_2d_resolution': 256,
                 'compute_grad_cosine': False,
                 'compute_ntk_condition': False,
+                'ntk_sample_size': 64,
                 'strict_autograd': True,
                 'save_rar_history': True,
                 'mass_metrics_interval': 1,
                 'gradient_report_interval': 50,
+                'gradient_contributions_enabled': False,
+                'compute_fvm_pde_cosine': False,
+                'gradient_contributions_interval': 50,
                 'section_flow': {
                     'enabled': True,
                     'sections': [0.2, 0.5, 0.8],
@@ -597,6 +600,9 @@ class ConfigManager:
         print(f"  strict_autograd          : {diag.get('strict_autograd', True)}")
         print(f"  save_rar_history         : {diag.get('save_rar_history', True)}")
         print(f"  gradient_report_interval : {diag.get('gradient_report_interval', 50)}")
+        print(f"  gradient_contributions_enabled : {diag.get('gradient_contributions_enabled', False)}")
+        print(f"  compute_fvm_pde_cosine   : {diag.get('compute_fvm_pde_cosine', False)}")
+        print(f"  gradient_contributions_interval : {diag.get('gradient_contributions_interval', 50)}")
         print(f"  mass_metrics_interval    : {diag.get('mass_metrics_interval', 1)}")
         print("=" * 70)
 

@@ -126,11 +126,13 @@ class StaticValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, r"output_bias\[2\]"):
             validate_static_config(config)
 
-    def test_pressure_gauge_cannot_be_disabled(self) -> None:
+    def test_obsolete_pressure_gauge_weight_is_not_required(self) -> None:
         config = _default_config()
+        self.assertNotIn("pressure_gauge_weight", config["loss_weights"])
+        validate_static_config(config)
+        # Old YAML files may retain this unused setting, including zero.
         config["loss_weights"]["pressure_gauge_weight"] = 0.0
-        with self.assertRaisesRegex(ConfigurationError, "pressure_gauge_weight"):
-            validate_static_config(config)
+        validate_static_config(config)
 
 
 class RuntimeValidationTests(unittest.TestCase):

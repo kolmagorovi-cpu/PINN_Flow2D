@@ -106,6 +106,11 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
         print("13. Интервал inlet/outlet метрик")
         print("14. Показать текущие настройки")
         print(f"15. Подробные градиенты: каждые {diag.get('gradient_report_interval', 50)} эпох (0 — отключено)")
+        state = 'включены' if diag.get('gradient_contributions_enabled', False) else 'выключены'
+        print(f"16. Градиентные вклады PDE / BC / FVM / Integral: {state}")
+        print(f"17. Интервал вывода градиентных вкладов: {diag.get('gradient_contributions_interval', 50)} эпох")
+        cosine_state = 'включён' if diag.get('compute_fvm_pde_cosine', False) else 'выключен'
+        print(f"18. Вычисление и вывод cosine(FVM, PDE), cosine(FVM, BC), cosine(PDE, BC): {cosine_state}")
         print("0. Выход")
         sub = input("Выберите пункт: ").strip()
 
@@ -136,15 +141,17 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
         elif sub == '10':
             diag['compute_grad_cosine'] = yes_no("Вычислять раздельные градиенты", diag.get('compute_grad_cosine', False))
         elif sub == '11':
-            print("\nNTK (Neural Tangent Kernel) — матрица сходства градиентов")
-            print("выходов сети по её параметрам: характеризует локальную динамику обучения.")
-            print("Здесь используется сумма выходов сети на малом подбатче.")
-            print("ntk_condition = lambda_max / lambda_min среди собственных значений > 1e-12.")
-            print("Ближе к 1 — более равномерный спектр; большое значение указывает")
-            print("на разные скорости обучения направлений и возможное замедление сходимости.")
-            print("Нулевые значения спектра исключаются: это не проверка полного ранга NTK.")
-            print("inf — нет собственных значений выше порога; 0 — недостаточно точек (< 2).")
-            print("Это оценка, а не ошибка решения; сравнивайте при одинаковых данных и масштабе.")
+            print("\nNTK: отдельные K = J J^T для знаковых невязок PDE, BC и FVM.")
+            print("Модель, невязки, якобианы и спектры вычисляются в float64 без AMP.")
+            print("Веса loss и SA не включаются; hard BC исключены из блока BC.")
+            print("FVM: r_i = sqrt(V_i) * divergence_i; без нормировки на суммарную площадь.")
+            print("Выводятся полный спектр и эффективный ранг exp(entropy).")
+            print("Пороги: lambda > rtol * lambda_max, rtol = 1e-12, 1e-10, 1e-8, 1e-6.")
+            print("Для каждого порога: численный ранг, число отсечений и condition.")
+            print("Condition относится к оставленному подпространству; полный ранг проверяется отдельно.")
+            print("ntk_condition в истории — PDE condition при rtol=1e-12.")
+            print("ntk_sample_size ограничивает точки PDE/BC и объёмы FVM на каждый режим.")
+            print("Пустой блок означает отсутствие выбранных невязок; FVM без сетки недоступен.")
             print("Расчёт и вывод выполняются с интервалом диагностики, кроме этапа L-BFGS.")
             print("Расчёт NTK требует дополнительных времени и памяти.")
             diag['compute_ntk_condition'] = yes_no(
@@ -169,7 +176,34 @@ def diagnostics_menu(cfg: ConfigManager) -> None:
             except ValueError:
                 print("Введите целое число >= 0. Текущее значение сохранено.")
                 input("Нажмите Enter...")
+        elif sub == '16':
+            print("L2-нормы взвешенных градиентов по параметрам модели до clipping.")
+            print("Вывод в консоль, текстовый лог и epochs.jsonl. Расчёт требует дополнительного времени и памяти.")
+            diag['gradient_contributions_enabled'] = yes_no(
+                "Измерять и выводить градиентные вклады PDE / BC / FVM / Integral",
+                diag.get('gradient_contributions_enabled', False),
+            )
+        elif sub == '17':
+            current = diag.get('gradient_contributions_interval', 50)
+            try:
+                value = int(input(f"Интервал вывода вкладов (эпох, >= 1) [{current}]: ") or current)
+                if value < 1:
+                    raise ValueError
+                diag['gradient_contributions_interval'] = value
+            except ValueError:
+                print("Введите целое число >= 1. Текущее значение сохранено.")
+                input("Нажмите Enter...")
+        elif sub == '18':
+            print("Косинусы между накопленными градиентами FVM, PDE и BC до clipping.")
+            print("Работает независимо от пункта 16; периодичность задаётся пунктом 17.")
+            diag['compute_fvm_pde_cosine'] = yes_no(
+                "Вычислять и выводить cosine(FVM, PDE), cosine(FVM, BC), cosine(PDE, BC)",
+                diag.get('compute_fvm_pde_cosine', False),
+            )
         elif sub == '14':
+            print(f"cosine(FVM, PDE), cosine(FVM, BC), cosine(PDE, BC): {cosine_state}")
+            print(f"Градиентные вклады PDE / BC / FVM / Integral: {state}")
+            print(f"Интервал вывода вкладов: {diag.get('gradient_contributions_interval', 50)} эпох")
             print(f"Интервал подробного вывода градиентов: {diag.get('gradient_report_interval', 50)} (0 — отключено)")
             print("\n--- ТЕКУЩИЕ НАСТРОЙКИ ДИАГНОСТИКИ ---")
             print(f"Интервал: {diag.get('interval', 50)}")

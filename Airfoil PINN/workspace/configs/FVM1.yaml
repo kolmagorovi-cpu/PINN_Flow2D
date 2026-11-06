@@ -175,7 +175,6 @@ loss_weights:
     mom_x: 1.0
     mom_y: 1.0
     mom_z: 1.0
-  pressure_gauge_weight: 1.0
   sa_apply_to_bc: false
   use_sa_weights: false
 output:

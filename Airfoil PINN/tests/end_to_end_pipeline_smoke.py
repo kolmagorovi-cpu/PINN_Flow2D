@@ -48,28 +48,52 @@ def _small_solver_config() -> dict:
 class EndToEndResumeTests(unittest.TestCase):
     """Exercise graph construction, autodiff, optimizer and exact resume."""
 
-    def test_raw_pressure_shift_changes_total_loss(self) -> None:
-        """The case-aware pressure gauge removes the PDE pressure nullspace."""
+    def test_pressure_level_is_penalized_only_on_pressure_boundaries(self) -> None:
+        """Domain and inlet pressure means are free; farfield fixes Cp."""
         with tempfile.TemporaryDirectory() as directory:
+            config = _small_solver_config()
+            # An old configuration must not reactivate the removed loss.
+            config["loss_weights"]["pressure_gauge_weight"] = 100.0
             solver = PINNSolver(
-                _small_solver_config(),
-                experiment_dir=str(Path(directory, "pressure_gauge")),
+                config,
+                experiment_dir=str(Path(directory, "pressure_boundaries")),
             )
-            batch = next(iter(solver.data_handler.get_dataloader()))
-            baseline = solver.trainer.forward_pass(batch)
+            batch = list(next(iter(solver.data_handler.get_dataloader())))
+            # Keep coordinates off the airfoil: relabeling wall points as
+            # interior would request undefined second SDF derivatives there.
+            interior_column = solver.data_handler.boundary_type_names.index(
+                "interior",
+            )
+            interior = batch[4][:, interior_column] > 0.5
+            self.assertTrue(bool(interior.any()))
+            batch = [value[interior] for value in batch]
             model = solver._unwrap_model_for_state(solver.model)
-            with torch.no_grad():
-                model.output_layer.bias[2].add_(10.0)
-            shifted = solver.trainer.forward_pass(batch)
+            for boundary_name in ("interior", "inlet", "farfield"):
+                with self.subTest(boundary=boundary_name):
+                    boundary = torch.zeros_like(batch[4])
+                    column = solver.data_handler.boundary_type_names.index(
+                        boundary_name,
+                    )
+                    boundary[:, column] = 1.0
+                    batch[4] = boundary
+                    with torch.no_grad():
+                        model.output_layer.bias[2].zero_()
+                    baseline = solver.trainer.forward_pass(tuple(batch))
+                    with torch.no_grad():
+                        model.output_layer.bias[2].add_(10.0)
+                    shifted = solver.trainer.forward_pass(tuple(batch))
 
-            self.assertNotEqual(
-                float(baseline["total"].detach()),
-                float(shifted["total"].detach()),
-            )
-            self.assertNotEqual(
-                baseline["pressure_gauge_loss"],
-                shifted["pressure_gauge_loss"],
-            )
+                    self.assertNotIn("pressure_gauge", shifted["loss_components"])
+                    self.assertNotIn("pressure_gauge_loss", shifted)
+                    if boundary_name == "farfield":
+                        self.assertGreater(
+                            float(shifted["total"].detach()),
+                            float(baseline["total"].detach()),
+                        )
+                    else:
+                        torch.testing.assert_close(
+                            baseline["total"], shifted["total"],
+                        )
 
     def test_checkpoint_restores_model_optimizer_data_and_rng(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

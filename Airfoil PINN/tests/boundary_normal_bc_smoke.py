@@ -16,6 +16,7 @@ from airfoil_pinn.data.handler import DataHandler, PINNDataset
 from airfoil_pinn.config.manager import ConfigManager
 from airfoil_pinn.sampling.core import CollocationPoints
 from airfoil_pinn.training.components.loss_computer import LossComputer
+from airfoil_pinn.training.components.trainer import Trainer
 
 
 DTYPE = torch.float64
@@ -97,6 +98,67 @@ def _rotation(angle: float) -> torch.Tensor:
         ],
         dtype=DTYPE,
     )
+
+
+class PressureBoundaryTests(unittest.TestCase):
+    def test_pressure_penalty_and_gradients_are_boundary_local(self) -> None:
+        """Opposite boundary pressures cannot cancel or affect interior Cp."""
+        for name in (
+            "outlet", "farfield", "inlet", "velocity_dirichlet", "wall", "interior",
+        ):
+            with self.subTest(boundary=name):
+                loss = _loss_computer(name)
+                u = torch.ones((3, 1), dtype=DTYPE)
+                zero = torch.zeros_like(u)
+                pressure = torch.tensor(
+                    [[2.0], [-2.0], [100.0]], dtype=DTYPE, requires_grad=True,
+                )
+                # The third point is outside the boundary, regardless of Cp.
+                boundary = torch.tensor([[1.0], [1.0], [0.0]], dtype=DTYPE)
+                baseline, _ = loss.compute_bc_loss(u, zero, zero, boundary, zero, zero)
+                actual, _ = loss.compute_bc_loss(u, zero, pressure, boundary, zero, zero)
+                active = name in ("outlet", "farfield")
+                delta = actual[name] - baseline[name]
+                self.assertEqual(float(delta.detach()), 4.0 if active else 0.0)
+                if active:
+                    gradient, = torch.autograd.grad(delta, pressure)
+                    torch.testing.assert_close(
+                        gradient, torch.tensor([[2.0], [-2.0], [0.0]], dtype=DTYPE),
+                    )
+
+    def test_adaptive_weights_and_rar_use_the_same_pressure_boundaries(self) -> None:
+        for name in ("outlet", "farfield", "inlet", "velocity_dirichlet", "interior"):
+            with self.subTest(boundary=name):
+                loss = _loss_computer(name)
+                loss.loss_weights[name] = 3.0
+                trainer = Trainer.__new__(Trainer)
+                trainer.loss_computer = loss
+                trainer.data_handler = loss.data_handler
+                trainer.device = torch.device("cpu")
+                trainer.dtype = DTYPE
+                trainer.sa_weights = None
+                u = torch.ones((3, 1), dtype=DTYPE)
+                zero = torch.zeros_like(u)
+                pressure = torch.tensor([[2.0], [-2.0], [100.0]], dtype=DTYPE)
+                boundary = torch.tensor([[1.0], [1.0], [0.0]], dtype=DTYPE)
+                weights = torch.tensor([[2.0], [4.0], [8.0]], dtype=DTYPE)
+                args = dict(u=u, v=zero, x=zero, y=zero, boundary_types=boundary)
+                baseline = trainer._compute_sa_bc_loss(p=zero, w_bc=weights, **args)
+                actual = trainer._compute_sa_bc_loss(p=pressure, w_bc=weights, **args)
+                active = name in ("outlet", "farfield")
+                self.assertEqual(float(actual - baseline), 36.0 if active else 0.0)
+
+                for adaptive in (False, True):
+                    trainer.sa_weights = object() if adaptive else None
+                    loss.sa_apply_to_bc = adaptive
+                    base_score = trainer._compute_bc_point_score(p=zero, w_bc=weights, **args)
+                    score = trainer._compute_bc_point_score(p=pressure, w_bc=weights, **args)
+                    expected = torch.zeros(3, dtype=DTYPE)
+                    if active:
+                        expected[:2] = torch.tensor(
+                            [24.0, 48.0] if adaptive else [12.0, 12.0], dtype=DTYPE,
+                        )
+                    torch.testing.assert_close(score - base_score, expected)
 
 
 class SlipWallNormalTests(unittest.TestCase):

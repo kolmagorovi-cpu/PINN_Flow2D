@@ -608,6 +608,30 @@ class MainWindow(QMainWindow):
         loss_form.addRow("", self.fvm_checkbox)
         layout.addWidget(loss_box)
 
+        self.diagnostics_dialog = QDialog(self)
+        self.diagnostics_dialog.setWindowTitle("Настройки диагностики")
+        diagnostics_form = QFormLayout(self.diagnostics_dialog)
+        self.gradient_contributions_check = QCheckBox("PDE / BC / FVM / Integral")
+        self.gradient_contributions_spin = self._spin(1, 1_000_000, 50, 1)
+        self.gradient_contributions_spin.setSuffix(" эпох")
+        self.gradient_contributions_spin.setEnabled(False)
+        self.gradient_contributions_check.toggled.connect(self.gradient_contributions_spin.setEnabled)
+        diagnostics_form.addRow("Градиентные вклады", self.gradient_contributions_check)
+        diagnostics_form.addRow("Периодичность вывода", self.gradient_contributions_spin)
+        explanation = QLabel(
+            "L2-нормы взвешенных градиентов до clipping.\n"
+            "Вывод в консоль и логи обучения.\n"
+            "Расчёт требует дополнительного времени и памяти."
+        )
+        explanation.setWordWrap(True)
+        diagnostics_form.addRow(explanation)
+        close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_buttons.rejected.connect(self.diagnostics_dialog.accept)
+        diagnostics_form.addRow(close_buttons)
+        self.diagnostics_button = QPushButton("Настройки диагностики")
+        self.diagnostics_button.clicked.connect(self.diagnostics_dialog.exec)
+        layout.addWidget(self.diagnostics_button)
+
         result_box = QGroupBox("Results")
         result_form = QFormLayout(result_box)
         self.results_dir_edit = QLineEdit(str(self.current_results_dir))
@@ -933,6 +957,8 @@ class MainWindow(QMainWindow):
         self.bc_weight_spin.setValue(self._settings_float("training/bc_weight", self.bc_weight_spin.value()))
         self.data_weight_spin.setValue(self._settings_float("training/data_weight", self.data_weight_spin.value()))
         self.fvm_checkbox.setChecked(self._settings_bool("training/use_fvm", self.fvm_checkbox.isChecked()))
+        self.gradient_contributions_check.setChecked(self._settings_bool("diagnostics/gradient_contributions_enabled", False))
+        self.gradient_contributions_spin.setValue(self._settings_int("diagnostics/gradient_contributions_interval", 50))
 
         self._sync_backend_controls()
         self._sync_training_profile_controls()
@@ -971,6 +997,8 @@ class MainWindow(QMainWindow):
         self.settings.setValue("training/bc_weight", self.bc_weight_spin.value())
         self.settings.setValue("training/data_weight", self.data_weight_spin.value())
         self.settings.setValue("training/use_fvm", self.fvm_checkbox.isChecked())
+        self.settings.setValue("diagnostics/gradient_contributions_enabled", self.gradient_contributions_check.isChecked())
+        self.settings.setValue("diagnostics/gradient_contributions_interval", self.gradient_contributions_spin.value())
         self.settings.sync()
 
     def _settings_int(self, key: str, default: int) -> int:
@@ -1456,6 +1484,7 @@ class MainWindow(QMainWindow):
             self.bc_weight_spin,
             self.data_weight_spin,
             self.fvm_checkbox,
+            self.diagnostics_button,
             self.results_dir_edit,
             self.browse_results_button,
         )
@@ -1566,6 +1595,10 @@ class MainWindow(QMainWindow):
                 "data": self.data_weight_spin.value(),
                 "use_fvm": self.fvm_checkbox.isChecked(),
             },
+            "diagnostics": {
+                "gradient_contributions_enabled": self.gradient_contributions_check.isChecked(),
+                "gradient_contributions_interval": self.gradient_contributions_spin.value(),
+            },
             "results_dir": str(result_dir),
         }
 
@@ -1592,6 +1625,9 @@ class MainWindow(QMainWindow):
         self.bc_weight_spin.setValue(float(weights.get("bc", self.bc_weight_spin.value())))
         self.data_weight_spin.setValue(float(weights.get("data", self.data_weight_spin.value())))
         self.fvm_checkbox.setChecked(bool(weights.get("use_fvm", self.fvm_checkbox.isChecked())))
+        diagnostics = config.get("diagnostics", {})
+        self.gradient_contributions_check.setChecked(bool(diagnostics.get("gradient_contributions_enabled", False)))
+        self.gradient_contributions_spin.setValue(int(diagnostics.get("gradient_contributions_interval", 50)))
         if config.get("results_dir"):
             self.results_dir_edit.setText(str(config["results_dir"]))
         self._sync_backend_controls()
@@ -1683,6 +1719,7 @@ class MainWindow(QMainWindow):
         output.setdefault("plot_frequency", 10)
 
         diagnostics = config.setdefault("diagnostics", {})
+        diagnostics.update(ui_config.get("diagnostics", {}))
         epochs = max(1, int(ui_config["training"]["epochs"]))
         diagnostics["interval"] = min(int(diagnostics.get("interval", epochs) or epochs), epochs)
 

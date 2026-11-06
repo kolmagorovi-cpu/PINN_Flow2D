@@ -333,7 +333,6 @@ class Visualizer:
                             'total_bc',
                             'integral_mse',
                             'fvm_mse',
-                            'pressure_gauge_mse',
                         )
                     },
                     'Loss diagnostics',

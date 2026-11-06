@@ -22,7 +22,10 @@ __all__ = ["PDEResiduals"]
 
 
 class PDEResiduals:
-    """Evaluate squared pointwise residuals of dimensionless flow equations."""
+    """Evaluate pointwise flow residuals, squared unless ``squared=False``.
+
+    Signed residuals expose the operator Jacobian even at an exact solution.
+    """
 
     @staticmethod
     def _inverse_reynolds_like(
@@ -72,6 +75,8 @@ class PDEResiduals:
         y: torch.Tensor,
         inverse_reynolds: torch.Tensor,
         grad_fn: Callable,
+        *,
+        squared: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Return planar steady Navier--Stokes residual squares.
 
@@ -110,9 +115,9 @@ class PDEResiduals:
             - inv_re * (v_xx + v_yy)
         )
         return {
-            "cont": continuity.square(),
-            "mom_x": momentum_x.square(),
-            "mom_y": momentum_y.square(),
+            "cont": continuity.square() if squared else continuity,
+            "mom_x": momentum_x.square() if squared else momentum_x,
+            "mom_y": momentum_y.square() if squared else momentum_y,
         }
 
     @staticmethod
@@ -123,6 +128,8 @@ class PDEResiduals:
         x: torch.Tensor,
         y: torch.Tensor,
         grad_fn: Callable,
+        *,
+        squared: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Return planar steady incompressible Euler residual squares."""
         u_x = grad_fn(u, x, silent=True)
@@ -136,9 +143,9 @@ class PDEResiduals:
         momentum_x = u * u_x + v * u_y + 0.5 * p_x
         momentum_y = u * v_x + v * v_y + 0.5 * p_y
         return {
-            "cont": continuity.square(),
-            "mom_x": momentum_x.square(),
-            "mom_y": momentum_y.square(),
+            "cont": continuity.square() if squared else continuity,
+            "mom_x": momentum_x.square() if squared else momentum_x,
+            "mom_y": momentum_y.square() if squared else momentum_y,
         }
 
     @staticmethod
@@ -151,6 +158,8 @@ class PDEResiduals:
         inverse_reynolds: torch.Tensor,
         grad_fn: Callable,
         eps: float = 1e-12,
+        *,
+        squared: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Return no-swirl axisymmetric Navier--Stokes residual squares.
 
@@ -187,9 +196,9 @@ class PDEResiduals:
             u * v_r + v * v_z + 0.5 * p_z - inv_re * laplacian_v
         )
         return {
-            "cont": continuity.square(),
-            "mom_r": momentum_r.square(),
-            "mom_z": momentum_z.square(),
+            "cont": continuity.square() if squared else continuity,
+            "mom_r": momentum_r.square() if squared else momentum_r,
+            "mom_z": momentum_z.square() if squared else momentum_z,
         }
 
     @staticmethod
@@ -201,6 +210,8 @@ class PDEResiduals:
         z: torch.Tensor,
         grad_fn: Callable,
         eps: float = 1e-12,
+        *,
+        squared: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Return no-swirl axisymmetric incompressible Euler residuals."""
         u_r = grad_fn(u, r, silent=True)
@@ -215,7 +226,7 @@ class PDEResiduals:
         momentum_r = u * u_r + v * u_z + 0.5 * p_r
         momentum_z = u * v_r + v * v_z + 0.5 * p_z
         return {
-            "cont": continuity.square(),
-            "mom_r": momentum_r.square(),
-            "mom_z": momentum_z.square(),
+            "cont": continuity.square() if squared else continuity,
+            "mom_r": momentum_r.square() if squared else momentum_r,
+            "mom_z": momentum_z.square() if squared else momentum_z,
         }

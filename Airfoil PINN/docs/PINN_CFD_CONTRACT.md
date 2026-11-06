@@ -235,8 +235,6 @@ contract.
 \mathcal L =
 \sum_k \lambda_{\mathrm{PDE},k}\mathcal L_{\mathrm{PDE},k}
 +\sum_j \lambda_{\mathrm{BC},j}\mathcal L_{\mathrm{BC},j}
-+\lambda_g\frac{1}{N_{\mathrm{case}}}
-\sum_c\left(\operatorname{mean}_{i:\,case_i=c} C_{p,i}\right)^2
 +\lambda_I\mathcal L_I
 +\lambda_{\mathrm{FVM}}\mathcal L_{\mathrm{FVM}}
 +\mathcal L_{\mathrm{extra}}.
@@ -247,9 +245,12 @@ contract.
   невязки. RMS вычисляется только как диагностический `sqrt(MSE)` и не входит
   в `total loss`.
 - PDE использует pointwise \(1/Re_c\) того же `case_id`, что и вход сети.
-- Pressure gauge вычисляется отдельно для каждого `case_id`, затем
-  усредняется между случаями. `pressure_gauge_weight` строго положителен,
-  а `architecture.output_bias[2]` равен нулю.
+- Условие нулевого среднего давления в области отсутствует. Уровень давления
+  задаётся только на `outlet` и `farfield` через граничный штраф
+  \(\operatorname{mean}(C_p^2)\) с весом соответствующей границы.
+  На `inlet`, `velocity_dirichlet`, стенках и внутренних точках такого штрафа нет.
+  Устаревший ключ `pressure_gauge_weight` игнорируется; `architecture.output_bias[2]`
+  задаёт нулевое начальное смещение выхода давления.
 - Inlet/farfield targets используют те же \(\cos\alpha,\sin\alpha\).
 - Hard BC применяются к выходам до вычисления остальных членов.
 - Integral mass loss группируется по случаю, затем усредняется между
@@ -361,7 +362,7 @@ boundary_conditions:
 - `slip_wall`: \(u_n=u n_x+v n_y=0\);
 - `symmetry`: \(u_n=0\) и
   \(\partial u_t/\partial n=0\), где \(u_t=-u n_y+v n_x\);
-- `farfield`: заданный вектор скорости набегающего потока.
+- `farfield`: заданный вектор скорости набегающего потока и \(C_p=0\).
 
 Файл с `slip_wall` или `symmetry` без конечной ненулевой нормали считается
 несовместимым и должен быть пересоздан Sampler/Initializer.
@@ -396,7 +397,7 @@ Runtime validation после загрузки данных проверяет:
 В `logs/run_manifest.json` сохраняются эффективный контракт, версии runtime,
 устройство, dtype, размеры модели и DataLoader. `logs/epochs.jsonl` содержит
 строгий JSON по каждой эпохе: раздельные `*_mse` и `*_rms` для PDE, BC,
-pressure gauge, integral/FVM, нормы градиента, mass/FVM-метрики, learning rate
+integral/FVM, нормы градиента, mass/FVM-метрики, learning rate
 и времена. Запись `NaN`/`Inf` в telemetry запрещена.
 
 `output.progress_bar` включает tqdm в интерактивном терминале;

@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -64,6 +65,32 @@ def test_main_window_mock_backend(app: QApplication) -> None:
             window.backend_mode_combo.setCurrentText("Mock backend")
             window.epochs_spin.setValue(3)
             window.results_dir_edit.setText(str(run_dir))
+
+            window.gradient_contributions_check.setChecked(True)
+            window.gradient_contributions_spin.setValue(7)
+            assert window.gradient_contributions_spin.isEnabled()
+            ui_config = window._collect_training_config()
+            window.gradient_contributions_check.setChecked(False)
+            window._apply_training_config(ui_config)
+            assert window.gradient_contributions_check.isChecked()
+            assert window.gradient_contributions_spin.value() == 7
+            import yaml
+            from airfoil_pinn.config.manager import ConfigManager
+            config_path = run_dir / "diagnostics.yaml"
+            with patch.object(window, '_load_base_backend_config', return_value=ConfigManager().config), patch.object(
+                window, '_validate_backend_data_paths'
+            ):
+                window._write_backend_yaml_config(ui_config, config_path)
+            diagnostics = yaml.safe_load(config_path.read_text(encoding='utf-8'))['diagnostics']
+            assert diagnostics['gradient_contributions_enabled'] is True
+            assert diagnostics['gradient_contributions_interval'] == 7
+
+            def close_diagnostics() -> None:
+                assert window.diagnostics_dialog.isVisible()
+                window.diagnostics_dialog.accept()
+
+            QTimer.singleShot(0, close_diagnostics)
+            window.diagnostics_button.click()
 
             timed_out = {"value": False}
 

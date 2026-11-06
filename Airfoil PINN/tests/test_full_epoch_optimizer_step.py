@@ -36,8 +36,6 @@ def _batch_result(total: torch.Tensor) -> dict:
         "fvm_mse": 0.0,
         "fvm_weighted_loss": 0.0,
         "fvm_rms": 0.0,
-        "pressure_gauge_loss": 0.0,
-        "pressure_gauge_raw": 0.0,
         "pde_coverage": {},
         "wall_speed": None,
         "test_value": value,
@@ -82,8 +80,6 @@ class FullEpochOptimizerStepTests(unittest.TestCase):
         trainer._last_fvm_rms = 0.0
         trainer._last_fvm_evaluations = 0
         trainer._last_integral_loss = 0.0
-        trainer._last_pressure_gauge_mse = 0.0
-        trainer._last_pressure_gauge_loss = 0.0
 
         observed_values: list[float] = []
 

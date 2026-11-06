@@ -91,11 +91,25 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
     """Validate configuration values that do not require loaded data."""
     errors: list[str] = []
     diagnostics = _mapping(config, "diagnostics", errors)
+    ntk_sample_size = diagnostics.get("ntk_sample_size", 64)
+    if (isinstance(ntk_sample_size, bool)
+            or not isinstance(ntk_sample_size, int)
+            or ntk_sample_size < 1):
+        errors.append("diagnostics.ntk_sample_size must be an integer >= 1")
     gradient_interval = diagnostics.get("gradient_report_interval", 50)
     if (isinstance(gradient_interval, bool)
             or not isinstance(gradient_interval, int)
             or gradient_interval < 0):
         errors.append("diagnostics.gradient_report_interval must be an integer >= 0")
+    if not isinstance(diagnostics.get("gradient_contributions_enabled", False), bool):
+        errors.append("diagnostics.gradient_contributions_enabled must be a boolean")
+    if not isinstance(diagnostics.get("compute_fvm_pde_cosine", False), bool):
+        errors.append("diagnostics.compute_fvm_pde_cosine must be a boolean")
+    contribution_interval = diagnostics.get("gradient_contributions_interval", 50)
+    if (isinstance(contribution_interval, bool)
+            or not isinstance(contribution_interval, int)
+            or contribution_interval < 1):
+        errors.append("diagnostics.gradient_contributions_interval must be an integer >= 1")
     input_params = _mapping(config, "input_params", errors)
     architecture = _mapping(config, "architecture", errors)
     pde = _mapping(config, "pde", errors)
@@ -316,22 +330,6 @@ def validate_static_config(config: Mapping[str, Any]) -> None:
                     f"loss_weights.pde_weights.{component}",
                     errors,
                 )
-
-    try:
-        pressure_gauge_weight = float(
-            loss.get("pressure_gauge_weight", 1.0)
-        )
-    except (TypeError, ValueError):
-        errors.append("loss_weights.pressure_gauge_weight must be numeric")
-    else:
-        if (
-            not math.isfinite(pressure_gauge_weight)
-            or pressure_gauge_weight <= 0.0
-        ):
-            errors.append(
-                "loss_weights.pressure_gauge_weight must be finite and "
-                "strictly positive"
-            )
 
     fvm = loss.get("fvm", {})
     if isinstance(fvm, Mapping):

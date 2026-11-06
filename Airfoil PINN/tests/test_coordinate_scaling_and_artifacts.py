@@ -220,7 +220,7 @@ class CoordinateScalingTests(unittest.TestCase):
         )
         self.assertEqual(weights["fvm"]["weight"], 1.0)
         self.assertEqual(weights["integral_weight"], 1.0)
-        self.assertEqual(weights["pressure_gauge_weight"], 1.0)
+        self.assertNotIn("pressure_gauge_weight", weights)
         self.assertTrue(
             all(
                 value == 1.0
@@ -257,7 +257,6 @@ class TerminalArtifactTests(unittest.TestCase):
             "total_bc": [1.0, 0.5, 0.25],
             "integral_mse": [],
             "fvm_mse": [0.4, 0.3, 0.2],
-            "pressure_gauge_mse": [0.1, 0.05, 0.025],
         }
         with tempfile.TemporaryDirectory() as directory:
             visualizer.save_loss_history(history, directory, "error")

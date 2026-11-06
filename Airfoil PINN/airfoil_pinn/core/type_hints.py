@@ -590,7 +590,9 @@ class DiagnosticsConfigDict(TypedDict, total=False):
     plot_2d_spectrum: bool
     spectrum_2d_resolution: int
     compute_grad_cosine: bool
+    compute_fvm_pde_cosine: bool
     compute_ntk_condition: bool
+    ntk_sample_size: int
     strict_autograd: bool
     save_rar_history: bool
     mass_metrics_interval: int

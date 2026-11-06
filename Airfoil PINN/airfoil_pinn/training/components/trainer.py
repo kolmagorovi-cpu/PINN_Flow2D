@@ -161,7 +161,7 @@ class Trainer:
         # История RAR (для статистики)
         self.rar_history = []  # список словарей с типами границ добавленных точек
 
-        # Флаг изменения SA-весов (для сигнала solver'у о необходимости пересоздания оптимизатора)
+        # Compatibility flag: RAR now migrates optimizer state immediately.
         self.sa_weights_changed = False
 
         self.fvm_batch_interval: int = getattr(loss_computer, 'fvm_batch_interval', 1)
@@ -177,8 +177,6 @@ class Trainer:
         self._last_fvm_rms = 0.0
         self._last_fvm_evaluations = 0
         self._last_integral_loss = 0.0
-        self._last_pressure_gauge_mse = 0.0
-        self._last_pressure_gauge_loss = 0.0
         self._rar_fvm_rebuild_counter = 0
         self._rar_new_points_since_fvm = 0
         self._rar_step_counter = 0
@@ -409,7 +407,7 @@ class Trainer:
                 bc_counts[boundary_name] = int(
                     boundary_mask.sum().detach().cpu()
                 )
-            # Если SA-веса применяются к BC, используем только их; иначе — фиксированные веса
+            # SA attention multiplies the configured BC coefficient.
             if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
                 bc_loss = self._compute_sa_bc_loss(
                     u=u,
@@ -433,18 +431,6 @@ class Trainer:
             bc_counts = {}
             # Создаём нулевой тензор, который требует градиент (чтобы избежать ошибок в диагностике)
             bc_loss = torch.zeros(1, device=self.device, dtype=self.dtype, requires_grad=True).squeeze()
-
-        pressure_gauge_raw = (
-            self.loss_computer.compute_pressure_gauge_loss(
-                p,
-                case_ids=case_ids,
-                mask=interior_pde_mask,
-            )
-        )
-        pressure_gauge_loss = (
-            self.loss_computer.pressure_gauge_weight
-            * pressure_gauge_raw
-        )
 
         # RAR использует локальный аналог Total Loss: взвешенная PDE-часть
         # плюс точечные BC-вклады. Глобальные integral/FVM не имеют координатной
@@ -570,12 +556,10 @@ class Trainer:
             fvm_t = fvm_weighted_t * float(fvm_scale)
 
         # Полная потеря — единый граф для backward, градиенты PDE/BC/FVM не конкурируют.
-        # Pressure gauge removes the independent additive pressure nullspace
-        # for every flow case represented in this batch.
+        # Pressure is anchored by outlet/farfield BC, with no domain-mean loss.
         total_loss = (
             pde_loss
             + bc_loss
-            + pressure_gauge_loss
             + integral_t
             + fvm_t
         )
@@ -591,6 +575,13 @@ class Trainer:
 
         return {
             'total': total_loss,
+            # Exact weighted summands of total_loss, before batch division.
+            'weighted_loss_components': {
+                'pde': pde_loss,
+                'bc': bc_loss,
+                'fvm': fvm_t,
+                'integral': integral_t,
+            },
             'pde_raw': pde_raw,
             'pde_mse': pde_raw,
             'pde_max': pde_max,
@@ -605,8 +596,6 @@ class Trainer:
             'fvm_mse': fvm_raw_val,
             'fvm_weighted_loss': fvm_loss_val,
             'fvm_rms': fvm_rms_val,
-            'pressure_gauge_raw': pressure_gauge_raw.item(),
-            'pressure_gauge_loss': pressure_gauge_loss.item(),
             'pde_coverage': {
                 'candidate_points': pde_candidate_count,
                 'active_points': pde_point_count,
@@ -620,7 +609,6 @@ class Trainer:
                 'mom1': loss_1,
                 'mom2': loss_2,
                 'bc': bc_loss,          # теперь всегда тензор
-                'pressure_gauge': pressure_gauge_loss,
                 'integral': integral_t
             },
             'u': u.detach(),  # для профилей и спектров
@@ -705,6 +693,8 @@ class Trainer:
                     (u - target_u) ** 2
                     + (v - target_v) ** 2
                 )
+                if name == 'farfield':
+                    point_loss = point_loss + p.square()
             elif name == 'outlet':
                 point_loss = p ** 2
             elif name == 'wall':
@@ -732,7 +722,7 @@ class Trainer:
                 continue
 
             weighted = point_loss * w_bc[:, i].view(-1, 1)
-            terms.append(weighted[mask].mean())
+            terms.append(self.loss_computer.loss_weights[name] * weighted[mask].mean())
 
         if not terms:
             return torch.zeros((), device=self.device, dtype=self.dtype)
@@ -880,6 +870,8 @@ class Trainer:
                     (u - target_u) ** 2
                     + (v - target_v) ** 2
                 )
+                if name == 'farfield':
+                    point_loss = point_loss + p.square()
             elif name == 'outlet':
                 point_loss = p ** 2
             elif name == 'wall':
@@ -945,7 +937,10 @@ class Trainer:
                 continue
 
             if self.sa_weights is not None and self.loss_computer.sa_apply_to_bc and w_bc is not None:
-                weighted = point_loss.flatten() * w_bc[:, i]
+                weighted = (
+                    point_loss.flatten() * w_bc[:, i]
+                    * self.loss_computer.loss_weights.get(name, 0.0)
+                )
             else:
                 weighted = point_loss.flatten() * self.loss_computer.loss_weights.get(name, 0.0)
             weighted = weighted + extra_point_loss.flatten()
@@ -979,6 +974,25 @@ class Trainer:
             raise ValueError("diagnostics.gradient_report_interval must be an integer >= 0")
         self._capture_gradient_report = interval > 0 and epoch % interval == 0
         self.gradient_report = None
+        enabled = self.diag_config.get('gradient_contributions_enabled', False)
+        cosine_enabled = self.diag_config.get('compute_fvm_pde_cosine', False)
+        if not isinstance(cosine_enabled, bool):
+            raise ValueError("diagnostics.compute_fvm_pde_cosine must be a boolean")
+        contribution_interval = self.diag_config.get('gradient_contributions_interval', 50)
+        if not isinstance(enabled, bool):
+            raise ValueError("diagnostics.gradient_contributions_enabled must be a boolean")
+        if (isinstance(contribution_interval, bool)
+                or not isinstance(contribution_interval, int)
+                or contribution_interval < 1):
+            raise ValueError("diagnostics.gradient_contributions_interval must be an integer >= 1")
+        self._gradient_contributions = None
+        self.gradient_contributions_report = None
+        if (enabled or cosine_enabled) and epoch % contribution_interval == 0:
+            from airfoil_pinn.training.gradient_contributions import GradientContributions
+            self._gradient_contributions = GradientContributions(
+                self.model.parameters(), compute_cosine=cosine_enabled,
+                include_contributions=enabled,
+            )
 
     def compute_grad_norms_separately(self, batch: Tuple) -> Dict[str, float]:
         """
@@ -1020,60 +1034,20 @@ class Trainer:
 
         return {'pde_norm': norm_pde, 'bc_norm': norm_bc, 'cosine': cosine}
 
+    def compute_ntk_diagnostics(self, batch: Tuple, max_samples: int = 64) -> Dict:
+        """Separate float64 residual kernels for PDE, BC and FVM."""
+        from airfoil_pinn.training.ntk import compute_ntk_diagnostics
+
+        return compute_ntk_diagnostics(self, batch, max_samples)
+
     def compute_ntk_condition(self, batch: Tuple, max_samples: int = 64) -> float:
+        """Compatibility scalar: PDE retained-spectrum condition at rtol=1e-12.
+
+        Use compute_ntk_diagnostics for ranks, all cutoffs and BC/FVM spectra.
         """
-        Оценивает condition number эмпирического NTK по малому подбатчу.
-
-        Диагностика дорогая, поэтому используется только при явном включении
-        compute_ntk_condition и ограничивает число точек max_samples.
-        """
-        was_training = self.model.training
-        was_training = self.model.training
-        self.model.eval()
-
-        idx, x, y, sdf, bt, mask_u, mask_v, mask_p, u_bc, v_bc, p_bc = batch
-        case_ids = getattr(batch, 'case_id', None)
-        n = min(max_samples, x.shape[0])
-        if n <= 1:
-            if was_training:
-                self.model.train()
-            return 0.0
-
-        x = x[:n].to(self.device, dtype=self.dtype)
-        y = y[:n].to(self.device, dtype=self.dtype)
-        sdf = sdf[:n].to(self.device, dtype=self.dtype)
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        rows = []
-
-        for i in range(n):
-            input_i = self.loss_computer.build_input_tensor(
-                x[i:i + 1],
-                y[i:i + 1],
-                sdf[i:i + 1],
-                case_ids=(
-                    case_ids[i:i + 1].to(self.device, dtype=torch.long)
-                    if case_ids is not None
-                    else None
-                ),
-            )
-            out_i = self.model(input_i).sum()
-            grads = torch.autograd.grad(out_i, params, retain_graph=False, allow_unused=True)
-            flat = [
-                g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1)
-                for g, p in zip(grads, params)
-            ]
-            rows.append(torch.cat(flat).detach())
-
-        if was_training:
-            self.model.train()
-
-        J = torch.stack(rows, dim=0).float()
-        K = J @ J.t()
-        eigvals = torch.linalg.eigvalsh(K)
-        positive = eigvals[eigvals > 1e-12]
-        if positive.numel() == 0:
-            return float('inf')
-        return (positive.max() / positive.min()).item()
+        report = self.compute_ntk_diagnostics(batch, max_samples)
+        condition = report['blocks']['pde']['cutoffs'][0]['condition']
+        return condition if condition is not None else float('inf')
 
     # ------------------------------------------------------------------
     # Получение предсказаний на всём датасете (для диагностики)
@@ -1297,8 +1271,6 @@ class Trainer:
             'last_fvm_rms': self._last_fvm_rms,
             'last_fvm_evaluations': self._last_fvm_evaluations,
             'last_integral_loss': self._last_integral_loss,
-            'last_pressure_gauge_mse': self._last_pressure_gauge_mse,
-            'last_pressure_gauge_loss': self._last_pressure_gauge_loss,
             'rar_fvm_rebuild_counter': self._rar_fvm_rebuild_counter,
             'rar_new_points_since_fvm': self._rar_new_points_since_fvm,
             'rar_step_counter': self._rar_step_counter,
@@ -1353,18 +1325,6 @@ class Trainer:
             state.get('last_fvm_evaluations', self._last_fvm_evaluations)
         )
         self._last_integral_loss = float(state.get('last_integral_loss', self._last_integral_loss))
-        self._last_pressure_gauge_mse = float(
-            state.get(
-                'last_pressure_gauge_mse',
-                self._last_pressure_gauge_mse,
-            )
-        )
-        self._last_pressure_gauge_loss = float(
-            state.get(
-                'last_pressure_gauge_loss',
-                self._last_pressure_gauge_loss,
-            )
-        )
         self._rar_fvm_rebuild_counter = int(state.get('rar_fvm_rebuild_counter', self._rar_fvm_rebuild_counter))
         self._rar_new_points_since_fvm = int(state.get('rar_new_points_since_fvm', self._rar_new_points_since_fvm))
         self._rar_step_counter = int(state.get('rar_step_counter', self._rar_step_counter))
@@ -1503,12 +1463,83 @@ class Trainer:
             logger.warning("Adaptive RAR: не удалось вывести SDF/delta статистику: %s", exc)
 
     def _extend_sa_weights(self, n_new: int) -> None:
-        """Расширяет SA-веса после добавления новых точек."""
+        """Append attention rows without resetting Adam or its scheduler.
+
+        Adam has one step counter per parameter, so appended rows share the
+        existing counter; their first and second moments start at zero.
+        """
         if self.sa_weights is None or n_new <= 0:
             return
+        old_parameter = self.sa_weights.log_weights
         self.sa_weights.extend(n_new)
-        self.sa_weights_changed = True
-        logger.warning("RAR: SA-веса расширены. Требуется пересоздание оптимизатора в solver.")
+        new_parameter = self.sa_weights.log_weights
+        old_state = self.optimizer.state.pop(old_parameter, {})
+        new_state = {}
+        for key, value in old_state.items():
+            if torch.is_tensor(value) and value.shape == old_parameter.shape:
+                expanded = value.new_zeros(new_parameter.shape)
+                expanded[:old_parameter.shape[0]].copy_(value)
+                new_state[key] = expanded
+            else:
+                new_state[key] = value
+        for group in self.optimizer.param_groups:
+            group['params'] = [
+                new_parameter if parameter is old_parameter else parameter
+                for parameter in group['params']
+            ]
+        if new_state:
+            self.optimizer.state[new_parameter] = new_state
+        self.sa_weights_changed = False
+        logger.info("RAR: appended %d SA rows, preserving Adam state.", n_new)
+
+    @torch.no_grad()
+    def compute_sa_diagnostics(self) -> Dict[str, Any]:
+        """Describe effective attention on active PDE/BC points only."""
+        if self.sa_weights is None:
+            return {}
+        weights = self.sa_weights().detach()
+        dataset = self.data_handler.dataset
+        boundary = dataset.boundary_types
+        if boundary is not None:
+            boundary = boundary.to(self.device)
+        reference = dataset.sdf.to(self.device, dtype=self.dtype)
+        # Reuse the exact SDF eligibility rule used by forward_pass.
+        _, sdf_mask = self.loss_computer.prepare_sdf_for_pde(
+            dataset.x.to(self.device, dtype=self.dtype),
+            dataset.y.to(self.device, dtype=self.dtype), reference, boundary,
+        )
+        pde_mask = (self._pde_loss_mask(boundary, reference) & sdf_mask).flatten()
+        selected = {
+            f'pde/{name}': weights[pde_mask, column]
+            for column, name in enumerate(self.loss_computer.pde_components)
+        }
+        if self.loss_computer.sa_apply_to_bc:
+            for column, name in enumerate(self.data_handler.boundary_type_names):
+                mask = torch.zeros(weights.shape[0], dtype=torch.bool, device=weights.device)
+                if (
+                    boundary is not None
+                    and self.loss_computer.bc_type != 'hard'
+                    and not self.loss_computer.is_hard_boundary(name)
+                    and self.loss_computer.loss_weights.get(name, 0.0) > 0.0
+                ):
+                    mask = boundary[:, column] > 0.5
+                selected[f'bc/{name}'] = weights[mask, 3 + column]
+        report = {}
+        for name, values in selected.items():
+            values = values.float().cpu()
+            if values.numel() == 0:
+                report[name] = {'count': 0}
+                continue
+            counts, edges = torch.histogram(values, bins=10)
+            report[name] = {
+                'count': values.numel(), 'mean': values.mean().item(),
+                'min': values.min().item(), 'max': values.max().item(),
+                'quantiles': torch.quantile(
+                    values, torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95]),
+                ).tolist(),
+                'histogram': {'counts': counts.long().tolist(), 'edges': edges.tolist()},
+            }
+        return report
 
     def _generate_adaptive_rar_points(
         self,
@@ -2194,11 +2225,21 @@ class Trainer:
             components={
                 "pde": sum(fwd["pde_raw"].values()),
                 "bc": sum(fwd["bc_comp"].values()),
-                "pressure_gauge": fwd["pressure_gauge_loss"],
                 "integral": fwd["integral_loss"],
                 "fvm": fwd.get("fvm_loss", 0.0),
             },
         )
+
+        contributions = getattr(self, '_gradient_contributions', None)
+        if contributions is not None:
+            contributions.accumulate(
+                fwd['weighted_loss_components'],
+                divisor=divisor,
+                amp_scale=(
+                    self.scaler.get_scale()
+                    if self.use_amp and self.scaler is not None else 1.0
+                ),
+            )
 
         # Обратное распространение
         if self.use_amp and self.scaler is not None:
@@ -2210,6 +2251,10 @@ class Trainer:
 
         # Если пора делать шаг оптимизации
         if accum_step:
+            if contributions is not None:
+                self.gradient_contributions_report = contributions.finish_step(
+                    stage="Adam: optimizer accumulation windows in this epoch",
+                )
             if self.use_amp and self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
             named_parameters = list(self.model.named_parameters())
@@ -2275,8 +2320,6 @@ class Trainer:
             'fvm_mse': fwd.get('fvm_mse', 0.0),
             'fvm_weighted_loss': fwd.get('fvm_weighted_loss', 0.0),
             'fvm_rms': fwd.get('fvm_rms', 0.0),
-            'pressure_gauge_loss': fwd['pressure_gauge_loss'],
-            'pressure_gauge_mse': fwd['pressure_gauge_raw'],
             'pde_coverage': fwd['pde_coverage'],
             'wall_speed': fwd['wall_speed'],
             'grad_norm': grad_norm
@@ -2336,8 +2379,6 @@ class Trainer:
             } if self.loss_computer.bc_type == 'soft' else {},
             'extra_grad': 0.0,
             'integral_loss': 0.0,
-            'pressure_gauge_mse_sum': 0.0,
-            'pressure_gauge_loss_sum': 0.0,
             'wall_speed_sum': 0.0,
             'n_wall_batches': 0,
             'grad_norm_sum': 0.0,
@@ -2417,14 +2458,6 @@ class Trainer:
                     epoch_losses['bc_count'][k] += count
                 epoch_losses['extra_grad'] += batch_losses['extra_grad']
             epoch_losses['integral_loss'] += batch_losses['integral_loss']
-            epoch_losses['pressure_gauge_mse_sum'] += batch_losses.get(
-                'pressure_gauge_mse',
-                0.0,
-            )
-            epoch_losses['pressure_gauge_loss_sum'] += batch_losses.get(
-                'pressure_gauge_loss',
-                0.0,
-            )
             if batch_losses['wall_speed'] is not None:
                 epoch_losses['wall_speed_sum'] += batch_losses['wall_speed']
                 epoch_losses['n_wall_batches'] += 1
@@ -2476,12 +2509,6 @@ class Trainer:
             avg_bc = {}
             avg_extra_grad = 0.0
         avg_integral = self._last_integral_loss if self.loss_computer.integral_condition else 0.0
-        self._last_pressure_gauge_mse = (
-            epoch_losses['pressure_gauge_mse_sum'] / n_batches
-        )
-        self._last_pressure_gauge_loss = (
-            epoch_losses['pressure_gauge_loss_sum'] / n_batches
-        )
         avg_wall_speed = (epoch_losses['wall_speed_sum'] / epoch_losses['n_wall_batches']
                           if epoch_losses['n_wall_batches'] > 0 else 0.0)
         avg_grad_norm = epoch_losses['grad_norm_sum'] / epoch_losses['grad_norm_count'] if epoch_losses['grad_norm_count'] > 0 else 0.0
@@ -2541,8 +2568,6 @@ class Trainer:
         bc_comp_list = []
         bc_count_list = []
         integral_loss_list = []
-        pressure_gauge_mse_list = []
-        pressure_gauge_loss_list = []
         fvm_loss_list = []
         fvm_raw_loss_list = []
         fvm_rms_list = []
@@ -2561,6 +2586,11 @@ class Trainer:
 
         def closure():
             self.optimizer.zero_grad()
+            contributions = getattr(self, '_gradient_contributions', None)
+            if contributions is not None:
+                # Line search may evaluate the closure repeatedly. Report only
+                # the last closure, matching the existing gradient report.
+                contributions.reset()
             total_loss = 0.0
             nonlocal n_batches, fvm_evaluations
             pde_raw_list.clear()
@@ -2569,8 +2599,6 @@ class Trainer:
             bc_comp_list.clear()
             bc_count_list.clear()
             integral_loss_list.clear()
-            pressure_gauge_mse_list.clear()
-            pressure_gauge_loss_list.clear()
             fvm_loss_list.clear()
             fvm_raw_loss_list.clear()
             fvm_rms_list.clear()
@@ -2604,6 +2632,8 @@ class Trainer:
                     integral_scale=1.0,
                 )
                 total_loss += fwd['total']
+                if contributions is not None:
+                    contributions.accumulate(fwd['weighted_loss_components'])
 
                 pde_raw_list.append(fwd['pde_raw'])
                 pde_max_list.append(fwd['pde_max'])
@@ -2614,8 +2644,6 @@ class Trainer:
                 if add_integral_b:
                     integral_loss_list.append(fwd['integral_loss'])
                     self._last_integral_loss = fwd['integral_loss']
-                pressure_gauge_mse_list.append(fwd['pressure_gauge_raw'])
-                pressure_gauge_loss_list.append(fwd['pressure_gauge_loss'])
                 if fwd['wall_speed'] is not None:
                     wall_speed_list.append(fwd['wall_speed'])
                 if add_fvm_b:
@@ -2638,6 +2666,10 @@ class Trainer:
                 },
             )
             total_loss.backward()
+            if contributions is not None:
+                self.gradient_contributions_report = contributions.finish_step(
+                    stage="L-BFGS: last closure evaluation",
+                )
             check_gradient_health(
                 self.model.named_parameters(),
                 stage="L-BFGS backward",
@@ -2686,16 +2718,6 @@ class Trainer:
             avg_bc = {}
 
         avg_integral = np.mean(integral_loss_list) if integral_loss_list else 0.0
-        self._last_pressure_gauge_mse = (
-            float(np.mean(pressure_gauge_mse_list))
-            if pressure_gauge_mse_list
-            else 0.0
-        )
-        self._last_pressure_gauge_loss = (
-            float(np.mean(pressure_gauge_loss_list))
-            if pressure_gauge_loss_list
-            else 0.0
-        )
         avg_wall_speed = np.mean(wall_speed_list) if wall_speed_list else 0.0
         avg_loss = loss.item() if torch.is_tensor(loss) else loss
         pde_rate = {c: 1.0 for c in self.loss_computer.pde_components}
